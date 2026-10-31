@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# ============================================================================
+# Hydragen One-Click Setup Script (Linux / WSL2)
+# ============================================================================
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+echo "=========================================================="
+echo "         Hydragen Engine Automated Setup"
+echo "=========================================================="
+
+# 1. Check Python
+PYTHON_CMD=""
+for cmd in python3.12 python3.11 python3.10 python3 python; do
+    if command -v "$cmd" &>/dev/null; then
+        PY_VER=$("$cmd" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+        PY_MAJOR=$("$cmd" -c 'import sys; print(sys.version_info.major)')
+        PY_MINOR=$("$cmd" -c 'import sys; print(sys.version_info.minor)')
+        if [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -ge 10 ]; then
+            PYTHON_CMD="$cmd"
+            echo "[+] Detected Python $PY_VER ($cmd)"
+            break
+        fi
+    fi
+done
+
+if [ -z "$PYTHON_CMD" ]; then
+    echo "[-] Error: Python 3.10+ is required but was not found."
+    exit 1
+fi
+
+# 2. Check NVIDIA GPU
+if command -v nvidia-smi &>/dev/null; then
+    GPU_NAME=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -n 1)
+    echo "[+] Detected GPU: $GPU_NAME"
+else
+    echo "[!] Warning: nvidia-smi not found. CUDA GPU is required for acceleration."
+fi
+
+# 3. Virtual Environment Setup
+VENV_DIR="$SCRIPT_DIR/.venv"
+if [ -z "$VIRTUAL_ENV" ]; then
+    if [ ! -d "$VENV_DIR" ]; then
+        echo "[+] Creating virtual environment in $VENV_DIR..."
+        "$PYTHON_CMD" -m venv "$VENV_DIR"
+    fi
+    echo "[+] Activating virtual environment..."
+    # shellcheck disable=SC1091
+    source "$VENV_DIR/bin/activate"
+else
+    echo "[+] Using active virtual environment: $VIRTUAL_ENV"
+fi
+
+# 4. Install Dependencies & Hydragen
+echo "[+] Installing Hydragen and dependencies..."
+python -m pip install --upgrade pip
+python -m pip install -e .
+
+# 5. Check for Worker Binary
+BIN_DIR="$SCRIPT_DIR/bin"
+mkdir -p "$BIN_DIR"
+if [ ! -f "$BIN_DIR/strata" ]; then
+    if [ -n "$STRATA_DIR" ] && [ -f "$STRATA_DIR/engine/strata" ]; then
+        echo "[+] Linking existing Strata worker binary from $STRATA_DIR..."
+        ln -sf "$STRATA_DIR/engine/strata" "$BIN_DIR/strata"
+    elif [ -f "../Strata/engine/strata" ]; then
+        echo "[+] Linking local Strata worker binary..."
+        ln -sf "$(cd ../Strata && pwd)/engine/strata" "$BIN_DIR/strata"
+    fi
+fi
+
+# 6. Generate Default Config if Missing
+CONFIG_FILE="$SCRIPT_DIR/hydragen.json"
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "[+] Generating default hydragen.json template..."
+    cat > "$CONFIG_FILE" << 'EOF'
+{
+  "exe": "bin/strata",
+  "args": [
+    "--expert-cache", "auto",
+    "--prefill", "auto:16384",
+    "--spec", "4",
+    "--max-context", "131072",
+    "--kv", "int8",
+    "--vram-reserve-mib", "1152",
+    "--pcie-frac", "0.20",
+    "--spec-min-p", "0.45",
+    "--adapt-async", "1",
+    "--kv-resident", "32768",
+    "--batch", "2",
+    "--batch-mtp"
+  ],
+  "batch": 2,
+  "max_context": 131072,
+  "log": "hydragen.log"
+}
+EOF
+fi
+
+echo ""
+echo "=========================================================="
+echo "         Hydragen Setup Complete!"
+echo "=========================================================="
+echo "To start the server:"
+echo "  1. (If not activated) source .venv/bin/activate"
+echo "  2. hydragen --config hydragen.json --port 8080 --api-monitor"
+echo "=========================================================="

@@ -15,10 +15,15 @@ authors = [
 urls = {Repository = "https://github.com/thirteenthd/Hydragen"}
 dependencies = [
     "numpy",
-    "gguf",
-    "torch",
-    "triton",
+    "gguf>=0.10.0",
+    "torch>=2.4.0",
+    "triton>=3.0.0",
+    "psutil",
+    "vllm>=0.6.0; sys_platform != 'win32'",
 ]
+
+[project.optional-dependencies]
+vllm = ["vllm>=0.6.0"]
 
 [project.scripts]
 hydragen = "hydragen.cli:main"

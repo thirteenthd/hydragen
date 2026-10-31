@@ -227,30 +227,69 @@ strata-vllm/
 ## 5. Quick Installation & Usage
 
 ### Prerequisites
-- An existing [Strata](https://github.com/Niko1221/Strata) installation with model weights downloaded.
-- Python 3.10+ environment with `torch`, `triton`, and `vllm` installed (e.g. `~/vllm-env`).
-- NVIDIA GPU with 12 GB+ VRAM (RTX 3060 12GB, RTX 3080 Ti, RTX 3090, RTX 4070 Ti+, etc.).
-- 64 GB System RAM recommended for locking the full `IQ3_XXS` expert pack in host RAM (or 32 GB RAM for `IQ2_XS`).
+- **NVIDIA GPU** with 12 GB+ VRAM (RTX 3060 12GB, RTX 3080 Ti, RTX 3090/4090, RTX 4070 Ti+, etc.).
+- **Host RAM:** 32 GB – 64 GB recommended for locking the full `IQ3_XXS` expert pack in system memory.
+- **Python:** 3.10+ (with CUDA support).
 
-### Install (Non-Destructive)
-Clone this repository and run the installer pointing to your Strata directory:
+---
 
+### Option A: Automated One-Click Setup (Standalone)
+
+Clone the repository and run the automated setup script for your platform:
+
+**Linux / WSL2:**
 ```bash
 git clone https://github.com/thirteenthd/Hydragen.git
 cd Hydragen
-./install.sh /path/to/target
+chmod +x setup.sh && ./setup.sh
 ```
 
-> **Note:** `./install.sh` installs the `strata_vllm` Python package (`pip install -e .`) into your `vllm-env` so vLLM automatically discovers the `strata_gguf` plugin, and copies the drop-in bridge files into `/path/to/Strata`. Your existing Strata installation is **100% preserved** (`serve/server.py` is backed up to `serve/server.py.orig_backup`). You can switch between `--engine strata` and `--engine vllm` at any time, or run `./uninstall.sh /path/to/Strata` to revert completely.
-
-### Launch the Server
-```bash
-cd /path/to/target
-./run_vllm.sh
+**Windows (PowerShell):**
+```powershell
+git clone https://github.com/thirteenthd/Hydragen.git
+cd Hydragen
+.\setup.ps1
 ```
-Or invoke directly via the `hydragen` entrypoint:
+
+**Windows (CMD):**
+```cmd
+git clone https://github.com/thirteenthd/Hydragen.git
+cd Hydragen
+setup.bat
+```
+
+The script automatically detects your GPU, creates a `.venv` virtual environment, installs PyTorch with CUDA and Hydragen, and generates a ready-to-run `hydragen.json` configuration.
+
+---
+
+### Option B: Drop-in Integration (Existing Strata Installations)
+
+If you already have a configured Strata installation with models downloaded:
+
+**Linux / WSL2:**
 ```bash
-hydragen --config strata-iq3_xxs.json --port 8080 --api-monitor --no-api-key
+./install.sh /path/to/Strata
+```
+
+**Windows:**
+```cmd
+install.bat C:\path\to\Strata
+```
+
+> **Note:** `./install.sh` non-destructively links the `hydragen` Python package and deploys the multi-slot scheduler and dynamic concurrency monitor to your existing setup. Your original server script is backed up to `serve/server.py.orig_backup` and can be reverted at any time with `./uninstall.sh`.
+
+---
+
+### Launching the Server
+
+Run directly via the `hydragen` CLI entrypoint:
+```bash
+hydragen --config hydragen.json --port 8080 --api-monitor
+```
+Or via the drop-in launcher:
+```bash
+./run_vllm.sh      # Linux
+run_vllm.bat       # Windows
 ```
 
 ### Run the Full Verification Suite
