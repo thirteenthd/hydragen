@@ -1,0 +1,5 @@
+torch>=2.4.0
+triton>=3.0.0
+gguf>=0.10.0
+numpy
+psutil
