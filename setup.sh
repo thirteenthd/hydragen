@@ -19,14 +19,23 @@ if [ "$1" = "--update" ] || [ "$1" = "-u" ]; then
     fi
 fi
 
-# 1. Check Python
+# 1. Check Python (PyTorch/Triton/vLLM require Python >=3.10 and <=3.13)
+export PATH="$HOME/.local/bin:$PATH"
 PYTHON_CMD=""
-for cmd in python3.12 python3.11 python3.10 python3 python; do
+CANDIDATES=("python3.12" "python3.11" "python3.10")
+for uv_py in "$HOME"/.local/share/uv/python/*/bin/python3; do
+    if [ -x "$uv_py" ]; then
+        CANDIDATES+=("$uv_py")
+    fi
+done
+CANDIDATES+=("python3" "python")
+
+for cmd in "${CANDIDATES[@]}"; do
     if command -v "$cmd" &>/dev/null; then
-        PY_VER=$("$cmd" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-        PY_MAJOR=$("$cmd" -c 'import sys; print(sys.version_info.major)')
-        PY_MINOR=$("$cmd" -c 'import sys; print(sys.version_info.minor)')
-        if [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -ge 10 ]; then
+        PY_VER=$("$cmd" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)
+        PY_MAJOR=$("$cmd" -c 'import sys; print(sys.version_info.major)' 2>/dev/null || true)
+        PY_MINOR=$("$cmd" -c 'import sys; print(sys.version_info.minor)' 2>/dev/null || true)
+        if [ "$PY_MAJOR" = "3" ] && [ "$PY_MINOR" -ge 10 ] && [ "$PY_MINOR" -le 13 ]; then
             PYTHON_CMD="$cmd"
             echo "[+] Detected Python $PY_VER ($cmd)"
             break
@@ -35,7 +44,7 @@ for cmd in python3.12 python3.11 python3.10 python3 python; do
 done
 
 if [ -z "$PYTHON_CMD" ]; then
-    echo "[-] Error: Python 3.10+ is required but was not found."
+    echo "[-] Error: Python >=3.10 and <=3.13 is required (PyTorch/vLLM do not support Python 3.14+ yet)."
     exit 1
 fi
 
