@@ -116,20 +116,21 @@
   <!-- ============================ Monitor ============================ -->
   <section class="view view--monitor" id="view-monitor" role="tabpanel" aria-labelledby="tab-btn-monitor" hidden>
     <div class="monitor">
-      <div class="st-card state-card">
-        <div class="state-card__head">
-          <span class="card-title">Model state</span>
-          <span class="badges" id="state-badges">
-            <span class="st-badge" data-s="idle">Idle</span>
-            <span class="st-badge" data-s="unloaded">Unloaded</span>
-            <span class="st-badge st-badge--reading" data-s="reading">Reading</span>
-            <span class="st-badge st-badge--generating" data-s="generating">Generating</span>
-            <span class="st-badge st-badge--queued" data-s="queued">Queued</span>
-            <span class="st-badge st-badge--error" data-s="error">Error</span>
-          </span>
+      <!-- Execution Slots & Dynamic Concurrency Panel (Replaced Model State card) -->
+      <div class="st-card slots-dashboard-card" id="slots-dashboard-card">
+        <div class="slots-dashboard__head">
+          <div class="slots-dashboard__title-wrap">
+            <span class="card-title"><svg class="st-icon st-icon--sm" aria-hidden="true"><use href="web/sprite.svg#i-layers"/></svg>Execution Slots &amp; Active State</span>
+            <span class="muted" id="slots-dashboard-sub">Dynamic slot allocation &amp; streaming throughput</span>
+          </div>
+          <div class="slots-dashboard__badges" id="slots-dashboard-badges">
+            <span class="st-badge" id="slots-state-badge">Idle</span>
+            <span class="st-badge" id="slots-active-badge">0 / 2 Active</span>
+          </div>
         </div>
-        <div class="state-card__row"><span id="state-label">Waiting for a request</span><span class="muted" id="state-detail"></span></div>
-        <div class="st-progress" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
+        <div class="slots-bars-grid" id="slots-bars-grid">
+          <!-- Dynamically populated for all configured slots: Slot 0, Slot 1, ... Slot N -->
+        </div>
       </div>
 
       <div class="metrics" id="metrics">
@@ -155,24 +156,6 @@
             <div class="st-progress" id="ram-progress"><div class="st-progress__bar" id="ram-bar" style="width:0%"></div></div>
             <div class="bar-row"><span>GPU temperature</span><span class="muted" id="temp-text">&ndash;</span></div>
             <div class="st-progress" data-tone="warn"><div class="st-progress__bar" id="temp-bar" style="width:0%"></div></div>
-          </div>
-          <div class="st-card metric-card" id="concurrency-card">
-            <div class="st-metric">
-              <span class="st-metric__label"><svg class="st-icon st-icon--sm" aria-hidden="true"><use href="web/sprite.svg#i-layers"/></svg>Concurrency &amp; Queuing</span>
-              <div class="speed-values concurrency-values">
-                <div>
-                  <span class="st-metric__value" id="mv-concurrency-slots">–</span>
-                  <span class="st-metric__sub" id="ms-concurrency-slots">Active slots</span>
-                </div>
-                <div class="concurrency-queue-col">
-                  <span class="st-metric__value" id="mv-concurrency-queue">–</span>
-                  <span class="st-metric__sub" id="ms-concurrency-queue">No queue</span>
-                </div>
-              </div>
-              <div class="concurrency-bars-wrap">
-                <div class="concurrency-bars" id="concurrency-bars"></div>
-              </div>
-            </div>
           </div>
         </div>
         <div class="st-card req-card">

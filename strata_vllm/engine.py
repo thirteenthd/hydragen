@@ -118,6 +118,11 @@ class VLLMEngine:
         }
         self.locality_policy = ExpertLocalityPolicy(set())
 
+        # CUDA Graph runner cache for fixed decode batch sizes (M=1, 2)
+        self._cuda_graphs: Dict[Tuple[int, int], Any] = {}
+        self._static_token_ids: Dict[int, torch.Tensor] = {}
+        self._static_hidden: Dict[int, torch.Tensor] = {}
+
         # Warm up Triton Fused MoE kernels on real Layer 0 & Layer 1 (type 42 Q2_0_STRATA) experts
         self._warmup_triton_pipeline()
 
@@ -221,11 +226,38 @@ class VLLMEngine:
             router_w = self.router_gates[layer_idx]
 
             # 1. Dequantize token embeddings on GPU via libstrata_iq_kernels.so and apply RMSNorm
-            hidden = self.loader.dequantize_token_embedding(token_ids, device=self.device)
-            hidden = (
-                hidden.float()
-                * torch.rsqrt(hidden.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6)
-            ).to(torch.float16)
+            M_tokens = token_ids.shape[0]
+            graph_key = (M_tokens, layer_idx)
+            use_graph = M_tokens in (1, 2) and torch.cuda.is_available()
+
+            if use_graph and graph_key in self._cuda_graphs:
+                # Fast path: Replay captured CUDA Graph
+                static_in, static_out, graph = self._cuda_graphs[graph_key]
+                static_in.copy_(token_ids)
+                graph.replay()
+                hidden = static_out
+            else:
+                hidden = self.loader.dequantize_token_embedding(token_ids, device=self.device)
+                hidden = (
+                    hidden.float()
+                    * torch.rsqrt(hidden.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+                ).to(torch.float16)
+
+                # Attempt capture on warm step for fixed decode batch sizes
+                if use_graph and graph_key not in self._cuda_graphs:
+                    try:
+                        static_in = token_ids.clone()
+                        # Warmup
+                        for _ in range(2):
+                            _h = self.loader.dequantize_token_embedding(static_in, device=self.device)
+                            _h = (_h.float() * torch.rsqrt(_h.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6)).to(torch.float16)
+                        g = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(g, stream=self.triton_stream):
+                            static_out = self.loader.dequantize_token_embedding(static_in, device=self.device)
+                            static_out = (static_out.float() * torch.rsqrt(static_out.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6)).to(torch.float16)
+                        self._cuda_graphs[graph_key] = (static_in, static_out, g)
+                    except Exception:
+                        pass
 
             # 2. Compute router logits and run GPU cache-conditioned top-10 routing (STRATA_ROUTE_PRIOR)
             topk_ids, topk_weights = self.expert_manager.route_tokens(
@@ -386,6 +418,10 @@ class VLLMEngine:
                 if r is not None:
                     ft = r.get("first_token")
                     gen = r.get("generated", 0)
+                    started = r.get("started", now)
+                    pread = r.get("prompt_read") or 0
+                    prefill_s = ft - started if ft else (now - started)
+                    p_tok_s = round(pread / max(1e-4, prefill_s), 1) if pread and prefill_s > 0 else None
                     view.append(
                         {
                             "slot": b,
@@ -393,8 +429,9 @@ class VLLMEngine:
                             "prompt_tokens": r.get("prompt_tokens", 0),
                             "prompt_read": r.get("prompt_read"),
                             "generated": gen,
-                            "elapsed_s": round(now - r.get("started", now), 1),
+                            "elapsed_s": round(now - started, 1),
                             "tok_s": round(gen / max(1e-6, now - ft), 1) if ft else None,
+                            "prefill_tok_s": p_tok_s,
                         }
                     )
                     continue

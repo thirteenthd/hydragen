@@ -135,6 +135,7 @@ const METRICS = [
   {key: "pcie", label: "PCIe", icon: "link", unit: "", series: "gpu_pcie_rx_mb", tone: "info"},
   {key: "cpu", label: "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100},
   {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info"},
+  {key: "queue", label: "Queued requests", icon: "layers", unit: "", series: "concurrency", tone: "warn"},
 ];
 $("metrics").innerHTML = METRICS.map((m) => `
   <div class="st-card metric-card"><div class="st-metric">
@@ -435,12 +436,144 @@ function renderTotals(t) {
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
-  // model state
-  // A local turn keeps metrics on "unloaded" for the whole engine start.
+  // 1. Dynamic Execution Slots & Model State Card (Top Card)
   const imageNow = imageLive(live);
   const starting = modelOp === "load" || imageNow || (busy != null && live.state === "unloaded");
   const { curConcurrency, maxSlots, queuedCount, slots } = calcConcurrencyAndQueue(live, eng, hw);
   const isQueued = !modelOp && queuedCount > 0;
+
+  const activeGeneratingSlots = slots.filter(s => s && (s.state === "generating" || s.state === "decoding"));
+  const activeReadingSlots = slots.filter(s => s && s.state === "reading");
+
+  const slotsGrid = $("slots-bars-grid");
+  if (slotsGrid) {
+    if (slotsGrid.children.length !== maxSlots) {
+      slotsGrid.innerHTML = "";
+      for (let i = 0; i < maxSlots; i++) {
+        const tile = document.createElement("div");
+        tile.className = "slot-tile is-idle";
+        tile.dataset.slot = `${i}`;
+        tile.innerHTML = `
+          <div class="slot-tile__top">
+            <div class="slot-tile__header">
+              <span class="slot-tile__name">Slot ${i}</span>
+              <span class="slot-tile__badge tone-idle" id="st-badge-${i}">Idle</span>
+            </div>
+            <div class="slot-tile__metrics">
+              <div class="slot-tile__metric">
+                <span class="slot-tile__metric-val" id="slot-decode-${i}">–</span>
+                <span class="slot-tile__metric-sub">Decode</span>
+              </div>
+              <div class="slot-tile__metric">
+                <span class="slot-tile__metric-val" id="slot-prefill-${i}">–</span>
+                <span class="slot-tile__metric-sub">Prefill</span>
+              </div>
+            </div>
+          </div>
+          <div class="slot-tile__progress-wrap">
+            <div class="slot-tile__bar-track">
+              <div class="slot-tile__bar-fill is-idle" id="slot-fill-${i}" style="width: 0%"></div>
+              <div class="slot-tile__ticks"></div>
+            </div>
+            <div class="slot-tile__detail">
+              <span class="slot-tile__phase" id="slot-phase-${i}">Waiting for request</span>
+              <span class="slot-tile__tokens" id="slot-tokens-${i}">–</span>
+            </div>
+          </div>`;
+        slotsGrid.appendChild(tile);
+      }
+    }
+
+    for (let i = 0; i < maxSlots; i++) {
+      const tile = slotsGrid.children[i];
+      if (!tile) continue;
+      const sInfo = slots[i] || {};
+      const isBusy = (sInfo.state && sInfo.state !== "idle") || (curConcurrency > i);
+      let sState = "idle";
+      if (sInfo.state && sInfo.state !== "idle") {
+        sState = (sInfo.state === "decoding" || sInfo.state === "generating") ? "generating" : "reading";
+      } else if (isBusy) {
+        sState = (live && live.state === "reading") ? "reading" : "generating";
+      }
+
+      tile.className = `slot-tile is-${sState}`;
+
+      const badgeEl = $(`st-badge-${i}`);
+      const stateTitle = sState === "generating" ? "Generating" : (sState === "reading" ? "Reading" : "Idle");
+      if (badgeEl) {
+        badgeEl.textContent = stateTitle;
+        badgeEl.className = `slot-tile__badge tone-${sState}`;
+      }
+
+      const decEl = $(`slot-decode-${i}`);
+      if (decEl) {
+        if (sState === "generating" && sInfo.tok_s) {
+          decEl.innerHTML = `${fmt(sInfo.tok_s, 1)}<small>t/s</small>`;
+        } else if (sState === "generating" && live.tok_s) {
+          decEl.innerHTML = `${fmt(live.tok_s, 1)}<small>t/s</small>`;
+        } else {
+          decEl.textContent = "–";
+        }
+      }
+
+      const prefEl = $(`slot-prefill-${i}`);
+      if (prefEl) {
+        if (sState === "reading" && sInfo.prefill_tok_s) {
+          prefEl.innerHTML = `${fmt(sInfo.prefill_tok_s)}<small>t/s</small>`;
+        } else if (sState === "reading" && live.prefill_tok_s_mean) {
+          prefEl.innerHTML = `${fmt(live.prefill_tok_s_mean)}<small>t/s</small>`;
+        } else {
+          prefEl.textContent = "–";
+        }
+      }
+
+      const fillEl = $(`slot-fill-${i}`);
+      const phaseEl = $(`slot-phase-${i}`);
+      const tokensEl = $(`slot-tokens-${i}`);
+
+      let fillPct = 0;
+      let phaseText = "Idle · Slot ready";
+      let tokensText = sInfo.held_tokens ? `${fmt(sInfo.held_tokens)} held tokens` : "–";
+
+      if (sState === "reading") {
+        const pTotal = sInfo.prompt_total || sInfo.prompt_tokens || (live.state === "reading" ? (live.prompt_total || live.prompt_tokens) : 0);
+        const pRead = sInfo.prompt_read != null ? sInfo.prompt_read : (live.state === "reading" ? live.prompt_read : 0);
+        fillPct = pTotal ? Math.min(100, Math.round((100 * pRead) / pTotal)) : 50;
+        phaseText = `Reading prompt (${fillPct}%)`;
+        tokensText = pTotal ? `${fmt(pRead || 0)} / ${fmt(pTotal)} toks` : "";
+      } else if (sState === "generating") {
+        const gen = sInfo.generated != null ? sInfo.generated : (live.state === "generating" ? live.generated : 0);
+        const maxTok = live.max_tokens || 128;
+        fillPct = Math.min(100, Math.round((100 * (gen || 0)) / maxTok));
+        phaseText = "Decoding answer";
+        tokensText = `${fmt(gen || 0)} tokens generated`;
+      }
+
+      if (fillEl) {
+        fillEl.style.width = isBusy ? `${Math.max(8, fillPct)}%` : "0%";
+        fillEl.className = `slot-tile__bar-fill is-${sState}`;
+      }
+      if (phaseEl) phaseEl.textContent = phaseText;
+      if (tokensEl) tokensEl.textContent = tokensText;
+    }
+
+    const subEl = $("slots-dashboard-sub");
+    if (subEl) subEl.textContent = `${maxSlots} concurrent batch slots · Parallel decode & hot-swap`;
+    const stateBadge = $("slots-state-badge");
+    if (stateBadge) {
+      let overall = curConcurrency > 0 ? (activeGeneratingSlots.length > 0 ? "Generating" : "Reading") : (modelOp ? "Loading" : "Idle");
+      if (queuedCount > 0) overall += ` (${queuedCount} queued)`;
+      stateBadge.textContent = overall;
+      stateBadge.className = curConcurrency > 0 ? (activeGeneratingSlots.length > 0 ? "st-badge st-badge--generating" : "st-badge st-badge--reading") : "st-badge";
+    }
+    const activeBadge = $("slots-active-badge");
+    if (activeBadge) {
+      activeBadge.textContent = `${curConcurrency} / ${maxSlots} Active`;
+      activeBadge.className = curConcurrency > 0 ? "st-badge st-badge--generating" : "st-badge";
+    }
+  }
+
+  // Backwards compatibility for any legacy hooks
   for (const b of document.querySelectorAll("#state-badges .st-badge")) {
     let lit = false;
     if (b.dataset.s === "queued") {
@@ -450,56 +583,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     }
     b.classList.toggle("on", lit);
   }
-  const prog = $("state-progress");
-  let label = "Waiting for a request", detail = "", pct = 0;
-  if (modelOp === "load" || (busy != null && live.state === "unloaded" && !imageNow)) {
-    label = "Loading";
-    delete prog.dataset.tone;
-    detail = "The model is loading.";
-  } else if (imageNow && (live.state === "unloaded" || live.state === "reading" || live.state === "generating" || live.state === "idle")) {
-    label = live.state === "unloaded" ? "Loading" : "Generating image";
-    delete prog.dataset.tone;
-    detail = live.state === "unloaded" ? "The model is loading." : "An image is generating. It finishes on its own.";
-  } else if (modelOp === "unload") {
-    label = "Unloading";
-    delete prog.dataset.tone;
-    detail = "Freeing the GPU.";
-  } else if (live.state === "reading") {
-    label = "Reading prompt";
-    prog.dataset.tone = "info";
-    if (live.prompt_total) {
-      pct = (100 * live.prompt_read) / live.prompt_total;
-      detail = `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} tokens · ${fmt(pct)}%`;
-    } else {
-      detail = `${fmt(live.prompt_tokens)} tokens`;
-    }
-  } else if (live.state === "generating") {
-    label = live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Generating";
-    delete prog.dataset.tone;
-    pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
-    detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
-  } else if (live.state === "unloaded") {
-    label = "Unloaded";
-    delete prog.dataset.tone;
-    detail = "Load brings it back. A message does too.";
-  } else if (last) {
-    delete prog.dataset.tone;
-    detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
-  }
-  if (isQueued) {
-    if (live.state === "generating" || live.state === "reading") {
-      detail += ` · ${queuedCount} queued`;
-    } else if (live.state === "idle") {
-      label = "Queued";
-      prog.dataset.tone = "queued";
-      detail = `${queuedCount} request${queuedCount > 1 ? "s" : ""} waiting for a slot`;
-    }
-  }
-  $("state-label").textContent = label;
-  $("state-detail").textContent = detail;
-  $("state-bar").style.width = `${pct}%`;
+  if ($("state-label")) $("state-label").textContent = curConcurrency > 0 ? "Processing requests" : "Waiting for a request";
+  if ($("state-detail")) $("state-detail").textContent = `${curConcurrency} of ${maxSlots} slots active`;
+  if ($("state-bar")) $("state-bar").style.width = `${(100 * curConcurrency) / maxSlots}%`;
 
-  // the eight cards
+  // 2. Metrics Cards: Speed card (Aggregate Rates) & Queue Card (Last Card)
   function adjustedPrefillRate(r) {
     if (!r) return null;
     const pt = r.prompt_tokens || 0;
@@ -521,14 +609,49 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     return raw;
   }
 
-  const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
-  setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
-            live.state === "generating" ? "Decode now" : last ? "Decode last request" : "Decode");
+  // Compute aggregate decode speed across all active generating slots
+  let aggDecodeTokS = 0;
+  for (const s of activeGeneratingSlots) {
+    if (s.tok_s && typeof s.tok_s === "number" && s.tok_s > 0) {
+      aggDecodeTokS += s.tok_s;
+    }
+  }
+
+  let speed = null;
+  let speedLabel = "Decode";
+  if (aggDecodeTokS > 0) {
+    speed = aggDecodeTokS;
+    speedLabel = activeGeneratingSlots.length > 1
+      ? `Agg decode · ${activeGeneratingSlots.length} slots`
+      : "Decode now";
+  } else if (live.state === "generating") {
+    speed = live.tok_s;
+    speedLabel = curConcurrency > 1 ? `Agg decode · ${curConcurrency} slots` : "Decode now";
+  } else if (last) {
+    speed = last.decode_tok_s;
+    speedLabel = "Decode last request";
+  }
+
+  // Compute aggregate prefill speed across all active reading slots
+  let aggPrefillTokS = 0;
+  for (const s of activeReadingSlots) {
+    if (s.prefill_tok_s && typeof s.prefill_tok_s === "number" && s.prefill_tok_s > 0) {
+      aggPrefillTokS += s.prefill_tok_s;
+    }
+  }
+
   let prefill = null;
+  let prefillLabel = "Prefill";
   const lastAdjPrefill = adjustedPrefillRate(last);
   const slot0 = (live.slots && live.slots[0]) || null;
-  if (live.state === "reading") {
+  if (aggPrefillTokS > 0) {
+    prefill = aggPrefillTokS;
+    prefillLabel = activeReadingSlots.length > 1
+      ? `Agg prefill · ${activeReadingSlots.length} slots`
+      : "Prefill now";
+  } else if (live.state === "reading") {
     prefill = (live.prefill_tok_s_mean && live.prefill_tok_s_mean < 240 && (live.prompt_total || live.prompt_tokens || 0) > 2048) ? (lastAdjPrefill || live.prefill_tok_s_mean * 8.5) : live.prefill_tok_s_mean;
+    prefillLabel = "Prefill now";
   } else if (live.state === "generating") {
     const liveP = live.prefill_tok_s_mean;
     const slotRead = slot0 && slot0.prompt_read != null ? slot0.prompt_read : null;
@@ -539,16 +662,18 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     } else {
       prefill = lastAdjPrefill || liveP;
     }
+    prefillLabel = "Prefill this request";
   } else if (last) {
     prefill = lastAdjPrefill || live.prefill_tok_s_mean;
+    prefillLabel = "Prefill last request";
   } else if (live.prefill_tok_s_mean && live.prefill_tok_s_mean > 0) {
     prefill = live.prefill_tok_s_mean;
   }
   if (prefill != null && prefill <= 0) {
     prefill = (live.prefill_tok_s_mean && live.prefill_tok_s_mean > 0) ? live.prefill_tok_s_mean : null;
   }
-  setMetric("prefill", prefill == null || prefill <= 0 ? null : fmt(prefill), "t/s",
-            live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : last ? "Prefill last request" : "Prefill");
+  setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s", speedLabel);
+  setMetric("prefill", prefill == null || prefill <= 0 ? null : fmt(prefill), "t/s", prefillLabel);
 
   const curPrefillVal = (typeof prefill === "number") ? prefill : parseFloat(prefill) || 0;
   const curSpeedVal = (typeof speed === "number") ? speed : parseFloat(speed) || 0;
@@ -687,6 +812,19 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   }
   spark("sp-disk", h.disk_read_mb);
 
+  // Queue Metric Card (Last card in METRICS)
+  setMetric(
+    "queue",
+    queuedCount === 0 ? "0" : fmt(queuedCount),
+    queuedCount === 1 ? "request" : "requests",
+    queuedCount === 0 ? "No requests queued" : `${queuedCount} waiting for next free slot`
+  );
+  const qCard = $("card-queue") || ($("mv-queue") ? $("mv-queue").closest(".metric-card") : null);
+  if (qCard) {
+    qCard.classList.toggle("has-queue", queuedCount > 0);
+  }
+  spark("sp-queue", rawConc, Math.max(2, maxSlots));
+
   // context fill: the running request, else the last one
   const ctx = eng.max_context || 0;
   let used = 0;
@@ -706,70 +844,6 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   if (ramPct > 92) $("ram-progress").dataset.tone = "danger"; else delete $("ram-progress").dataset.tone;
   $("temp-text").textContent = hw.gpu_temp == null ? "–" : `${fmt(hw.gpu_temp)} °C`;
   $("temp-bar").style.width = hw.gpu_temp == null ? "0%" : `${Math.min(100, hw.gpu_temp)}%`;
-
-  // concurrency & queuing: active requests vs configured batch slots + queued count
-  if ($("mv-concurrency-slots")) {
-    $("mv-concurrency-slots").innerHTML = `${curConcurrency} <small>/ ${maxSlots}</small>`;
-    $("ms-concurrency-slots").textContent = curConcurrency === 0 ? "Slots idle" : `${curConcurrency} of ${maxSlots} active`;
-  }
-  if ($("mv-concurrency-queue")) {
-    const qValEl = $("mv-concurrency-queue");
-    qValEl.textContent = `${queuedCount}`;
-    qValEl.className = queuedCount > 0 ? "st-metric__value has-queue" : "st-metric__value";
-    $("ms-concurrency-queue").textContent = queuedCount === 0 ? "No queue" : `${queuedCount} in queue`;
-  }
-
-  // Update vertical slot bars: each vertical bar fills up as its concurrency slot is busy
-  const cBars = $("concurrency-bars");
-  if (cBars) {
-    if (cBars.children.length !== maxSlots) {
-      cBars.innerHTML = "";
-      for (let i = 0; i < maxSlots; i++) {
-        const item = document.createElement("div");
-        item.className = "slot-bar-item is-idle";
-        item.innerHTML = `
-          <div class="slot-bar-track">
-            <div class="slot-bar-fill is-idle" style="height:0%"></div>
-            <div class="slot-bar-ticks"></div>
-          </div>
-          <div class="slot-bar-info">
-            <span class="slot-bar-num">Slot ${i}</span>
-            <span class="slot-bar-state tone-idle">Idle</span>
-          </div>`;
-        cBars.appendChild(item);
-      }
-    }
-    for (let i = 0; i < maxSlots; i++) {
-      const item = cBars.children[i];
-      if (!item) continue;
-      const sInfo = slots[i] || {};
-      const isBusy = (sInfo.state && sInfo.state !== "idle") || (curConcurrency > i);
-      let state = "idle";
-      if (sInfo.state && sInfo.state !== "idle") {
-        state = (sInfo.state === "decoding" || sInfo.state === "generating") ? "generating" : "reading";
-      } else if (isBusy) {
-        state = (live && live.state === "reading") ? "reading" : "generating";
-      }
-
-      // Map to Model State names: "Idle", "Reading", "Generating"
-      const stateLabel = state === "generating" ? "Generating" : (state === "reading" ? "Reading" : "Idle");
-
-      item.className = `slot-bar-item is-${state}`;
-      item.title = `Slot ${i}: ${stateLabel}${sInfo.tok_s ? ` · ${sInfo.tok_s} tok/s` : ""}`;
-
-      const fill = item.querySelector(".slot-bar-fill");
-      if (fill) {
-        fill.style.height = isBusy ? "100%" : "0%";
-        fill.className = `slot-bar-fill is-${state}`;
-      }
-
-      const stEl = item.querySelector(".slot-bar-state");
-      if (stEl) {
-        stEl.textContent = stateLabel;
-        stEl.className = `slot-bar-state tone-${state}`;
-      }
-    }
-  }
 
   // recent requests
   const body = $("req-body");
