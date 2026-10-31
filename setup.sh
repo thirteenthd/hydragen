@@ -11,13 +11,31 @@ echo "=========================================================="
 echo "      Hydragen Engine Automated Setup & Updater           "
 echo "=========================================================="
 
-# Check if this is an update run
-if [ "$1" = "--update" ] || [ "$1" = "-u" ]; then
-    echo "[+] Updating Hydragen from git repository..."
-    if [ -d ".git" ]; then
-        git pull || true
+# Check arguments
+MODEL_DIR=""
+for arg in "$@"; do
+    case "$arg" in
+        --update|-u)
+            echo "[+] Updating Hydragen from git repository..."
+            if [ -d ".git" ]; then
+                git pull || true
+            fi
+            ;;
+        --model-dir=*)
+            MODEL_DIR="${arg#*=}"
+            ;;
+    esac
+done
+
+# Also check space-separated args
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+    if [ "${args[i]}" = "--model-dir" ] || [ "${args[i]}" = "-m" ]; then
+        if [ $((i+1)) -lt ${#args[@]} ]; then
+            MODEL_DIR="${args[i+1]}"
+        fi
     fi
-fi
+done
 
 # 1. Check Python (PyTorch/Triton/vLLM require Python >=3.10 and <=3.13)
 export PATH="$HOME/.local/bin:$PATH"
@@ -58,6 +76,15 @@ fi
 
 # 3. Virtual Environment Setup
 VENV_DIR="$SCRIPT_DIR/.venv"
+if [ -d "$VENV_DIR" ]; then
+    VENV_PY_MAJOR=$("$VENV_DIR/bin/python" -c 'import sys; print(sys.version_info.major)' 2>/dev/null || true)
+    VENV_PY_MINOR=$("$VENV_DIR/bin/python" -c 'import sys; print(sys.version_info.minor)' 2>/dev/null || true)
+    if [ "$VENV_PY_MAJOR" != "3" ] || [ "$VENV_PY_MINOR" -lt 10 ] || [ "$VENV_PY_MINOR" -gt 13 ]; then
+        echo "[!] Existing virtualenv in $VENV_DIR has unsupported Python ($VENV_PY_MAJOR.$VENV_PY_MINOR). Recreating with $PYTHON_CMD..."
+        rm -rf "$VENV_DIR"
+    fi
+fi
+
 if [ -z "$VIRTUAL_ENV" ]; then
     if [ ! -d "$VENV_DIR" ]; then
         echo "[+] Creating virtual environment in $VENV_DIR..."
@@ -106,20 +133,34 @@ if [ ! -f "$BIN_DIR/strata" ]; then
     fi
 fi
 
-# 6. Ensure strata_control and tools modules are available
-if [ ! -d "$SCRIPT_DIR/strata_control" ] && [ ! -d "../Strata/strata_control" ]; then
-    echo "[+] Downloading Strata control modules (v0.2.9 / 0.1.55)..."
+# 6. Ensure strata_control, tools, and data modules are available
+if [ ! -d "$SCRIPT_DIR/strata_control" ] || [ ! -d "$SCRIPT_DIR/data" ]; then
+    echo "[+] Downloading Strata control & data modules (v0.2.9 / 0.1.55)..."
     CTRL_URL="https://github.com/Niko1221/Strata/releases/download/v0.2.9/strata-control-0.1.55-linux-x86_64.tar.gz"
     if curl -sL --fail "$CTRL_URL" -o "$BIN_DIR/control.tar.gz"; then
-        tar -xzf "$BIN_DIR/control.tar.gz" -C "$SCRIPT_DIR" strata_control tools 2>/dev/null || tar -xzf "$BIN_DIR/control.tar.gz" -C "$SCRIPT_DIR"
+        tar -xzf "$BIN_DIR/control.tar.gz" -C "$SCRIPT_DIR" strata_control tools data 2>/dev/null || tar -xzf "$BIN_DIR/control.tar.gz" -C "$SCRIPT_DIR"
         rm -f "$BIN_DIR/control.tar.gz"
-        echo "[+] Successfully unpacked strata_control and tools into $SCRIPT_DIR"
+        echo "[+] Successfully unpacked strata_control, tools, and data into $SCRIPT_DIR"
     else
         echo "[!] Control modules auto-download failed."
     fi
 fi
 
-# 7. Generate Default Config if Missing
+# 7. Model Storage Configuration
+if [ -n "$MODEL_DIR" ] && [ -d "$MODEL_DIR" ]; then
+    echo "[+] Linking model directory: $MODEL_DIR -> $SCRIPT_DIR/models..."
+    ln -sfn "$MODEL_DIR" "$SCRIPT_DIR/models"
+fi
+
+if [ ! -e "$SCRIPT_DIR/models" ]; then
+    echo "[i] Note: Model weights not found in $SCRIPT_DIR/models."
+    echo "    Link or specify your models directory with:"
+    echo "      ./setup.sh --model-dir=/path/to/models"
+    echo "    or:"
+    echo "      ln -s /path/to/models $SCRIPT_DIR/models"
+fi
+
+# 8. Generate Default Config if Missing
 CONFIG_FILE="$SCRIPT_DIR/hydragen.json"
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "[+] Generating default hydragen.json template..."
@@ -127,22 +168,62 @@ if [ ! -f "$CONFIG_FILE" ]; then
 {
   "exe": "bin/strata",
   "args": [
+    "--pack", "models/packs/iq3_xxs",
+    "--native", "models/models/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+    "--ple-gguf", "models/models/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf",
+    "--expert-profile", "data/expert-profile.bin",
     "--expert-cache", "auto",
     "--prefill", "auto:16384",
     "--spec", "4",
+    "--mtp", "models/mtp/rt",
     "--max-context", "131072",
     "--kv", "int8",
+    "--vision",
     "--vram-reserve-mib", "1152",
     "--pcie-frac", "0.20",
     "--spec-min-p", "0.45",
+    "--coupled-draft",
+    "--adapt-every", "1",
+    "--adapt-swaps", "160",
+    "--adapt-decay", "0.97",
     "--adapt-async", "1",
     "--kv-resident", "32768",
+    "--conversation-cache-mib", "6144",
+    "--conversation-cache-slots", "8",
+    "--prompt-cache-tail",
     "--batch", "2",
     "--batch-mtp"
   ],
-  "batch": 2,
-  "max_context": 131072,
-  "log": "hydragen.log"
+  "cwd": ".",
+  "tokenizer": "models/packs/iq3_xxs/tokenizer",
+  "model_name": "qwen3.8-flash-next-iq3_xxs",
+  "log": "hydragen.log",
+  "port": 8080,
+  "gpu": 0,
+  "gpus_asked": true,
+  "host": "0.0.0.0",
+  "open_browser": false,
+  "vision": {
+    "exe": "bin/strata-vision",
+    "mmproj": "models/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+    "model": "models/models/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+    "gpu": false,
+    "max_tokens": 300,
+    "threads": 12
+  },
+  "allowed_hosts": [
+    "*"
+  ],
+  "env": {
+    "STRATA_PREFILL_CPU_SHARE": "auto",
+    "STRATA_PF_FUSED": "1",
+    "STRATA_PREFILL_EQUAL": "1",
+    "STRATA_ROUTE_PRIOR": "0.8"
+  },
+  "parallel": 2,
+  "reasoning_loop_recovery": "recover",
+  "reasoning_close_retry": true,
+  "repeat_stop_tokens": 64
 }
 EOF
 fi

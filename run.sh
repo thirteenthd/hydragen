@@ -24,5 +24,10 @@ if [ ! -f "$CONFIG_FILE" ]; then
     fi
 fi
 
+ENGINE_ARG=""
+if [[ "$*" != *"--engine"* ]]; then
+    ENGINE_ARG="--engine ${HYDRAGEN_ENGINE:-strata}"
+fi
+
 echo "[hydragen] Starting server using config: $CONFIG_FILE"
-exec hydragen --config "$CONFIG_FILE" --port 8080 --api-monitor "$@"
+exec hydragen $ENGINE_ARG --config "$CONFIG_FILE" --port 8080 --api-monitor "$@"
