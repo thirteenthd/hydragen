@@ -11,13 +11,16 @@ from strata_vllm.gguf_loader import (
     register_strata_gguf_types,
 )
 from strata_vllm.triton_moe import (
+    fused_moe_gguf_down_slot_kernel,
     fused_moe_indexed_slot_kernel,
     fused_moe_slot_kernel,
+    native_gguf_paged_moe_forward,
+    triton_gguf_down_slot_forward,
     triton_paged_moe_forward,
 )
 from strata_vllm.vllm_plugin import register_strata_vllm_plugin
 
-__version__ = "0.34.0"
+__version__ = "0.35.0"
 
 __all__ = [
     "CPUExpertFallbackExecutor",
@@ -26,9 +29,12 @@ __all__ = [
     "StrataCUDAKernelBridge",
     "StrataGGUFMoELoader",
     "VLLMEngine",
+    "fused_moe_gguf_down_slot_kernel",
     "fused_moe_indexed_slot_kernel",
     "fused_moe_slot_kernel",
+    "native_gguf_paged_moe_forward",
     "register_strata_gguf_types",
     "register_strata_vllm_plugin",
+    "triton_gguf_down_slot_forward",
     "triton_paged_moe_forward",
 ]

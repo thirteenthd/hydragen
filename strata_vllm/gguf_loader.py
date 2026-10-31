@@ -179,6 +179,165 @@ class StrataCUDAKernelBridge:
             ]
             self._router_top10.restype = None
 
+        # Direct compressed GGUF MoE execution (Option 2: zero BF16/FP16 materialization)
+        self._expert_blob_info = getattr(self._cdll, "strata_vllm_expert_blob_info", None)
+        if self._expert_blob_info is not None:
+            self._expert_blob_info.argtypes = [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_void_p,
+            ]
+            self._expert_blob_info.restype = None
+
+        self._expert_scratch_bytes = getattr(self._cdll, "strata_vllm_expert_scratch_bytes", None)
+        if self._expert_scratch_bytes is not None:
+            self._expert_scratch_bytes.argtypes = [ctypes.c_int64, ctypes.c_int64]
+            self._expert_scratch_bytes.restype = ctypes.c_uint64
+
+        self._native_expert_grouped = getattr(self._cdll, "strata_vllm_native_expert_grouped", None)
+        if self._native_expert_grouped is not None:
+            self._native_expert_grouped.argtypes = [
+                ctypes.c_int,      # gu_type
+                ctypes.c_int,      # d_type
+                ctypes.c_int64,    # n_embd
+                ctypes.c_int64,    # n_ff
+                ctypes.c_int64,    # n_tokens
+                ctypes.c_void_p,   # grp_ptr
+                ctypes.c_void_p,   # grp_start
+                ctypes.c_void_p,   # n_groups
+                ctypes.c_void_p,   # ent_dst
+                ctypes.c_void_p,   # ent_tok
+                ctypes.c_int64,    # cap_groups
+                ctypes.c_int64,    # cap_entries
+                ctypes.c_void_p,   # x_f32
+                ctypes.c_void_p,   # x_q8_1
+                ctypes.c_void_p,   # scratch
+                ctypes.c_void_p,   # out
+                ctypes.c_void_p,   # stream
+            ]
+            self._native_expert_grouped.restype = None
+
+        self._moe_combine_multi = getattr(self._cdll, "strata_vllm_moe_combine_multi", None)
+        if self._moe_combine_multi is not None:
+            self._moe_combine_multi.argtypes = [
+                ctypes.c_void_p,   # parts
+                ctypes.c_void_p,   # weights
+                ctypes.c_void_p,   # shared
+                ctypes.c_void_p,   # output
+                ctypes.c_int64,    # n_embd
+                ctypes.c_int64,    # k
+                ctypes.c_int,      # n_tok
+                ctypes.c_void_p,   # stream
+            ]
+            self._moe_combine_multi.restype = None
+
+    def expert_blob_info(self, gu_type: int, d_type: int, n_embd: int, n_ff: int) -> Dict[str, int]:
+        """Return exact byte offsets of [gate | up | down] in a compressed GGUF expert blob."""
+        if self._expert_blob_info is not None:
+            arr = (ctypes.c_uint64 * 5)()
+            self._expert_blob_info(int(gu_type), int(d_type), int(n_embd), int(n_ff), ctypes.byref(arr))
+            return {
+                "gu_row": int(arr[0]),
+                "d_row": int(arr[1]),
+                "up_off": int(arr[2]),
+                "down_off": int(arr[3]),
+                "blob_bytes": int(arr[4]),
+            }
+        gu_row = self.row_bytes(gu_type, n_embd)
+        d_row = self.row_bytes(d_type, n_ff)
+        up_off = gu_row * n_ff
+        down_off = up_off * 2
+        blob_bytes = down_off + d_row * n_embd
+        return {
+            "gu_row": gu_row,
+            "d_row": d_row,
+            "up_off": up_off,
+            "down_off": down_off,
+            "blob_bytes": blob_bytes,
+        }
+
+    def expert_scratch_bytes(self, cap_entries: int, n_ff: int) -> int:
+        if self._expert_scratch_bytes is not None:
+            return int(self._expert_scratch_bytes(int(cap_entries), int(n_ff)))
+        return int(cap_entries) * (int(n_ff) * 8 + 4096)
+
+    def native_expert_grouped_forward(
+        self,
+        gu_type: int,
+        d_type: int,
+        n_embd: int,
+        n_ff: int,
+        n_tokens: int,
+        grp_ptr: torch.Tensor,
+        grp_start: torch.Tensor,
+        n_groups: torch.Tensor,
+        ent_dst: torch.Tensor,
+        ent_tok: torch.Tensor,
+        cap_groups: int,
+        cap_entries: int,
+        x_f32: torch.Tensor,
+        x_q8_1: torch.Tensor,
+        scratch: torch.Tensor,
+        out_parts: torch.Tensor,
+        cuda_stream: Any = None,
+    ) -> None:
+        """Execute Strata's native INT8 grouped MoE directly on compressed GGUF VRAM blobs."""
+        if self._native_expert_grouped is None:
+            raise RuntimeError("strata_vllm_native_expert_grouped symbol not loaded in libstrata_iq_kernels.so")
+        stream_val = cuda_stream.cuda_stream if cuda_stream is not None else None
+        self._native_expert_grouped(
+            int(gu_type),
+            int(d_type),
+            int(n_embd),
+            int(n_ff),
+            int(n_tokens),
+            ctypes.c_void_p(grp_ptr.data_ptr()),
+            ctypes.c_void_p(grp_start.data_ptr()),
+            ctypes.c_void_p(n_groups.data_ptr()),
+            ctypes.c_void_p(ent_dst.data_ptr()),
+            ctypes.c_void_p(ent_tok.data_ptr()),
+            int(cap_groups),
+            int(cap_entries),
+            ctypes.c_void_p(x_f32.data_ptr()),
+            ctypes.c_void_p(x_q8_1.data_ptr()),
+            ctypes.c_void_p(scratch.data_ptr()),
+            ctypes.c_void_p(out_parts.data_ptr()),
+            ctypes.c_void_p(stream_val),
+        )
+
+    def moe_combine_multi(
+        self,
+        parts: torch.Tensor,
+        weights: torch.Tensor,
+        output: torch.Tensor,
+        n_embd: int,
+        top_k: int,
+        n_tok: int,
+        shared: Optional[torch.Tensor] = None,
+        cuda_stream: Any = None,
+    ) -> None:
+        """Weighted reduction over top-k expert outputs on GPU."""
+        stream_val = cuda_stream.cuda_stream if cuda_stream is not None else 0
+        if self._moe_combine_multi is not None and stream_val != 0 and 1 <= top_k <= 15:
+            self._moe_combine_multi(
+                ctypes.c_void_p(parts.data_ptr()),
+                ctypes.c_void_p(weights.data_ptr()),
+                ctypes.c_void_p(shared.data_ptr()) if shared is not None else None,
+                ctypes.c_void_p(output.data_ptr()),
+                int(n_embd),
+                int(top_k),
+                int(n_tok),
+                ctypes.c_void_p(stream_val),
+            )
+        else:
+            reshaped = parts.view(n_tok, top_k, n_embd)
+            weighted = (reshaped * weights.view(n_tok, top_k, 1)).sum(dim=1)
+            if shared is not None:
+                weighted = weighted + shared
+            output.copy_(weighted)
+
     def row_bytes(self, ggml_type: int, cols: int) -> int:
         """Return exact byte length of one row of `cols` elements for `ggml_type`."""
         rb = int(self._iq_row_bytes(int(ggml_type), int(cols)))
@@ -351,10 +510,41 @@ class StrataGGUFMoELoader:
             "bytes_gate": bytes_gate,
             "bytes_up": bytes_up,
             "bytes_down": bytes_down,
+            "up_off": bytes_gate,
+            "down_off": bytes_gate + bytes_up,
             "total_expert_bytes": bytes_gate + bytes_up + bytes_down,
         }
         self._layer_meta_cache[layer_idx] = meta
         return meta
+
+    def dma_compressed_expert_to_gpu(
+        self,
+        layer_idx: int,
+        expert_idx: int,
+        dst_blob_u8: torch.Tensor,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> int:
+        """DMA raw compressed GGUF expert blocks [gate | up | down] directly into VRAM slot.
+
+        Performs ZERO FP16/BF16 dequantization (1.54 - 1.69 MB per expert instead of 9.83 MB).
+        """
+        meta = self.get_layer_expert_metadata(layer_idx)
+        gate_t = self.tensor_map[f"blk.{layer_idx}.ffn_gate_exps.weight"]
+        up_t = self.tensor_map[f"blk.{layer_idx}.ffn_up_exps.weight"]
+        down_t = self.tensor_map[f"blk.{layer_idx}.ffn_down_exps.weight"]
+
+        bg = meta["bytes_gate"]
+        bu = meta["bytes_up"]
+        bd = meta["bytes_down"]
+
+        g_raw = np.frombuffer(gate_t.data, dtype=np.uint8, count=bg, offset=expert_idx * bg)
+        u_raw = np.frombuffer(up_t.data, dtype=np.uint8, count=bu, offset=expert_idx * bu)
+        d_raw = np.frombuffer(down_t.data, dtype=np.uint8, count=bd, offset=expert_idx * bd)
+
+        dst_blob_u8[:bg].copy_(torch.from_numpy(np.copy(g_raw)), non_blocking=True)
+        dst_blob_u8[bg : bg + bu].copy_(torch.from_numpy(np.copy(u_raw)), non_blocking=True)
+        dst_blob_u8[bg + bu : bg + bu + bd].copy_(torch.from_numpy(np.copy(d_raw)), non_blocking=True)
+        return bg + bu + bd
 
     def load_router_gate(
         self, layer_idx: int, device: torch.device = torch.device("cuda:0")

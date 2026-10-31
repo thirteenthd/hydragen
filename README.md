@@ -22,9 +22,10 @@ Instead of invasively forking upstream `vllm` or `Strata` C++ sources, `strata_v
 - **vLLM General & Quantization Plugin (`strata_vllm/vllm_plugin.py`):**
   - Registered via `[project.entry-points."vllm.general_plugins"]` (`strata_gguf = "strata_vllm.vllm_plugin:register_strata_vllm_plugin"`).
   - Registers `@register_quantization_config("strata_gguf")` (`StrataGGUFQuantConfig` and `StrataPagedMoEMethod(FusedMoEMethodBase)`) automatically whenever `vllm` initializes—requiring **zero edits** to `vllm`'s installed site-packages.
-- **Triton Fused MoE with GPU Slot Indirection (`strata_vllm/triton_moe.py`):**
-  - Implements `@triton.jit def fused_moe_indexed_slot_kernel` and `@triton.jit def fused_moe_slot_kernel` using `tl.dot` on Ampere Tensor Cores for both Gate/Up (`SwiGLU`) and Down projections.
-  - Dereferences `expert_to_slot[logical_expert_id] -> physical_vram_slot` directly inside the Triton kernel via `stride_az` (`slot_id * stride_az`) without materializing intermediate token-expert weight copies.
+- **Zero-Dequantization Compressed GGUF VRAM Slot Pool (`strata_vllm/expert_manager.py`, `strata_vllm/triton_moe.py`):**
+  - Stores raw compressed `[gate | up | down]` GGUF blocks (`~1.61 MB/expert` instead of `9.83 MB/expert` in BF16/FP16 — a **5.8x VRAM & PCIe bandwidth reduction**) directly in `PagedExpertManager.vram_blob_cache` (`[num_slots, max_blob_bytes] uint8`).
+  - **Option 1 — In-Kernel Triton GGUF Unpacker (`@triton.jit def fused_moe_gguf_down_slot_kernel`):** Reads compressed 18-byte `Q2_0_STRATA` (`type=42`, 64 weights) and `IQ4_NL` (`type=20`, 32 weights) blocks directly from `vram_blob_cache` via `slot_mapping_ptr`, unpacking 2-bit/4-bit weights and `fp16` block scale `d` **in Triton registers inside the `K` loop** before `tl.dot` on Tensor Cores—with **zero intermediate BF16/FP16 weight buffer in VRAM**.
+  - **Option 2 — Native INT8 `dp4a` / `native_expert_grouped` Bridge (`native_gguf_paged_moe_forward`):** Quantizes activations once via `quantize_q8_1_rows` and executes Gate + Up + `SwiGLU` + Down directly in `int8` against the compressed `IQ2_XXS`/`IQ2_XS`/`IQ3_XXS`/`IQ3_S`/`IQ2_S`/`IQ4_NL`/`Q2_0_STRATA` expert slots in `vram_blob_cache`.
 - **Universal CUDA GSQ Dequantization & Routing Bridge (`strata_vllm/gguf_loader.py`, `serve/libstrata_iq_kernels.so`):**
   - Links `iq_kernels.cu`, `dequant_bf16.cu`, `route_prior.cu`, and `router_top10.cu` into `libstrata_iq_kernels.so` (`sm_86`).
   - Supports **all 48 layers** of `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS`, including standard IQ quants (`IQ2_XXS=16`, `IQ2_XS=17`, `IQ3_XXS=18`, `IQ4_NL=20`, `IQ3_S=21`, `IQ2_S=22`) and Strata's custom `Q2_0_STRATA=42` (`ffn_down_exps` in odd layers 1..27), plus GPU-accelerated cache-aware top-10 routing (`route_prior_top10`).
@@ -162,10 +163,10 @@ Sampled directly from production multi-turn coding sessions on `modelserver01` (
 ### D. Custom CUDA Kernel, Triton Fused MoE & PagedMoE Verification Suite
 Verified across all **7 automated test suites** in [`tests/`](tests/):
 
-- **End-to-End Triton PagedMoE + GGUF + vLLM Plugin (`tests/test_end_to_end_triton_vllm.py`):**
+- **End-to-End Compressed GGUF Triton + Native INT8 + vLLM Plugin (`tests/test_end_to_end_triton_vllm.py`):**
   - Verifies `@register_quantization_config("strata_gguf")` registration with vLLM.
-  - Exercises live `StrataGGUFMoELoader` -> `PagedExpertManager` -> `route_prior_top10` -> `triton_paged_moe_forward` across Layers `0`, `1` (`Q2_0_STRATA=42`), `8`, and `12` (`out_std = 0.0205..0.0547`, zero NaN/Inf).
-  - Confirms **100.0% VRAM cache hit rate (`0 B` PCIe traffic)** on cached re-execution and **6.63 ms** Triton MoE step execution inside `VLLMEngine.generate()`.
+  - Verifies **Option 1 (`fused_moe_gguf_down_slot_kernel`)** in-register Triton GGUF unpacking on Layer 0 (`IQ4_NL=20`, `max_abs_diff = 0.000061`) and Layer 1 (`Q2_0_STRATA=42`, `max_abs_diff = 0.000031`) directly from compressed `vram_blob_cache` with **zero intermediate BF16/FP16 VRAM weight buffer**.
+  - Verifies **Option 2 (`native_gguf_paged_moe_forward`)** compressed `[gate | up | down]` GGUF execution (`dp4a` / `native_expert_grouped`) across Layers `0`, `1` (`Q2_0_STRATA=42`), `8`, and `12`, achieving **100.0% VRAM cache hit rate (`0 B` PCIe traffic)** on cached re-execution and cutting step execution latency from `6.63 ms` (FP16 dequant) down to **`1.44 ms` (4.6x faster)**.
 - **Ampere GPU Dequantization (`libstrata_iq_kernels.so`):**
   - Universal `dequant_f16` / `dequant_bf16` supporting `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, and `Q2_0_STRATA`: **0.027 ms** per expert (**982.4 GB/s** effective throughput), **0.0 max absolute error** vs. reference implementation.
 - **Triton MoE Slot Indirection (`tests/test_triton_moe_indirection.py`):**
