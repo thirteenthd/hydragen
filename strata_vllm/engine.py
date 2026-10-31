@@ -22,8 +22,10 @@ from strata_vllm.expert_locality_policy import ExpertLocalityPolicy
 from strata_vllm.expert_manager import PagedExpertManager
 from strata_vllm.gguf_loader import StrataGGUFMoELoader, register_strata_gguf_types
 from strata_vllm.triton_moe import (
+    fused_moe_gguf_down_slot_kernel,
     fused_moe_indexed_slot_kernel,
     fused_moe_slot_kernel,
+    triton_gguf_down_slot_forward,
     triton_paged_moe_forward,
 )
 
@@ -166,14 +168,36 @@ class VLLMEngine:
         self._tl = threading.local()
 
     def _warmup_triton_pipeline(self) -> None:
-        """JIT-compile and verify the Triton Fused MoE kernel on real GGUF experts at startup."""
+        """JIT-compile and verify Option 1 (Triton GGUF unpacker) & Option 2 (Native INT8 GGUF) at startup."""
         t0 = time.perf_counter()
         sample_tokens = torch.tensor([1, 15, 42, 100], dtype=torch.int32, device=self.device)
         out0, metrics0 = self.execute_triton_moe_step(sample_tokens, layer_idx=0)
         out1, metrics1 = self.execute_triton_moe_step(sample_tokens, layer_idx=1)
+
+        # Also JIT-compile Option 1 (`fused_moe_gguf_down_slot_kernel`) directly on compressed GGUF slots
+        if self.expert_manager.vram_blob_cache is not None:
+            inter = torch.randn((2, 4, self.n_ff), dtype=torch.float16, device=self.device)
+            for l_idx in (0, 1):
+                meta = self.loader.get_layer_expert_metadata(l_idx)
+                d_row = self.loader.bridge.row_bytes(meta["down_type"], self.n_ff)
+                slot_tbl = self.expert_manager.get_gpu_slot_table(l_idx)
+                res_ids = torch.nonzero(slot_tbl >= 0, as_tuple=False).reshape(-1)[:2].to(torch.int32)
+                if res_ids.numel() > 0:
+                    _ = triton_gguf_down_slot_forward(
+                        inter[: res_ids.numel()],
+                        res_ids,
+                        slot_tbl,
+                        self.expert_manager.vram_blob_cache,
+                        down_type=meta["down_type"],
+                        down_off=meta["down_off"],
+                        d_row_bytes=d_row,
+                        n_embd=self.n_embd,
+                        n_ff=self.n_ff,
+                    )
+
         dt_ms = (time.perf_counter() - t0) * 1000.0
         print(
-            f"[strata-vllm] Triton Fused MoE JIT warmup complete in {dt_ms:.1f} ms "
+            f"[strata-vllm] Compressed GGUF Triton+INT8 MoE warmup complete in {dt_ms:.1f} ms "
             f"(L0 finite={torch.isfinite(out0).all().item()}, L1[Q2_0_STRATA] finite={torch.isfinite(out1).all().item()}, "
             f"active_experts={int(metrics0['active_experts'] + metrics1['active_experts'])})"
         )

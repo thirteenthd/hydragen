@@ -3,10 +3,15 @@
 
 """PagedExpertManager: Tiered memory management and asynchronous expert hot-swapping for MoE models.
 
-Manages an L1 VRAM slot pool and an L2 host-memory / GGUF-mmap pool with on-GPU
-CUDA dequantization (`libstrata_iq_kernels.so`), enabling massive sparse MoE
-models (e.g. Qwen3.8-Flash-Next 512x56B) to execute through Triton Fused MoE
-kernels on 12 GB consumer GPUs.
+Supports two VRAM caching modes:
+1. Compressed GGUF Blob Mode (`compressed_cache=True`, default when `loader` is attached):
+   Stores raw quantized `[gate | up | down]` GGUF blocks directly in `vram_blob_cache`
+   (`~1.54 - 1.69 MB` per expert instead of `9.83 MB` in BF16/FP16 — a 5.8x VRAM savings
+   and zero intermediate dequantization buffer), consumed directly by both:
+   - Option 1: In-kernel Triton GGUF unpacker (`fused_moe_gguf_down_slot_kernel`)
+   - Option 2: Native CUDA INT8 `native_expert_grouped` (`dp4a` / `mma.sync`)
+2. FP16/BF16 Arena Mode (`compressed_cache=False`, or synthetic host-pool tests):
+   Stores `[num_slots, *expert_shape]` FP16/BF16 tensors in `vram_arena`.
 """
 
 from __future__ import annotations
@@ -17,9 +22,12 @@ import torch
 
 
 class PagedExpertManager:
-    """Manages dynamic allocation, slot indirection, async PCIe DMA transfers,
-    and on-GPU GGUF dequantization for Mixture-of-Experts weights.
+    """Manages dynamic allocation, slot indirection, and async PCIe DMA transfers
+    for Mixture-of-Experts weights in compressed GGUF or FP16 arena format.
     """
+
+    # Max compressed expert blob across all 48 layers of Qwen3.8-Flash-Next (<= 2.22 MB, aligned to 2.25 MB)
+    MAX_COMPRESSED_BLOB_BYTES = 2304 * 1024
 
     def __init__(
         self,
@@ -30,6 +38,7 @@ class PagedExpertManager:
         device: torch.device = torch.device("cuda:0"),
         loader: Optional[Any] = None,
         default_layer_idx: int = 0,
+        compressed_cache: Optional[bool] = None,
     ):
         self.num_slots = int(num_slots)
         self.expert_shape = tuple(expert_shape)
@@ -38,6 +47,7 @@ class PagedExpertManager:
         self.device = device
         self.loader = loader
         self.default_layer_idx = int(default_layer_idx)
+        self.compressed_cache = (loader is not None) if compressed_cache is None else bool(compressed_cache)
 
         # Telemetry counters
         self.cache_hits: int = 0
@@ -47,53 +57,77 @@ class PagedExpertManager:
         # Create dedicated CUDA stream first so CUDA context & stream memory are accounted for
         self.dma_stream = torch.cuda.Stream(device=device)
 
-        # Auto-clamp num_slots to available free GPU memory when sharing GPU
-        if self.loader is not None and torch.cuda.is_available():
-            free_b, _ = torch.cuda.mem_get_info(device)
-            elem_b = 2 if dtype in (torch.float16, torch.bfloat16) else 4
-            slot_b = elem_b
-            for d in self.expert_shape:
-                slot_b *= d
-            # Reserve at least 110 MiB for Triton JIT workspaces and staging buffers
-            usable_b = max(4 * slot_b, min(int(free_b * 0.50), free_b - 110 * 1024 * 1024))
-            max_fit_slots = max(4, int(usable_b // slot_b))
-            if self.num_slots > max_fit_slots:
-                self.num_slots = max_fit_slots
+        if self.compressed_cache and self.loader is not None:
+            self.max_blob_bytes = self.MAX_COMPRESSED_BLOB_BYTES
+            if torch.cuda.is_available():
+                free_b, _ = torch.cuda.mem_get_info(device)
+                # Leave >=110 MiB for Triton/CUDA scratch workspaces
+                usable_b = max(
+                    8 * self.max_blob_bytes,
+                    min(int(free_b * 0.65), free_b - 110 * 1024 * 1024),
+                )
+                max_fit_slots = max(8, int(usable_b // self.max_blob_bytes))
+                if self.num_slots > max_fit_slots:
+                    self.num_slots = max_fit_slots
 
-        # 1. Allocate L1 GPU VRAM Expert Arena [num_slots, *expert_shape]
-        self.vram_arena = torch.empty(
-            (self.num_slots, *self.expert_shape),
-            dtype=dtype,
-            device=device,
-        )
-
-        # 2. Allocate L2 Host Pool (when not backed by GGUF mmap loader) or
-        # compact pinned DMA staging buffers (when backed by GGUF mmap loader).
-        if self.loader is None:
-            self.host_pool: Optional[torch.Tensor] = torch.empty(
-                (self.total_experts, *self.expert_shape),
-                dtype=dtype,
-                device="cpu",
-                pin_memory=True,
+            # Compressed L1 GPU VRAM Slot Pool: [num_slots, max_blob_bytes] uint8 (~1.75 MB/slot vs 9.83 MB FP16)
+            self.vram_blob_cache: Optional[torch.Tensor] = torch.empty(
+                (self.num_slots, self.max_blob_bytes),
+                dtype=torch.uint8,
+                device=device,
             )
+            self.vram_arena: Optional[torch.Tensor] = None
+            self.host_pool: Optional[torch.Tensor] = None
             self.staging_gate_u8 = None
             self.staging_up_u8 = None
             self.staging_down_u8 = None
         else:
-            self.host_pool = None
-            # Max compressed bytes per projection across all layers (<= 1.2 MB)
-            max_proj_bytes = 1536 * 1024
-            self.staging_gate_u8 = torch.empty(
-                (max_proj_bytes,), dtype=torch.uint8, device=device
-            )
-            self.staging_up_u8 = torch.empty(
-                (max_proj_bytes,), dtype=torch.uint8, device=device
-            )
-            self.staging_down_u8 = torch.empty(
-                (max_proj_bytes,), dtype=torch.uint8, device=device
+            self.vram_blob_cache = None
+            self.max_blob_bytes = 0
+            # Auto-clamp num_slots to available free GPU memory when sharing GPU
+            if self.loader is not None and torch.cuda.is_available():
+                free_b, _ = torch.cuda.mem_get_info(device)
+                elem_b = 2 if dtype in (torch.float16, torch.bfloat16) else 4
+                slot_b = elem_b
+                for d in self.expert_shape:
+                    slot_b *= d
+                usable_b = max(4 * slot_b, min(int(free_b * 0.50), free_b - 110 * 1024 * 1024))
+                max_fit_slots = max(4, int(usable_b // slot_b))
+                if self.num_slots > max_fit_slots:
+                    self.num_slots = max_fit_slots
+
+            # 1. Allocate L1 GPU VRAM Expert Arena [num_slots, *expert_shape]
+            self.vram_arena = torch.empty(
+                (self.num_slots, *self.expert_shape),
+                dtype=dtype,
+                device=device,
             )
 
-        # 3. GPU-resident Indirection Table for Triton / CUTLASS kernels
+            # 2. Allocate L2 Host Pool (when not backed by GGUF mmap loader) or staging buffers
+            if self.loader is None:
+                self.host_pool = torch.empty(
+                    (self.total_experts, *self.expert_shape),
+                    dtype=dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                self.staging_gate_u8 = None
+                self.staging_up_u8 = None
+                self.staging_down_u8 = None
+            else:
+                self.host_pool = None
+                max_proj_bytes = 1536 * 1024
+                self.staging_gate_u8 = torch.empty(
+                    (max_proj_bytes,), dtype=torch.uint8, device=device
+                )
+                self.staging_up_u8 = torch.empty(
+                    (max_proj_bytes,), dtype=torch.uint8, device=device
+                )
+                self.staging_down_u8 = torch.empty(
+                    (max_proj_bytes,), dtype=torch.uint8, device=device
+                )
+
+        # 3. GPU-resident Indirection Table for Triton / CUDA kernels
         # gpu_slot_table[expert_id] == slot_idx (or -1 if not resident)
         self.gpu_slot_table = torch.full(
             (self.total_experts,),
@@ -167,15 +201,49 @@ class PagedExpertManager:
         total = self.cache_hits + self.cache_misses
         return float(self.cache_hits) / float(total) if total > 0 else 1.0
 
+    def _dma_expert_into_slot(self, layer_idx: int, expert_id: int, target_slot: int) -> None:
+        if self.loader is not None:
+            if self.compressed_cache and self.vram_blob_cache is not None:
+                n_bytes = self.loader.dma_compressed_expert_to_gpu(
+                    layer_idx,
+                    expert_id,
+                    self.vram_blob_cache[target_slot],
+                    stream=self.dma_stream,
+                )
+                self.pcie_bytes_transferred += n_bytes
+            else:
+                has_up = self.vram_arena.shape[1] >= 3
+                dst_gate = self.vram_arena[target_slot, 0]
+                dst_up = self.vram_arena[target_slot, 1] if has_up else None
+                dst_down = self.vram_arena[target_slot, 2 if has_up else 1]
+                n_bytes = self.loader.dequantize_expert_to_gpu(
+                    layer_idx,
+                    expert_id,
+                    dst_gate,
+                    dst_down,
+                    self.staging_gate_u8,
+                    self.staging_down_u8,
+                    stream=self.dma_stream,
+                    dst_up_fp16=dst_up,
+                    staging_up_u8=self.staging_up_u8 if has_up else None,
+                )
+                self.pcie_bytes_transferred += n_bytes
+        elif self.host_pool is not None:
+            self.vram_arena[target_slot].copy_(
+                self.host_pool[expert_id],
+                non_blocking=True,
+            )
+            self.pcie_bytes_transferred += (
+                self.host_pool[expert_id].numel()
+                * self.host_pool[expert_id].element_size()
+            )
+
     def request_experts(
         self,
         required_expert_ids: List[int],
         locked_slots: Optional[Set[int]] = None,
     ) -> Dict[int, int]:
-        """Ensures all required_expert_ids are resident in VRAM for default_layer_idx.
-        Issues asynchronous DMA transfers (and on-GPU GGUF dequantization if
-        `self.loader` is attached) for missing experts on `self.dma_stream`.
-        """
+        """Ensures all required_expert_ids are resident in VRAM for default_layer_idx."""
         if locked_slots is None:
             locked_slots = set()
 
@@ -189,6 +257,9 @@ class PagedExpertManager:
 
         table_updated = False
         locked_all = set(locked_slots)
+        for eid in required_expert_ids:
+            if eid in self.residency_map:
+                locked_all.add(self.residency_map[eid])
 
         for expert_id in missing:
             if self.free_slots:
@@ -198,32 +269,7 @@ class PagedExpertManager:
             locked_all.add(target_slot)
 
             with torch.cuda.stream(self.dma_stream):
-                if self.loader is not None:
-                    has_up = self.vram_arena.shape[1] >= 3
-                    dst_gate = self.vram_arena[target_slot, 0]
-                    dst_up = self.vram_arena[target_slot, 1] if has_up else None
-                    dst_down = self.vram_arena[target_slot, 2 if has_up else 1]
-                    n_bytes = self.loader.dequantize_expert_to_gpu(
-                        self.default_layer_idx,
-                        expert_id,
-                        dst_gate,
-                        dst_down,
-                        self.staging_gate_u8,
-                        self.staging_down_u8,
-                        stream=self.dma_stream,
-                        dst_up_fp16=dst_up,
-                        staging_up_u8=self.staging_up_u8 if has_up else None,
-                    )
-                    self.pcie_bytes_transferred += n_bytes
-                elif self.host_pool is not None:
-                    self.vram_arena[target_slot].copy_(
-                        self.host_pool[expert_id],
-                        non_blocking=True,
-                    )
-                    self.pcie_bytes_transferred += (
-                        self.host_pool[expert_id].numel()
-                        * self.host_pool[expert_id].element_size()
-                    )
+                self._dma_expert_into_slot(self.default_layer_idx, expert_id, target_slot)
 
             # Update CPU mapping state
             self.residency_map[expert_id] = target_slot
@@ -270,7 +316,6 @@ class PagedExpertManager:
 
         dirty_layers: Set[int] = set()
         locked_all = set(locked_slots)
-        # Protect slots already assigned to other experts in this same step
         for eid in required_expert_ids:
             key = (layer_idx, eid)
             if key in self.residency_map:
@@ -286,23 +331,7 @@ class PagedExpertManager:
             locked_all.add(target_slot)
 
             with torch.cuda.stream(self.dma_stream):
-                if self.loader is not None:
-                    has_up = self.vram_arena.shape[1] >= 3
-                    dst_gate = self.vram_arena[target_slot, 0]
-                    dst_up = self.vram_arena[target_slot, 1] if has_up else None
-                    dst_down = self.vram_arena[target_slot, 2 if has_up else 1]
-                    n_bytes = self.loader.dequantize_expert_to_gpu(
-                        layer_idx,
-                        eid,
-                        dst_gate,
-                        dst_down,
-                        self.staging_gate_u8,
-                        self.staging_down_u8,
-                        stream=self.dma_stream,
-                        dst_up_fp16=dst_up,
-                        staging_up_u8=self.staging_up_u8 if has_up else None,
-                    )
-                    self.pcie_bytes_transferred += n_bytes
+                self._dma_expert_into_slot(layer_idx, eid, target_slot)
 
             key = (layer_idx, eid)
             self.residency_map[key] = target_slot
