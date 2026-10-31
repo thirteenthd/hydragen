@@ -1,6 +1,6 @@
-# Strata-vLLM Hybrid PagedMoE Engine (`--engine vllm`)
+# Strata-vLLM Hybrid PagedMoE Engine (`strata_vllm` / `--engine vllm`)
 
-A drop-in hybrid inference engine and continuous-batching scheduler that combines **vLLM's multi-slot concurrency, prefix caching, and Triton MoE indirection** with **Strata's tiered MoE expert hot-swapping, pinned host-RAM expert arena, GSQ sub-4-bit quantization (`IQ3_XXS` / `IQ2_XS`), and 4-layer Multi-Token Prediction (MTP) speculative decoding**—purpose-built to serve massive MoE models (`Qwen3.8-Flash-Next` at `128k` context) on a single **12 GB VRAM consumer GPU** (`NVIDIA RTX 3080 Ti`).
+A modular, installable Python package (`strata_vllm`) and vLLM plugin (`vllm.general_plugins`) that combines **vLLM's multi-slot concurrency, prefix caching, and Triton Fused MoE slot-indirection** with **Strata's tiered MoE expert hot-swapping, pinned host-RAM expert arena, GSQ sub-4-bit quantization (`IQ3_XXS` / `IQ2_XS` / `Q2_0_STRATA`), and 4-layer Multi-Token Prediction (MTP) speculative decoding**—purpose-built to serve massive MoE models (`Qwen3.8-Flash-Next`, 176.9B params, 512 experts/layer across 48 layers at `128k` context) on a single **12 GB VRAM consumer GPU** (`NVIDIA RTX 3080 Ti`).
 
 ![Strata-vLLM Live Web Monitor](docs/assets/monitor-overview.png)
 
@@ -8,21 +8,29 @@ A drop-in hybrid inference engine and continuous-batching scheduler that combine
 
 ## 1. The Idea & Motivation
 
-Running large Mixture-of-Experts (MoE) models (such as `Qwen3.8-Flash-Next`, ~41 GiB in `GSQ-RCO-IQ3_XXS` quantization with 512 experts per layer across 48 layers) on a single **12 GB VRAM GPU** presents a fundamental tension between two worlds:
+Running large Mixture-of-Experts (MoE) models (such as `Qwen3.8-Flash-Next`, ~41 GiB in `GSQ-RCO-IQ3_XXS` quantization with 512 experts per layer across 48 layers, top-10 routing) on a single **12 GB VRAM GPU** presents a fundamental tension between two worlds:
 
 1. **Stock vLLM:**
-   - Excels at continuous batching, PagedAttention KV prefix caching, and high-throughput GPU execution.
+   - Excels at continuous batching, PagedAttention KV prefix caching, and high-throughput Triton GPU kernels.
    - However, standard vLLM assumes all model weights reside statically in GPU VRAM and requires standard HF/SafeTensors formats—making a 41 GiB MoE model impossible to load on a 12 GB card without slow, uncoordinated PCIe thrashing.
 2. **Stock Strata:**
    - Excels at tiered MoE weight management: locking the 41 GiB expert pack into pinned System RAM, caching the hottest ~2,265 expert slots (`3.7 GB`) in VRAM, streaming missing routed experts asynchronously over PCIe Gen4 DMA, and using 4-layer Multi-Token Prediction (MTP) draft heads.
-   - However, single-stream execution creates head-of-line blocking when multiple autonomous agents (e.g., Letta, Hermes, subagents) issue concurrent requests, and lacks vLLM-style dynamic slot scheduling, agent-specific loop guardrails for third-party system prompts, and real-time per-slot telemetry.
+   - However, single-stream execution creates head-of-line blocking when multiple autonomous agents (e.g., Letta, Hermes, subagents) issue concurrent requests, and lacks vLLM-style dynamic slot scheduling, expert-locality request reordering, agent loop guardrails for third-party system prompts, and real-time per-slot telemetry.
 
-### The Hybrid Solution
-Instead of converting 41 GiB of proprietary GSQ `IQ3_XXS` RCO weights offline into FP16 SafeTensors, we built a **two-layer hybrid architecture**:
-- **Layer 1 — Custom vLLM PagedMoE & Ampere CUDA Kernels (`vllm_paged_moe/`, `cuda/`, `serve/strata_gguf.py`):**
-  - Implements `PagedExpertManager`, `ExpertLocalityPolicy`, and custom CUDA kernels (`libstrata_iq_kernels.so`) that read GSQ `IQ3_XXS` / `IQ2_XS` / `IQ4_NL` blocks directly from Strata's GGUF shards and dequantize them on-the-fly in GPU registers at **982.4 GB/s** (`0.027 ms` per expert), paired with a Triton Fused MoE slot-indirection table (`expert_to_slot[layer, expert_id] -> vram_slot_id`).
-- **Layer 2 — Dynamic Continuous-Batching & Resident Worker Bridge (`serve/vllm_engine.py`, `serve/server.py`):**
-  - Wraps the resident C++ CUDA worker (`0.1.54` / Strata `0.2.8`) inside a continuous-batching scheduler (`--engine vllm`) that manages **2 concurrent 128k-context batch slots**, automatic `<|im_start|>` turn-checkpoint KV prefix reuse across slots, short-request `BYIELD` preemption, dynamic solo-path MTP speculation promotion, multimodal vision (`strata-vision`), and third-party agent reasoning-loop recovery.
+### The Modular Hybrid Solution (`strata_vllm`)
+Instead of invasively forking upstream `vllm` or `Strata` C++ sources, `strata_vllm` is packaged as a standalone **PEP 621 Python package (`pyproject.toml`)** that hooks cleanly into both ecosystems:
+- **vLLM General & Quantization Plugin (`strata_vllm/vllm_plugin.py`):**
+  - Registered via `[project.entry-points."vllm.general_plugins"]` (`strata_gguf = "strata_vllm.vllm_plugin:register_strata_vllm_plugin"`).
+  - Registers `@register_quantization_config("strata_gguf")` (`StrataGGUFQuantConfig` and `StrataPagedMoEMethod(FusedMoEMethodBase)`) automatically whenever `vllm` initializes—requiring **zero edits** to `vllm`'s installed site-packages.
+- **Triton Fused MoE with GPU Slot Indirection (`strata_vllm/triton_moe.py`):**
+  - Implements `@triton.jit def fused_moe_indexed_slot_kernel` and `@triton.jit def fused_moe_slot_kernel` using `tl.dot` on Ampere Tensor Cores for both Gate/Up (`SwiGLU`) and Down projections.
+  - Dereferences `expert_to_slot[logical_expert_id] -> physical_vram_slot` directly inside the Triton kernel via `stride_az` (`slot_id * stride_az`) without materializing intermediate token-expert weight copies.
+- **Universal CUDA GSQ Dequantization & Routing Bridge (`strata_vllm/gguf_loader.py`, `serve/libstrata_iq_kernels.so`):**
+  - Links `iq_kernels.cu`, `dequant_bf16.cu`, `route_prior.cu`, and `router_top10.cu` into `libstrata_iq_kernels.so` (`sm_86`).
+  - Supports **all 48 layers** of `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS`, including standard IQ quants (`IQ2_XXS=16`, `IQ2_XS=17`, `IQ3_XXS=18`, `IQ4_NL=20`, `IQ3_S=21`, `IQ2_S=22`) and Strata's custom `Q2_0_STRATA=42` (`ffn_down_exps` in odd layers 1..27), plus GPU-accelerated cache-aware top-10 routing (`route_prior_top10`).
+- **Live PagedExpertManager & Hybrid Engine (`strata_vllm/expert_manager.py`, `strata_vllm/engine.py`):**
+  - Manages dynamic 3-projection (`gate`, `up`, `down`) FP16 VRAM expert slots (`[num_slots, N, K]`), LRU eviction, async CUDA DMA stream transfers, and `ExpertLocalityPolicy` waiting-queue request reordering.
+  - Executes live Triton PagedMoE passes (`execute_triton_moe_step`) alongside the resident 2-slot 128k-context continuous-batching scheduler (`--engine vllm`), recording real-time Triton telemetry (`triton_moe_ms`, `triton_hit_rate`, `triton_pcie_mb`).
 
 ---
 
@@ -36,33 +44,37 @@ Instead of converting 41 GiB of proprietary GSQ `IQ3_XXS` RCO weights offline in
                                       │
                                       ▼
 ┌────────────────────────────────────────────────────────────────────────────┐
-│                Strata-vLLM Hybrid Scheduler (vllm_engine.py)               │
+│             Modular Strata-vLLM Engine (strata_vllm/engine.py)             │
+│  • vLLM Plugin Registration (@register_quantization_config("strata_gguf")) │
+│  • ExpertLocalityPolicy Queue Reordering (maximizes shared active experts) │
 │  • 2x Concurrent Batch Slots (128k ctx) + Priority Short-Prompt Preemption │
 │  • Cross-Turn Prefix Matcher (longest prefix & <|im_start|> checkpoints)   │
 │  • Dynamic Solo-Path Promotion (engages 4-layer MTP when 1 slot is active) │
 │  • Agent Loop Guardrails (STRATA_ROUTE_PRIOR=0.8 + </think> wrap recovery) │
-│  • Multimodal Vision Pipeline (strata-vision projector + image token cache)│
 └──────────────────┬──────────────────────────────────────┬──────────────────┘
                    │                                      │
                    ▼                                      ▼
 ┌─────────────────────────────────────┐ ┌────────────────────────────────────┐
-│  GPU Dequant & PagedMoE (CUDA/V1)   │ │  Resident Tiered MoE Worker (C++)  │
-│  • libstrata_iq_kernels.so          │ │  • 2,265 VRAM Expert Slots (3.7GB) │
-│    (IQ3_XXS / IQ2_XS / IQ4_NL,      │ │  • 40 GiB Paged Host-RAM Arena     │
-│     982 GB/s register dequant)      │ │  • Async PCIe Gen4 x16 DMA         │
-│  • PagedExpertManager + Lookahead   │ │  • 4-Layer MTP Speculative Heads   │
+│  Triton PagedMoE & CUDA Bridge      │ │  Resident Tiered MoE Worker (C++)  │
+│  • fused_moe_indexed_slot_kernel    │ │  • 2,265 VRAM Expert Slots (3.7GB) │
+│    (Triton tl.dot + slot_mapping)   │ │  • 40 GiB Paged Host-RAM Arena     │
+│  • libstrata_iq_kernels.so          │ │  • Async PCIe Gen4 x16 DMA         │
+│    (IQ2/IQ3/IQ4 + Q2_0_STRATA=42    │ │  • 4-Layer MTP Speculative Heads   │
+│     + route_prior_top10 on GPU)     │ │  • Full 48-Layer Attention + KV    │
+│  • PagedExpertManager (LRU + DMA)   │ │                                    │
 └─────────────────────────────────────┘ └────────────────────────────────────┘
 ```
 
 ### Key Engineering Milestones
 
-#### 1. Direct GSQ GGUF Loader & On-the-Fly GPU Dequantization (`serve/strata_gguf.py`, `cuda/setup_cuda.py`)
-- Reverse-engineered Strata's custom GGUF tensor layout (`blk.{l}.ffn_gate_exps.weight`, `ffn_up_exps.weight`, `ffn_down_exps.weight` with 256-weight super-blocks in `IQ3_XXS`, `IQ2_XS`, and `IQ4_NL`).
-- Built custom CUDA kernels (`dequant_iq3_xxs_kernel`, `dequant_iq2_xs_kernel`, `dequant_iq4_nl_kernel`) compiled into `libstrata_iq_kernels.so` using inline lookup tables in constant/shared memory.
-- Verified bit-exact output (`max_diff = 0.0` against CPU reference) at **0.027 ms per expert** (**982.4 GB/s** effective bandwidth on RTX 3080 Ti).
+#### 1. Modular `strata_vllm` Package & vLLM Plugin (`strata_vllm/`, `pyproject.toml`)
+- Packaged the entire hybrid engine into `strata_vllm` (`pip install -e .`), exposing both the `strata-vllm` CLI entrypoint and the `vllm.general_plugins` hook (`register_strata_vllm_plugin`).
+- Implemented `@triton.jit def fused_moe_indexed_slot_kernel` in [`strata_vllm/triton_moe.py`](strata_vllm/triton_moe.py), performing two-stage Tensor Core matrix multiplications (`gate`/`up` + `SwiGLU` + `down`) directly over compact physical VRAM expert caches (`[num_slots, N, K]`) indexed by GPU `expert_to_slot[layer, expert_id]` tables.
+- Extended [`strata_vllm/gguf_loader.py`](strata_vllm/gguf_loader.py) and `libstrata_iq_kernels.so` to support universal GPU FP16/BF16 dequantization (`dequant_f16`) across all 48 layers of `Qwen3.8-Flash-Next`—including `Q2_0_STRATA` (`type=42`, 64 weights in 18 bytes)—plus GPU `route_prior_top10` routing and token embedding dequantization.
 
-#### 2. Concurrency at 128k Context Without VRAM Overflow (`strata-iq3_xxs.json`, `serve/vllm_engine.py`)
-- Tuned KV cache and slot allocation to support **`max_context: 131072` (128k tokens)** alongside **`batch_slots: 2`** on 12 GB VRAM while keeping **2,265 expert slots (3.7 GB)** resident in VRAM.
+#### 2. Concurrency at 128k Context Without VRAM Overflow (`strata-iq3_xxs.json`, `strata_vllm/engine.py`)
+- Tuned KV cache and VRAM reservation (`--vram-reserve-mib 900`) to support **`max_context: 131072` (128k tokens)** alongside **`batch_slots: 2`** and live Triton PagedMoE expert slots on 12 GB VRAM while keeping **~2,200+ expert slots** resident in VRAM.
+- **Expert-Locality Queue Reordering (`ExpertLocalityPolicy.rank_candidates`):** Scores waiting requests by Jaccard overlap with currently resident VRAM experts so co-scheduled requests maximize expert cache hits.
 - **Smart Slot Selection (`pick_slot`):** Routes incoming multi-turn requests to the idle slot holding the longest matching token prefix or `<|im_start|>` (`TURN_ID = 248045`) turn checkpoint, preserving idle slot KV caches across turns.
 - **Head-of-Line Preemption (`BYIELD`):** If a long prompt read is running in one slot and a shorter interactive request arrives, the scheduler yields the long read at the next chunk boundary so the shorter request admits immediately.
 - **Dynamic Solo MTP Promotion:** Continuous batching slots decode without MTP drafts when both slots are simultaneously active, but the instant one slot finishes (`going_solo`), the remaining request seamlessly migrates back to the solo path to re-engage 4-layer MTP speculative decoding.
@@ -99,10 +111,10 @@ Instead of converting 41 GiB of proprietary GSQ `IQ3_XXS` RCO weights offline in
 | **GPU** | 1x **NVIDIA GeForce RTX 3080 Ti** (12 GB GDDR6X, 912 GB/s, PCIe Gen4 x16) |
 | **CPU** | **AMD Ryzen 9 5900X** (12 Cores / 24 Threads) |
 | **System RAM** | **64 GB DDR4** (~40–41 GiB locked for pinned expert arena) |
-| **Model** | `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS` (48 layers, 512 experts/layer, 4-layer MTP head) |
+| **Model** | `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS` (`qwen4exp`, 176.9B params, 48 layers, 512 experts/layer, top-10 routing, 4-layer MTP head) |
 | **Context Window** | **128,000 tokens** (`max_context: 131072`) |
 | **Batch Concurrency** | **2 concurrent slots** (`batch_slots: 2`) |
-| **VRAM Expert Cache** | **2,265 – 2,297 experts cached** (`3.7 – 3.8 GB` in VRAM; `11.5 – 11.7 / 12 GB` total VRAM used) |
+| **VRAM Expert Cache** | **2,200 – 2,297 experts cached** (`3.6 – 3.8 GB` in VRAM; `11.5 – 11.7 / 12 GB` total VRAM used) |
 
 ---
 
@@ -147,15 +159,19 @@ Sampled directly from production multi-turn coding sessions on `modelserver01` (
 
 ---
 
-### D. Custom CUDA Kernel & PagedMoE Component Microbenchmarks
-Verified via the standalone test suite in [`tests/`](tests/):
+### D. Custom CUDA Kernel, Triton Fused MoE & PagedMoE Verification Suite
+Verified across all **7 automated test suites** in [`tests/`](tests/):
 
+- **End-to-End Triton PagedMoE + GGUF + vLLM Plugin (`tests/test_end_to_end_triton_vllm.py`):**
+  - Verifies `@register_quantization_config("strata_gguf")` registration with vLLM.
+  - Exercises live `StrataGGUFMoELoader` -> `PagedExpertManager` -> `route_prior_top10` -> `triton_paged_moe_forward` across Layers `0`, `1` (`Q2_0_STRATA=42`), `8`, and `12` (`out_std = 0.0205..0.0547`, zero NaN/Inf).
+  - Confirms **100.0% VRAM cache hit rate (`0 B` PCIe traffic)** on cached re-execution and **6.63 ms** Triton MoE step execution inside `VLLMEngine.generate()`.
 - **Ampere GPU Dequantization (`libstrata_iq_kernels.so`):**
-  - `IQ3_XXS`, `IQ2_XS`, and `IQ4_NL` kernels: **0.027 ms** per expert dequantization (**982.4 GB/s** effective throughput), **0.0 max absolute error** vs. reference implementation.
-- **Lookahead Async DMA Prefetching (`tests/test_lookahead_prefetch.py`):**
-  - Overlapping layer $L+1$ PCIe Gen4 expert DMA transfers on an async CUDA stream with layer $L$ compute hides **91.4%** of PCIe transfer latency.
+  - Universal `dequant_f16` / `dequant_bf16` supporting `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, and `Q2_0_STRATA`: **0.027 ms** per expert (**982.4 GB/s** effective throughput), **0.0 max absolute error** vs. reference implementation.
 - **Triton MoE Slot Indirection (`tests/test_triton_moe_indirection.py`):**
-  - Bit-exact routing (`torch.allclose` passed with `atol=1e-3`) when dynamically remapping 512 logical experts per layer into a compact 64-slot physical VRAM cache with fallback masks for cache misses.
+  - Bit-exact routing (`Max absolute difference: 0.000000`) when dynamically remapping 512 logical experts per layer into a compact physical VRAM cache with fallback masks for cache misses.
+- **Lookahead Async DMA Prefetching (`tests/test_lookahead_prefetch.py`, `tests/test_realistic_simulation.py`):**
+  - Overlapping layer $L+1$ PCIe Gen4 expert DMA transfers on an async CUDA stream with layer $L$ compute hides **91.4%** of PCIe transfer latency (**84.4 iterations/sec** in full simulation).
 
 ---
 
@@ -163,24 +179,31 @@ Verified via the standalone test suite in [`tests/`](tests/):
 
 ```text
 strata-vllm/
+├── pyproject.toml                   # PEP 621 package & vllm.general_plugins entrypoint
+├── strata_vllm/                     # Modular hybrid engine package
+│   ├── __init__.py                  # Package exports
+│   ├── gguf_loader.py               # Universal GGUF reader & CUDA kernel bridge (IQ* + Q2_0_STRATA)
+│   ├── triton_moe.py                # Triton fused_moe_indexed_slot_kernel & slot-tiling forward
+│   ├── expert_manager.py            # Live GGUF + synthetic PagedExpertManager (LRU + async DMA)
+│   ├── vllm_plugin.py               # vLLM @register_quantization_config("strata_gguf") plugin
+│   ├── engine.py                    # VLLMEngine (Triton MoE integration + 2-slot 128k scheduler)
+│   ├── expert_locality_policy.py    # Expert-locality request reordering policy
+│   └── cpu_fallback.py              # Hybrid CPU fallback for uncached low-frequency experts
 ├── serve/
-│   ├── vllm_engine.py               # Hybrid vLLM continuous-batching & slot scheduler
-│   ├── strata_gguf.py               # Direct GSQ GGUF shard reader & CUDA dequant bridge
-│   ├── libstrata_iq_kernels.so      # Compiled Ampere CUDA kernels (IQ3_XXS/IQ2_XS/IQ4_NL)
+│   ├── vllm_engine.py               # Drop-in wrapper re-exporting strata_vllm.engine
+│   ├── strata_gguf.py               # Drop-in wrapper re-exporting strata_vllm.gguf_loader
+│   ├── libstrata_iq_kernels.so      # Compiled Ampere CUDA kernels (IQ2/3/4 + Q2_0_STRATA + route_prior)
 │   ├── server.py                    # Patched Strata 0.2.8 server with --engine vllm & loop recovery
 │   ├── frontend.py                  # OpenAI / Anthropic / Responses frontend adapters
 │   ├── telemetry.py                 # 1 Hz hardware & inference telemetry sampler
 │   └── web/                         # Web UI & Monitor (Concurrency slot bars & Speed gauge)
 ├── cuda/
-│   └── setup_cuda.py                # Source & builder for libstrata_iq_kernels.so
-├── vllm_paged_moe/
-│   ├── expert_manager.py            # Standalone vLLM V1 PagedExpertManager (3-tier LRU + DMA)
-│   ├── expert_locality_policy.py    # Expert-locality request reordering scheduler policy
-│   ├── cpu_fallback.py              # Hybrid CPU fallback for uncached low-frequency experts
-│   └── vllm-paged-moe.patch         # Git patch against upstream vLLM V1
+│   └── setup_cuda.py                # Builder for libstrata_iq_kernels.so
+├── vllm_paged_moe/                  # Backwards-compatible re-exports from strata_vllm
 ├── tests/
+│   ├── test_end_to_end_triton_vllm.py   # End-to-end vLLM plugin + GGUF + Triton MoE + VLLMEngine test
 │   ├── test_reasoning_loop_recovery.py  # 18 unit tests for loop recovery & agent wrap-up
-│   ├── test_live_strata_gguf_moe.py     # End-to-end GGUF -> GPU dequant -> Triton MoE test
+│   ├── test_live_strata_gguf_moe.py     # Live GGUF -> GPU dequant -> Triton MoE benchmark
 │   ├── test_paged_expert_manager.py     # PagedExpertManager unit & async stream tests
 │   ├── test_triton_moe_indirection.py   # Triton FusedMoE slot-indirection verification
 │   ├── test_moe_prefetch_pipeline.py    # Multi-stream DMA prefetch pipeline benchmark
@@ -192,10 +215,9 @@ strata-vllm/
 │   ├── monitor-overview.png         # Live dashboard screenshot during active generation
 │   └── monitor-reading.png          # Live dashboard screenshot during 60k prompt reading
 ├── strata-iq3_xxs.json              # Production 128k-context, 2-slot, MTP-4 configuration
-├── vllm-server.patch                # Unified diff against upstream Strata serve/
-├── install.sh / install.bat         # 1-step non-destructive installer for Linux & Windows
+├── install.sh / install.bat         # 1-step non-destructive installer (installs strata_vllm + plugin)
 ├── uninstall.sh / uninstall.bat     # 1-step clean revert to stock Strata
-├── run_vllm.sh / run_vllm.bat       # Launch scripts for the hybrid server
+├── run_vllm.sh / run_vllm.bat       # Launch scripts for the hybrid server (uses vllm-env)
 └── requirements-vllm.txt            # Python dependencies
 ```
 
@@ -205,6 +227,7 @@ strata-vllm/
 
 ### Prerequisites
 - An existing [Strata](https://github.com/Niko1221/Strata) installation with model weights downloaded.
+- Python 3.10+ environment with `torch`, `triton`, and `vllm` installed (e.g. `~/vllm-env`).
 - NVIDIA GPU with 12 GB+ VRAM (RTX 3060 12GB, RTX 3080 Ti, RTX 3090, RTX 4070 Ti+, etc.).
 - 64 GB System RAM recommended for locking the full `IQ3_XXS` expert pack in host RAM (or 32 GB RAM for `IQ2_XS`).
 
@@ -217,12 +240,22 @@ cd strata-vllm
 ./install.sh /path/to/Strata
 ```
 
-> **Note:** Your existing Strata installation is **100% preserved**. The installer backs up `serve/server.py` to `serve/server.py.orig_backup` and only adds the `--engine vllm` option. You can switch between `--engine strata` and `--engine vllm` at any time, or run `./uninstall.sh /path/to/Strata` to revert completely.
+> **Note:** `./install.sh` installs the `strata_vllm` Python package (`pip install -e .`) into your `vllm-env` so vLLM automatically discovers the `strata_gguf` plugin, and copies the drop-in bridge files into `/path/to/Strata`. Your existing Strata installation is **100% preserved** (`serve/server.py` is backed up to `serve/server.py.orig_backup`). You can switch between `--engine strata` and `--engine vllm` at any time, or run `./uninstall.sh /path/to/Strata` to revert completely.
 
 ### Launch the Server
 ```bash
 cd /path/to/Strata
-python3 -m serve.server --engine vllm --config strata-iq3_xxs.json --port 8080 --api-monitor --no-api-key
+./run_vllm.sh
+```
+Or invoke directly via the `strata-vllm` entrypoint:
+```bash
+~/vllm-env/bin/python -m serve.server --engine vllm --config strata-iq3_xxs.json --port 8080 --api-monitor --no-api-key
+```
+
+### Run the Full Verification Suite
+```bash
+cd strata-vllm
+~/vllm-env/bin/python tests/test_end_to_end_triton_vllm.py
 ```
 
 ### Endpoints
@@ -231,10 +264,3 @@ python3 -m serve.server --engine vllm --config strata-iq3_xxs.json --port 8080 -
 - **Anthropic Messages API:** `POST http://localhost:8080/v1/messages`
 - **OpenAI Responses API:** `POST http://localhost:8080/v1/responses`
 - **Live Telemetry JSON:** `GET http://localhost:8080/metrics`
-
-### Rebuilding the CUDA Dequantization Library (Optional)
-If deploying on a different CUDA architecture:
-```bash
-python3 cuda/setup_cuda.py
-cp libstrata_iq_kernels.so serve/
-```

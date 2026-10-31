@@ -15,11 +15,15 @@ if [ ! -d "$TARGET_DIR/serve" ]; then
     exit 1
 fi
 
-echo "[1/4] Installing Python requirements..."
-if command -v pip3 &>/dev/null; then
-    pip3 install -q -r "$SCRIPT_DIR/requirements-vllm.txt" || echo "[!] Notice: pip install had warnings; ensure torch, triton, gguf are available."
+echo "[1/4] Installing strata-vllm Python package & vLLM general plugin..."
+if [ -x "/home/thirteenthd/vllm-env/bin/pip" ]; then
+    /home/thirteenthd/vllm-env/bin/pip install -e "$SCRIPT_DIR" --no-build-isolation --no-deps || true
+elif command -v pip3 &>/dev/null; then
+    pip3 install -q -r "$SCRIPT_DIR/requirements-vllm.txt" || true
+    pip3 install -e "$SCRIPT_DIR" --no-build-isolation --no-deps || true
 elif command -v pip &>/dev/null; then
-    pip install -q -r "$SCRIPT_DIR/requirements-vllm.txt" || echo "[!] Notice: pip install had warnings; ensure torch, triton, gguf are available."
+    pip install -q -r "$SCRIPT_DIR/requirements-vllm.txt" || true
+    pip install -e "$SCRIPT_DIR" --no-build-isolation --no-deps || true
 fi
 
 echo "[2/4] Deploying engine bridge files to $TARGET_DIR/serve/..."

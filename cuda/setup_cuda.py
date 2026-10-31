@@ -66,3 +66,21 @@ with open(f'{root}/include/cuda.h') as fh:
 print('nvrtc.h exists:', os.path.exists(f'{root}/include/nvrtc.h'))
 print('libnvrtc.so exists:', os.path.exists(f'{root}/lib64/libnvrtc.so'))
 print('libnvToolsExt.so exists:', os.path.exists(f'{root}/lib64/libnvToolsExt.so'))
+
+# Compile extended libstrata_iq_kernels.so (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, Q2_0_STRATA, Q4_K..Q6_K, route_prior_top10, router_top10)
+strata_src = os.environ.get('STRATA_SRC_DIR', '/home/thirteenthd/Strata-src/src/kernels')
+if os.path.isdir(strata_src):
+    import subprocess
+    out_so = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'serve', 'libstrata_iq_kernels.so'))
+    cmd = [
+        f'{root}/bin/nvcc', '-O3', '--shared', '-Xcompiler', '-fPIC', '-arch=sm_86',
+        f'{strata_src}/iq_kernels.cu',
+        f'{strata_src}/dequant_bf16.cu',
+        f'{strata_src}/route_prior.cu',
+        f'{strata_src}/router_top10.cu',
+        '-o', out_so, '-lcudart',
+    ]
+    print('Compiling libstrata_iq_kernels.so:', ' '.join(cmd))
+    subprocess.check_call(cmd)
+    print('Built:', out_so)
+
