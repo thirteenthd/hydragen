@@ -35,6 +35,8 @@
     "160",
     "--adapt-decay",
     "0.97",
+    "--adapt-async",
+    "1",
     "--kv-resident",
     "32768",
     "--conversation-cache-mib",
