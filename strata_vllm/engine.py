@@ -159,9 +159,9 @@ class VLLMEngine:
             "vram_free_mib": b_info.get("vram_free_mib", 463),
             "batch_slots": self.batch,
             "kv": b_info.get("kv", "int8"),
-            "spec": b_info.get("spec", 3),
-            "mtp_max": 4,
-            "cvec": "1",
+            "spec": b_info.get("spec", 4),
+            "mtp_max": b_info.get("mtp_max", 4),
+            "cvec": b_info.get("cvec"),
         }
         self._last_prefill_tok_s: float = 100.0
         self._active_prefill_tok_s: Optional[float] = None
