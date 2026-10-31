@@ -219,7 +219,7 @@ if (-not (Test-Path $cfgPath)) {
     "--native", "models/models/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
     "--ple-gguf", "models/models/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf",
     "--expert-profile", "data/expert-profile.bin",
-    "--expert-cache", "auto",
+    "--expert-cache", "2200",
     "--prefill", "auto:8192",
     "--spec", "4",
     "--mtp", "models/mtp/rt",

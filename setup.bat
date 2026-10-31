@@ -99,7 +99,7 @@ if not exist "%CONFIG_FILE%" (
         echo {
         echo   "exe": "bin\\strata.exe",
         echo   "args": [
-        echo     "--expert-cache", "auto",
+        echo     "--expert-cache", "2200",
         echo     "--prefill", "auto:8192",
         echo     "--spec", "4",
         echo     "--max-context", "131072",
