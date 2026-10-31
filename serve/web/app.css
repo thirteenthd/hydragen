@@ -102,7 +102,6 @@ main { flex: 1; min-height: 0; display: flex; }
 .speed-values > div:last-child { text-align: right; }
 .speed-values .st-metric__value { font-size: clamp(20px, 2.2vw, var(--st-fs-stat)); }
 .st-metric__spark .speed-prefill { color: var(--st-info, #0f97ff); }
-.st-metric__spark .speed-prefill .line { stroke-dasharray: 4 2; }
 .speed-values .speed-prefill .st-metric__value { color: var(--st-info-text, #0668c2); }
 [data-theme="dark"] .speed-values .speed-prefill .st-metric__value { color: var(--st-info, #0f97ff); }
 .st-metric__spark[data-tone="warn"] { color: var(--st-warn); }
