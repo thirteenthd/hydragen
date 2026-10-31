@@ -58,9 +58,15 @@ from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
+if not (ROOT / "tools").exists():
+    for p in Path(__file__).resolve().parents:
+        if (p / "tools").exists():
+            ROOT = p
+            break
 _paths = [
     str(ROOT),
     str(ROOT / "tools"),
+    str(ROOT / "serve"),
     str(ROOT.parent / "Strata"),
     str(ROOT.parent / "Strata" / "tools"),
     os.environ.get("STRATA_DIR"),
