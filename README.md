@@ -23,10 +23,10 @@ Hydragen bridges this gap as an independent, modular inference platform with a c
 - **vLLM General & Quantization Plugin (`src/hydragen/vllm_plugin.py`):**
   - Registered via `[project.entry-points."vllm.general_plugins"]` (`hydragen_gguf`).
   - Registers `@register_quantization_config("hydragen_gguf")` and `@register_quantization_config("strata_gguf")` (`StrataPagedMoEMethod(FusedMoEMethodBase)`) automatically whenever `vllm` initializes—requiring **zero edits** to site-packages.
-- **Zero-Dequantization Compressed GGUF VRAM Slot Pool (`src/hydragen/expert_manager.py`, `src/hydragen/triton_moe.py`):**
+- **Zero-Dequantization Dual-Kernel Architecture (`src/hydragen/expert_manager.py`, `src/hydragen/triton_moe.py`):**
   - Stores raw compressed `[gate | up | down]` GGUF blocks (`~1.61 MB/expert` instead of `9.83 MB/expert` in BF16/FP16 — a **5.8x VRAM & PCIe bandwidth reduction**) directly in `PagedExpertManager.vram_blob_cache` (`[num_slots, max_blob_bytes] uint8`).
-  - **Option 1 — In-Kernel Triton GGUF Unpacker (`@triton.jit def fused_moe_gguf_down_slot_kernel`):** Reads compressed 18-byte `Q2_0_STRATA` (`type=42`, 64 weights) and `IQ4_NL` (`type=20`, 32 weights) blocks directly from `vram_blob_cache` via `slot_mapping_ptr`, unpacking 2-bit/4-bit weights and `fp16` block scale `d` **in Triton registers inside the `K` loop** before `tl.dot` on Tensor Cores—with **zero intermediate BF16/FP16 weight buffer in VRAM**.
-  - **Option 2 — Native INT8 `dp4a` / `native_expert_grouped` Bridge (`native_gguf_paged_moe_forward`):** Quantizes activations once via `quantize_q8_1_rows` and executes Gate + Up + `SwiGLU` + Down directly in `int8` against the compressed `IQ2_XXS`/`IQ2_XS`/`IQ3_XXS`/`IQ3_S`/`IQ2_S`/`IQ4_NL`/`Q2_0_STRATA` expert slots in `vram_blob_cache`.
+  - **Native INT8 `dp4a` Grouped Engine (`native_gguf_paged_moe_forward`):** Automatically leveraged for high-speed production execution. Quantizes activation vectors once via `quantize_q8_1_rows` and executes Gate + Up + `SwiGLU` + Down directly in INT8 against the compressed `IQ2_XXS`/`IQ2_XS`/`IQ3_XXS`/`IQ3_S`/`IQ2_S`/`IQ4_NL`/`Q2_0_STRATA` expert slots on GPU Tensor Cores—with **zero intermediate BF16/FP16 weight buffer in VRAM**.
+  - **In-Kernel Triton JIT Register Unpacker (`@triton.jit def fused_moe_gguf_down_slot_kernel`):** Provides dynamic register-level unpacking for specialized non-linear blocks (`IQ4_NL`, 32 weights/18B and `Q2_0_STRATA`, 64 weights/18B) directly inside the compute `K` loop before `tl.dot`, completely eliminating weight allocations in GPU memory.
 - **Universal CUDA GSQ Dequantization & Routing Bridge (`src/hydragen/gguf_loader.py`, `src/hydragen/server/libstrata_iq_kernels.so`):**
   - Links `iq_kernels.cu`, `dequant_bf16.cu`, `route_prior.cu`, and `router_top10.cu` into dynamically located runtime libraries (`sm_86`+).
   - Supports **all 48 layers** of `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS`, including standard IQ quants (`IQ2_XXS=16`, `IQ2_XS=17`, `IQ3_XXS=18`, `IQ4_NL=20`, `IQ3_S=21`, `IQ2_S=22`) and custom `Q2_0_STRATA=42` (`ffn_down_exps` in odd layers 1..27), plus GPU-accelerated cache-aware top-10 routing (`route_prior_top10`).
@@ -79,14 +79,17 @@ Hydragen bridges this gap as an independent, modular inference platform with a c
 - **Expert-Locality Queue Reordering (`ExpertLocalityPolicy.rank_candidates`):** Scores waiting requests by Jaccard overlap with currently resident VRAM experts so co-scheduled requests maximize expert cache hits.
 - **Smart Slot Selection (`pick_slot`):** Routes incoming multi-turn requests to the idle slot holding the longest matching token prefix or `<|im_start|>` (`TURN_ID = 248045`) turn checkpoint, preserving idle slot KV caches across turns.
 - **Head-of-Line Preemption (`BYIELD`):** If a long prompt read is running in one slot and a shorter interactive request arrives, the scheduler yields the long read at the next chunk boundary so the shorter request admits immediately.
-- **Dynamic Solo MTP Promotion:** Continuous batching slots decode without MTP drafts when multiple slots are simultaneously active, but the instant one slot finishes (`going_solo`), the remaining request seamlessly migrates back to the solo path to re-engage 4-layer MTP speculative decoding.
+- **Dynamic Solo MTP Promotion & Speculative Strategy:**
+  - When multiple batch slots actively decode in the exact same step, speculative tree verification across independent streams is disabled to avoid GPU warp divergence and dynamic KV tree collisions. While overlapping, each stream generates tokens autoregressively (~28–35 tok/s per stream).
+  - However, autonomous agent turns (Hermes, Letta, Cursor, subagent teams) are inherently bursty: an agent issues a tool call (50–150 tokens), then pauses for several seconds while tool execution completes in a sandbox.
+  - The instant a request is alone in flight (`going_solo`), the scheduler dynamically migrates it back to the solo speculative path, re-engaging the 4-layer MTP draft head to accelerate decode speed up to **80.0–113.8 tok/s** for the rest of its turn.
 
 #### 3. Speculative Decoding Optimization for Agent Workloads
-- Optimized MTP parameters for agent turns (long prompt prefixes, short tool-call outputs):
+- Optimized MTP parameters for bursty agent turns (long prompt prefixes, short tool-call outputs):
   - `"mtp_max": 4`
   - `"stream_all_min": 64` (engages MTP drafting on prompts as short as 64 tokens)
   - `"spec_min_p": 0.05`
-- Achieved **82% – 88.2% draft acceptance** on live coding/tool-call workloads.
+- Achieved **82% – 88.2% draft acceptance** on solo agent turns, yielding **2.3x–2.65x single-stream speedups**.
 
 #### 4. Agent Reliability: Routing Prior & Reasoning Loop Guardrails
 - **The `STRATA_ROUTE_PRIOR` Tradeoff:**
@@ -129,8 +132,10 @@ Hydragen bridges this gap as an independent, modular inference platform with a c
 | **Cached Turn TTFT (`90k–105k` ctx)** | ~0.70 s | ~0.65 s | **0.55 – 0.68 s** *(99.9% token reuse)* |
 | **VRAM Expert Cache Hit Rate** | 72% – 80% | 52% – 60% | **75.1% – 89.6%** *(+0.8% – 3.2% over PCIe)* |
 | **MTP Draft Acceptance Rate** | ~0% on short turns | 78% – 83% | **82.0% – 88.2%** *(e.g., 379/458 drafts accepted)* |
-| **2-Slot Concurrent Aggregate Decode** | N/A (serialized) | ~68 tok/s | **102 – 118 tok/s combined** |
+| **2-Slot Concurrent Aggregate Decode** | N/A (serialized) | ~68 tok/s | **102 – 118 tok/s combined\*** |
 | **Multimodal Vision (`strata-vision`)** | 3.1 s | 2.9 s | **2.74 s total** *(52.3 tok/s decode, 88.2% MTP)* |
+
+*\*When multiple streams actively overlap in the exact same decode step, each stream runs autoregressively at ~28–35 tok/s (~60–70 tok/s parallel combined). The **102–118 tok/s aggregate** reflects real-world multi-agent workloads where requests interleave and leverage **Dynamic Solo MTP Promotion** (up to 113.8 tok/s) whenever the other stream completes or pauses for tool execution.*
 
 ---
 
