@@ -100,15 +100,15 @@ if not exist "%CONFIG_FILE%" (
         echo   "exe": "bin\\strata.exe",
         echo   "args": [
         echo     "--expert-cache", "auto",
-        echo     "--prefill", "auto:16384",
+        echo     "--prefill", "auto:8192",
         echo     "--spec", "4",
         echo     "--max-context", "131072",
         echo     "--kv", "int8",
-        echo     "--vram-reserve-mib", "1152",
+        echo     "--vram-reserve-mib", "384",
         echo     "--pcie-frac", "0.20",
         echo     "--spec-min-p", "0.45",
         echo     "--adapt-async", "1",
-        echo     "--kv-resident", "32768",
+        echo     "--kv-resident", "20480",
         echo     "--batch", "2",
         echo     "--batch-mtp"
         echo   ],
