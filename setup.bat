@@ -2,15 +2,24 @@
 setlocal enabledelayedexpansion
 
 REM ============================================================================
-REM Hydragen One-Click Setup Script (Windows CMD)
+REM Hydragen Automated Setup & Updater (Windows CMD)
 REM ============================================================================
 
 set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
 
 echo ==========================================================
-echo          Hydragen Engine Automated Setup (Windows)
+echo      Hydragen Engine Automated Setup ^& Updater (Windows)
 echo ==========================================================
+
+if "%~1"=="--update" goto :do_update
+if "%~1"=="-u" goto :do_update
+goto :skip_update
+
+:do_update
+echo [+] Updating Hydragen from git repository...
+if exist ".git" git pull
+:skip_update
 
 REM 1. Check Python
 where python >nul 2>nul
@@ -109,6 +118,9 @@ echo ==========================================================
 echo          Hydragen Windows Setup Complete!
 echo ==========================================================
 echo To start the server:
-echo   1. call .venv\Scripts\activate.bat
-echo   2. hydragen --config hydragen.json --port 8080 --api-monitor
+echo   run.bat
+echo   (or: hydragen --config hydragen.json --port 8080 --api-monitor)
+echo.
+echo To update in the future:
+echo   setup.bat -u
 echo ==========================================================

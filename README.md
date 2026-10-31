@@ -233,9 +233,9 @@ strata-vllm/
 
 ---
 
-### Option A: Automated One-Click Setup (Standalone)
+### Automated One-Click Setup & Updater
 
-Clone the repository and run the automated setup script for your platform:
+Clone the repository and run the setup script for your platform:
 
 **Linux / WSL2:**
 ```bash
@@ -258,38 +258,34 @@ cd Hydragen
 setup.bat
 ```
 
-The script automatically detects your GPU, creates a `.venv` virtual environment, installs PyTorch with CUDA and Hydragen, and generates a ready-to-run `hydragen.json` configuration.
+The script automatically detects your GPU, creates a `.venv` virtual environment, installs PyTorch with CUDA and Hydragen, downloads the precompiled engine binary if needed, and generates a ready-to-run `hydragen.json` configuration.
 
 ---
 
-### Option B: Drop-in Integration (Existing Strata Installations)
+### Updating Hydragen
 
-If you already have a configured Strata installation with models downloaded:
+To update an existing installation to the latest release at any time:
 
-**Linux / WSL2:**
 ```bash
-./install.sh /path/to/Strata
+./setup.sh --update      # Linux / WSL2
+.\setup.ps1 -u           # Windows PowerShell
+setup.bat -u             # Windows CMD
 ```
-
-**Windows:**
-```cmd
-install.bat C:\path\to\Strata
-```
-
-> **Note:** `./install.sh` non-destructively links the `hydragen` Python package and deploys the multi-slot scheduler and dynamic concurrency monitor to your existing setup. Your original server script is backed up to `serve/server.py.orig_backup` and can be reverted at any time with `./uninstall.sh`.
 
 ---
 
 ### Launching the Server
 
-Run directly via the `hydragen` CLI entrypoint:
+Start the server using the launcher script:
+```bash
+./run.sh      # Linux / WSL2
+.\run.ps1     # Windows PowerShell
+run.bat       # Windows CMD
+```
+
+Or invoke directly via the `hydragen` CLI entrypoint:
 ```bash
 hydragen --config hydragen.json --port 8080 --api-monitor
-```
-Or via the drop-in launcher:
-```bash
-./run_vllm.sh      # Linux
-run_vllm.bat       # Windows
 ```
 
 ### Run the Full Verification Suite
