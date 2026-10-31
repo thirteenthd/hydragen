@@ -18,7 +18,7 @@ Tests:
 import threading
 import torch
 
-from strata_vllm import (
+from hydragen import (
     PagedExpertManager,
     StrataGGUFMoELoader,
     VLLMEngine,

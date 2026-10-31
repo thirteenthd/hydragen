@@ -227,36 +227,75 @@ strata-vllm/
 ## 5. Quick Installation & Usage
 
 ### Prerequisites
-- An existing [Strata](https://github.com/Niko1221/Strata) installation with model weights downloaded.
-- Python 3.10+ environment with `torch`, `triton`, and `vllm` installed (e.g. `~/vllm-env`).
-- NVIDIA GPU with 12 GB+ VRAM (RTX 3060 12GB, RTX 3080 Ti, RTX 3090, RTX 4070 Ti+, etc.).
-- 64 GB System RAM recommended for locking the full `IQ3_XXS` expert pack in host RAM (or 32 GB RAM for `IQ2_XS`).
+- **NVIDIA GPU** with 12 GB+ VRAM (RTX 3060 12GB, RTX 3080 Ti, RTX 3090/4090, RTX 4070 Ti+, etc.).
+- **Host RAM:** 32 GB – 64 GB recommended for locking the full `IQ3_XXS` expert pack in system memory.
+- **Python:** 3.10+ (with CUDA support).
 
-### Install (Non-Destructive)
-Clone this repository and run the installer pointing to your Strata directory:
+---
 
+### Option A: Automated One-Click Setup (Standalone)
+
+Clone the repository and run the automated setup script for your platform:
+
+**Linux / WSL2:**
 ```bash
 git clone https://github.com/thirteenthd/Hydragen.git
 cd Hydragen
-./install.sh /path/to/target
+chmod +x setup.sh && ./setup.sh
 ```
 
-> **Note:** `./install.sh` installs the `strata_vllm` Python package (`pip install -e .`) into your `vllm-env` so vLLM automatically discovers the `strata_gguf` plugin, and copies the drop-in bridge files into `/path/to/Strata`. Your existing Strata installation is **100% preserved** (`serve/server.py` is backed up to `serve/server.py.orig_backup`). You can switch between `--engine strata` and `--engine vllm` at any time, or run `./uninstall.sh /path/to/Strata` to revert completely.
-
-### Launch the Server
-```bash
-cd /path/to/Strata
-./run_vllm.sh
+**Windows (PowerShell):**
+```powershell
+git clone https://github.com/thirteenthd/Hydragen.git
+cd Hydragen
+.\setup.ps1
 ```
-Or invoke directly via the `strata-vllm` entrypoint:
+
+**Windows (CMD):**
+```cmd
+git clone https://github.com/thirteenthd/Hydragen.git
+cd Hydragen
+setup.bat
+```
+
+The script automatically detects your GPU, creates a `.venv` virtual environment, installs PyTorch with CUDA and Hydragen, and generates a ready-to-run `hydragen.json` configuration.
+
+---
+
+### Option B: Drop-in Integration (Existing Strata Installations)
+
+If you already have a configured Strata installation with models downloaded:
+
+**Linux / WSL2:**
 ```bash
-~/vllm-env/bin/python -m serve.server --engine vllm --config strata-iq3_xxs.json --port 8080 --api-monitor --no-api-key
+./install.sh /path/to/Strata
+```
+
+**Windows:**
+```cmd
+install.bat C:\path\to\Strata
+```
+
+> **Note:** `./install.sh` non-destructively links the `hydragen` Python package and deploys the multi-slot scheduler and dynamic concurrency monitor to your existing setup. Your original server script is backed up to `serve/server.py.orig_backup` and can be reverted at any time with `./uninstall.sh`.
+
+---
+
+### Launching the Server
+
+Run directly via the `hydragen` CLI entrypoint:
+```bash
+hydragen --config hydragen.json --port 8080 --api-monitor
+```
+Or via the drop-in launcher:
+```bash
+./run_vllm.sh      # Linux
+run_vllm.bat       # Windows
 ```
 
 ### Run the Full Verification Suite
 ```bash
-cd strata-vllm
-~/vllm-env/bin/python tests/test_end_to_end_triton_vllm.py
+cd Hydragen
+python tests/test_end_to_end_triton_vllm.py
 ```
 
 ### Endpoints
@@ -265,3 +304,69 @@ cd strata-vllm
 - **Anthropic Messages API:** `POST http://localhost:8080/v1/messages`
 - **OpenAI Responses API:** `POST http://localhost:8080/v1/responses`
 - **Live Telemetry JSON:** `GET http://localhost:8080/metrics`
+
+---
+
+## 6. Engine Selection & Workload Tuning Guide
+
+Hydragen allows you to easily switch between inference engines and fine-tune scheduling, memory, and speculative execution parameters to match your specific hardware and workload.
+
+### A. Switching Inference Engines
+
+Hydragen provides two powerful execution backends. **Both engines fully support multi-slot concurrency (`--batch <N>`), the enhanced scheduler with interactive prompt preemption, small-cap reasoning budget guards, and the live Concurrency States dashboard:**
+
+| Flag | Engine Name | Execution Paradigm | When to Use |
+| :--- | :--- | :--- | :--- |
+| **`--engine vllm`** *(Default)* | **Hydragen Hybrid Engine** | Continuous multi-slot batching with **Triton FusedMoE expert paging**, in-kernel dequantization, dynamic PCIe Gen4 DMA streaming, and Jaccard expert-affinity queue reordering. | High-concurrency agent workflows (Hermes, Letta, Cursor, multi-subagent teams) where dynamic expert paging and GPU-accelerated routing maximize aggregate throughput. |
+| **`--engine strata`** | **Enhanced Strata Multi-Slot Engine** | Native C++ multi-slot batching (`BGEN`/`BT`/`BDONE`) with pinned host-RAM expert arena, dynamic solo MTP promotion, and interactive chunk yielding. | High-performance multi-slot or solo inference using the native C++ pipeline worker. Supports concurrency whenever VRAM headroom permits slot allocation. |
+
+**Command-line examples:**
+```bash
+# Launch with Hydragen hybrid Triton PagedMoE engine (2 concurrent slots):
+hydragen --engine vllm --batch 2 --config hydragen.json
+
+# Launch with Enhanced Strata multi-slot engine (2 concurrent slots):
+hydragen --engine strata --batch 2 --config hydragen.json
+```
+
+---
+
+### B. Tuning Parameters for Different Workloads
+
+All settings can be specified in `hydragen.json` or passed as command-line arguments to `hydragen`:
+
+#### 1. Concurrency Slots (`--batch <N>`)
+* **`--batch 1` (Solo Mode):** Single stream execution. Allows dynamic solo MTP promotion for maximum single-turn speed (up to **113.8 tok/s**).
+* **`--batch 2` (Recommended Default for 12 GB GPUs):** Sustains 2 concurrent streams at **102–118 combined tok/s** without risking VRAM overflow at 128k context.
+* **`--batch 3` or `4`:** Best for multi-agent workloads with higher VRAM cards (16 GB–24 GB, e.g. RTX 3090/4090/4080) or when using shorter context windows (32k–64k). Any excess requests wait cleanly in the FIFO queue displayed on the monitor.
+
+#### 2. Context Length & KV Cache Tiering
+* **`--max-context <tokens>`:** Sets the total sequence length (e.g., `32768`, `65536`, `131072`).
+* **`--kv int8`:** Quantizes KV cache to 8-bit, cutting KV memory consumption by 50% so a 128k context fits on 12 GB GPUs.
+* **`--kv-resident <positions>`:** Specifies how many token positions are pinned in fast GPU VRAM (e.g., `32768`), with remainder paged to host RAM.
+
+#### 3. Speculative Decoding Depth (`--spec <N>` / MTP)
+* **`--spec 4` (Recommended):** Enables 4-layer Multi-Token Prediction (MTP) speculative drafting, giving a **2.3x–2.65x speedup** on code and structured generation tasks.
+* **`--spec-min-p 0.05`:** Lowers the draft acceptance probability threshold, allowing speculative drafting to engage even on shorter agent turns.
+* **`--spec 0`:** Disables speculative decoding if you need to minimize memory pressure.
+
+#### 4. VRAM Reservation Headroom (`--vram-reserve-mib <MiB>`)
+* **`--vram-reserve-mib 1152`:** Sets aside dedicated VRAM headroom for Triton Fused MoE kernels, dynamic expert swap buffers, and CUDA graph capture. If you experience out-of-memory errors on 12 GB GPUs, increase this value to `1280` or `1536`.
+
+#### 5. Dynamic PCIe Expert Streaming (`--pcie-frac <ratio>`)
+* **`--pcie-frac 0.20`:** Allows the GPU to stream up to 20% of routed experts across PCIe Gen4 DMA in parallel with computation when expert slots are crowded, hiding memory latency and boosting hit rates.
+
+#### 6. Expert Cache Routing Bias (`STRATA_ROUTE_PRIOR`)
+* **`STRATA_ROUTE_PRIOR=0.8` (Environment Variable):** Biases top-10 expert routing toward currently resident VRAM experts. Keeps cache hit rate at **75%–89.6%** without sacrificing reasoning accuracy.
+
+---
+
+## 7. Attribution & Acknowledgments
+
+Hydragen builds upon and brings together two foundational open-source AI projects:
+
+* **[Strata](https://github.com/Niko1221/Strata)** by Niko Veit ([@Niko1221](https://github.com/Niko1221)): For the tiered expert memory architecture, pinned host-RAM expert arena offloading, GSQ sub-4-bit quantization (`IQ3_XXS`/`IQ2_XS`/`Q2_0_STRATA`), and speculative MTP decoding on consumer hardware.
+* **[vLLM](https://github.com/vllm-project/vllm)** by the vLLM Team: For the continuous batching architecture, multi-slot scheduling paradigms, PagedAttention KV management, and high-throughput Triton FusedMoE execution.
+
+Hydragen is released under the [Apache-2.0 License](LICENSE).
+

@@ -61,19 +61,39 @@ def register_strata_gguf_types() -> None:
 register_strata_gguf_types()
 
 
-class StrataCUDAKernelBridge:
-    """Ctypes bridge to compiled Strata CUDA kernels (libstrata_iq_kernels.so)."""
+def _find_default_lib_path() -> str:
+    env_path = os.environ.get("STRATA_IQ_KERNELS_SO")
+    if env_path and os.path.exists(env_path):
+        return env_path
 
-    DEFAULT_LIB_PATH = os.environ.get(
-        "STRATA_IQ_KERNELS_SO", "/home/thirteenthd/libstrata_iq_kernels.so"
-    )
+    from pathlib import Path
+    candidates = [
+        Path(__file__).parent / "server" / "libstrata_iq_kernels.so",
+        Path(__file__).parent.parent.parent / "serve" / "libstrata_iq_kernels.so",
+        Path.cwd() / "serve" / "libstrata_iq_kernels.so",
+        Path.cwd() / "libstrata_iq_kernels.so",
+        Path(__file__).parent / "server" / "strata_iq_kernels.dll",
+        Path.cwd() / "strata_iq_kernels.dll",
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c.resolve())
+    return env_path or "libstrata_iq_kernels.so"
+
+
+class StrataCUDAKernelBridge:
+    """Ctypes bridge to compiled Strata CUDA kernels (libstrata_iq_kernels.so / .dll)."""
+
+    @classmethod
+    def get_default_path(cls) -> str:
+        return _find_default_lib_path()
 
     def __init__(self, lib_path: Optional[str] = None):
-        self.lib_path = lib_path or self.DEFAULT_LIB_PATH
+        self.lib_path = lib_path or self.get_default_path()
         if not os.path.exists(self.lib_path):
             raise FileNotFoundError(
                 f"Strata CUDA kernel library not found at: {self.lib_path}. "
-                "Compile it with nvcc -shared -Xcompiler -fPIC ..."
+                "Set STRATA_IQ_KERNELS_SO or place libstrata_iq_kernels.so in your server/ directory."
             )
 
         self._cdll = ctypes.CDLL(self.lib_path)
