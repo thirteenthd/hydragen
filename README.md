@@ -245,18 +245,18 @@ cd Hydragen
 
 ### Launch the Server
 ```bash
-cd /path/to/Strata
+cd /path/to/target
 ./run_vllm.sh
 ```
-Or invoke directly via the `strata-vllm` entrypoint:
+Or invoke directly via the `hydragen` entrypoint:
 ```bash
-~/vllm-env/bin/python -m serve.server --engine vllm --config strata-iq3_xxs.json --port 8080 --api-monitor --no-api-key
+hydragen --config strata-iq3_xxs.json --port 8080 --api-monitor --no-api-key
 ```
 
 ### Run the Full Verification Suite
 ```bash
-cd strata-vllm
-~/vllm-env/bin/python tests/test_end_to_end_triton_vllm.py
+cd Hydragen
+python tests/test_end_to_end_triton_vllm.py
 ```
 
 ### Endpoints
@@ -265,3 +265,15 @@ cd strata-vllm
 - **Anthropic Messages API:** `POST http://localhost:8080/v1/messages`
 - **OpenAI Responses API:** `POST http://localhost:8080/v1/responses`
 - **Live Telemetry JSON:** `GET http://localhost:8080/metrics`
+
+---
+
+## 6. Attribution & Acknowledgments
+
+Hydragen builds upon and brings together two foundational open-source AI projects:
+
+* **[Strata](https://github.com/Niko1221/Strata)** by Niko Veit ([@Niko1221](https://github.com/Niko1221)): For the tiered expert memory architecture, pinned host-RAM expert arena offloading, GSQ sub-4-bit quantization (`IQ3_XXS`/`IQ2_XS`/`Q2_0_STRATA`), and speculative MTP decoding on consumer hardware.
+* **[vLLM](https://github.com/vllm-project/vllm)** by the vLLM Team: For the continuous batching architecture, multi-slot scheduling paradigms, PagedAttention KV management, and high-throughput Triton FusedMoE execution.
+
+Hydragen is released under the [Apache-2.0 License](LICENSE).
+

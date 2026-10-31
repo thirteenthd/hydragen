@@ -18,10 +18,10 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 import torch
 
-from strata_vllm.expert_locality_policy import ExpertLocalityPolicy
-from strata_vllm.expert_manager import PagedExpertManager
-from strata_vllm.gguf_loader import StrataGGUFMoELoader, register_strata_gguf_types
-from strata_vllm.triton_moe import (
+from hydragen.expert_locality_policy import ExpertLocalityPolicy
+from hydragen.expert_manager import PagedExpertManager
+from hydragen.gguf_loader import StrataGGUFMoELoader, register_strata_gguf_types
+from hydragen.triton_moe import (
     fused_moe_gguf_down_slot_kernel,
     fused_moe_indexed_slot_kernel,
     fused_moe_slot_kernel,
