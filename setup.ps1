@@ -72,9 +72,6 @@ if (-not (Test-Path $strataExe)) {
     if ($env:STRATA_DIR -and (Test-Path (Join-Path $env:STRATA_DIR "engine\strata.exe"))) {
         Write-Host "[+] Copying Strata binary from `$env:STRATA_DIR..." -ForegroundColor Green
         Copy-Item (Join-Path $env:STRATA_DIR "engine\strata.exe") $strataExe
-    } elseif (Test-Path "..\Strata\engine\strata.exe") {
-        Write-Host "[+] Copying local Strata binary..." -ForegroundColor Green
-        Copy-Item "..\Strata\engine\strata.exe" $strataExe
     } else {
         Write-Host "[+] Downloading precompiled Strata worker binary (v0.2.9 / engine 0.1.55)..." -ForegroundColor Yellow
         $cudaVer = "cuda12"

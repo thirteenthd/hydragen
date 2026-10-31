@@ -82,9 +82,6 @@ if [ ! -f "$BIN_DIR/strata" ]; then
     if [ -n "$STRATA_DIR" ] && [ -f "$STRATA_DIR/engine/strata" ]; then
         echo "[+] Linking existing Strata worker binary from $STRATA_DIR..."
         ln -sf "$STRATA_DIR/engine/strata" "$BIN_DIR/strata"
-    elif [ -f "../Strata/engine/strata" ]; then
-        echo "[+] Linking local Strata worker binary..."
-        ln -sf "$(cd ../Strata && pwd)/engine/strata" "$BIN_DIR/strata"
     else
         echo "[+] Downloading precompiled Strata worker binary (v0.2.9 / engine 0.1.55)..."
         CUDA_VER="cuda12"
