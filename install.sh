@@ -5,17 +5,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_DIR="${1:-.}"
 
 echo "=========================================================="
-echo "  Installing Strata vLLM PagedMoE Engine Drop-in"
+echo "  Installing Hydragen (vLLM + Triton PagedMoE Engine)"
 echo "=========================================================="
 echo "Target directory: $TARGET_DIR"
 
 if [ ! -d "$TARGET_DIR/serve" ]; then
-    echo "[-] Error: '$TARGET_DIR' does not look like a Strata repository (missing 'serve/' folder)."
-    echo "    Usage: ./install.sh /path/to/Strata"
+    echo "[-] Error: '$TARGET_DIR' does not look like a valid target repository (missing 'serve/' folder)."
+    echo "    Usage: ./install.sh /path/to/target"
     exit 1
 fi
 
-echo "[1/4] Installing strata-vllm Python package & vLLM general plugin..."
+echo "[1/4] Installing hydragen Python package & vLLM general plugin..."
 if [ -x "/home/thirteenthd/vllm-env/bin/pip" ]; then
     /home/thirteenthd/vllm-env/bin/pip install -e "$SCRIPT_DIR" --no-build-isolation --no-deps || true
 elif command -v pip3 &>/dev/null; then

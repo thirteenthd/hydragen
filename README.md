@@ -1,8 +1,8 @@
-# Strata-vLLM Hybrid PagedMoE Engine (`strata_vllm` / `--engine vllm`)
+# Hydragen: Hybrid vLLM + Triton PagedMoE Engine (`hydragen` / `--engine vllm`)
 
-A modular, installable Python package (`strata_vllm`) and vLLM plugin (`vllm.general_plugins`) that combines **vLLM's multi-slot concurrency, prefix caching, and Triton Fused MoE slot-indirection** with **Strata's tiered MoE expert hot-swapping, pinned host-RAM expert arena, GSQ sub-4-bit quantization (`IQ3_XXS` / `IQ2_XS` / `Q2_0_STRATA`), and 4-layer Multi-Token Prediction (MTP) speculative decoding**—purpose-built to serve massive MoE models (`Qwen3.8-Flash-Next`, 176.9B params, 512 experts/layer across 48 layers at `128k` context) on a single **12 GB VRAM consumer GPU** (`NVIDIA RTX 3080 Ti`).
+A modular, installable Python package (`hydragen`) and vLLM plugin (`vllm.general_plugins`) that combines **vLLM's multi-slot concurrency, prefix caching, and Triton Fused MoE slot-indirection** with **tiered MoE expert hot-swapping, pinned host-RAM expert arena, GSQ sub-4-bit quantization (`IQ3_XXS` / `IQ2_XS` / `Q2_0_STRATA`), and 4-layer Multi-Token Prediction (MTP) speculative decoding**—purpose-built to serve massive MoE models (`Qwen3.8-Flash-Next`, 176.9B params, 512 experts/layer across 48 layers at `128k` context) on a single **12 GB VRAM consumer GPU** (`NVIDIA RTX 3080 Ti`).
 
-![Strata-vLLM Live Web Monitor](docs/assets/monitor-overview.png)
+![Hydragen Live Web Monitor](docs/assets/monitor-overview.png)
 
 ---
 
@@ -236,9 +236,9 @@ strata-vllm/
 Clone this repository and run the installer pointing to your Strata directory:
 
 ```bash
-git clone git@github.com:derekchung-800house/strata-vllm.git
-cd strata-vllm
-./install.sh /path/to/Strata
+git clone https://github.com/thirteenthd/Hydragen.git
+cd Hydragen
+./install.sh /path/to/target
 ```
 
 > **Note:** `./install.sh` installs the `strata_vllm` Python package (`pip install -e .`) into your `vllm-env` so vLLM automatically discovers the `strata_gguf` plugin, and copies the drop-in bridge files into `/path/to/Strata`. Your existing Strata installation is **100% preserved** (`serve/server.py` is backed up to `serve/server.py.orig_backup`). You can switch between `--engine strata` and `--engine vllm` at any time, or run `./uninstall.sh /path/to/Strata` to revert completely.

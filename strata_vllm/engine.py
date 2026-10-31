@@ -59,8 +59,8 @@ class VLLMEngine:
             or self.cfg.get("native")
             or "/home/thirteenthd/Strata-data/models/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf"
         )
-        print(f"[strata-vllm] Initializing VLLMEngine with shard: {Path(shard).name}")
-        print(f"[strata-vllm] Concurrency slots: {self.batch}, STRATA_ROUTE_PRIOR={self.route_prior}")
+        print(f"[hydragen] Initializing VLLMEngine with shard: {Path(shard).name}")
+        print(f"[hydragen] Concurrency slots: {self.batch}, STRATA_ROUTE_PRIOR={self.route_prior}")
 
         # 1. Option A GGUF Loader & Bridge Metadata
         register_strata_gguf_types()
@@ -85,7 +85,7 @@ class VLLMEngine:
             args = engine_args(self.cfg)
             log_path = self.cfg.get("log") or "/home/thirteenthd/Strata/strata-iq3_xxs.log"
             env = self.cfg.get("env")
-            print(f"[strata-vllm] Launching resident 48-layer pipeline worker: {exe}")
+            print(f"[hydragen] Launching resident 48-layer pipeline worker: {exe}")
             self.backend = StrataEngine(
                 exe, args, cwd=self.cfg.get("cwd"), log=log_path, env=env
             )
@@ -148,7 +148,7 @@ class VLLMEngine:
         )
         self.info = {
             **b_info,
-            "version": "0.34.0-strata-vllm-triton",
+            "version": "0.34.0-hydragen-triton",
             "engine": "vllm-triton-pagedmoe",
             "model": "qwen3.8-flash-next-iq3_xxs",
             "arena_mib": b_info.get("arena_mib", 40925),
@@ -202,7 +202,7 @@ class VLLMEngine:
 
         dt_ms = (time.perf_counter() - t0) * 1000.0
         print(
-            f"[strata-vllm] Compressed GGUF Triton+INT8 MoE warmup complete in {dt_ms:.1f} ms "
+            f"[hydragen] Compressed GGUF Triton+INT8 MoE warmup complete in {dt_ms:.1f} ms "
             f"(L0 finite={torch.isfinite(out0).all().item()}, L1[Q2_0_STRATA] finite={torch.isfinite(out1).all().item()}, "
             f"active_experts={int(metrics0['active_experts'] + metrics1['active_experts'])})"
         )

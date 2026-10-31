@@ -3,15 +3,16 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "strata-vllm"
+name = "hydragen"
 version = "0.34.0"
-description = "Modular Hybrid vLLM + Triton Paged MoE Engine for Strata GGUF Models on 12 GB GPUs"
+description = "Hydragen: Modular Hybrid vLLM + Triton Paged MoE Engine for GGUF Models on Consumer GPUs"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [
-    {name = "Derek Chung", email = "derekchung-800house@users.noreply.github.com"}
+    {name = "thirteenthd", email = "thirteenthd@users.noreply.github.com"}
 ]
+urls = {Repository = "https://github.com/thirteenthd/Hydragen"}
 dependencies = [
     "numpy",
     "gguf",
@@ -20,9 +21,11 @@ dependencies = [
 ]
 
 [project.scripts]
+hydragen = "strata_vllm.cli:main"
 strata-vllm = "strata_vllm.cli:main"
 
 [project.entry-points."vllm.general_plugins"]
+hydragen_gguf = "strata_vllm.vllm_plugin:register_strata_vllm_plugin"
 strata_gguf = "strata_vllm.vllm_plugin:register_strata_vllm_plugin"
 
 [tool.setuptools.packages.find]

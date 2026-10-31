@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 echo ==========================================================
-echo   Installing Strata vLLM PagedMoE Engine Drop-in (Windows)
+echo   Installing Hydragen PagedMoE Engine Drop-in (Windows)
 echo ==========================================================
 
 set "SCRIPT_DIR=%~dp0"
