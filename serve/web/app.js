@@ -607,8 +607,6 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
       }
     }
 
-    const subEl = $("slots-dashboard-sub");
-    if (subEl) subEl.textContent = `${maxSlots} concurrent batch slots · Parallel decode & hot-swap`;
     const stateBadge = $("slots-state-badge");
     if (stateBadge) {
       let overall = curConcurrency > 0 ? (activeGeneratingSlots.length > 0 ? "Generating" : "Reading") : (modelOp ? "Loading" : "Idle");
