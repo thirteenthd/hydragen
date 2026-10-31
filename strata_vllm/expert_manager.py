@@ -295,12 +295,9 @@ class PagedExpertManager:
         required_expert_ids: List[int],
         locked_slots: Optional[Set[int]] = None,
     ) -> Dict[int, int]:
-        """Multi-layer expert paging across all 48 layers sharing the VRAM slot pool."""
-        if layer_idx == self.default_layer_idx and all(
-            isinstance(k, int) for k in self.residency_map
-        ):
-            return self.request_experts(required_expert_ids, locked_slots=locked_slots)
-
+        """Multi-layer expert paging across all 48 layers sharing the VRAM slot pool.
+        Always uses `(layer_idx, eid)` keys so single-layer and multi-layer keys never collide.
+        """
         if locked_slots is None:
             locked_slots = set()
 

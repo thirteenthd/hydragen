@@ -419,7 +419,9 @@ def native_gguf_paged_moe_forward(
         slot_table = expert_manager.get_gpu_slot_table(layer_idx)
         expert_manager.synchronize()
 
-        slot_ids = slot_table[chunk_experts_t.long()].to(torch.int64)
+        slot_ids = slot_table[chunk_experts_t.long()].to(torch.int64).clamp(
+            min=0, max=expert_manager.num_slots - 1
+        )
         tile_grp_ptr = (base_ptr + slot_ids * slot_stride).contiguous()
 
         entry_start = int(grp_start_cpu[start])
