@@ -313,20 +313,20 @@ Hydragen allows you to easily switch between inference engines and fine-tune sch
 
 ### A. Switching Inference Engines
 
-You can switch engines directly via the `--engine` command-line flag or inside your configuration file:
+Hydragen provides two powerful execution backends. **Both engines fully support multi-slot concurrency (`--batch <N>`), the enhanced scheduler with interactive prompt preemption, small-cap reasoning budget guards, and the live Concurrency States dashboard:**
 
-| Flag | Engine Name | Key Features | Best Used For |
+| Flag | Engine Name | Execution Paradigm | When to Use |
 | :--- | :--- | :--- | :--- |
-| **`--engine vllm`** *(Default)* | **Hydragen Hybrid Engine** | Multi-slot continuous batching, Triton FusedMoE expert paging, dynamic PCIe streaming, live Concurrency States dashboard, Jaccard expert-affinity request reordering. | High-concurrency agent workflows (Hermes, Letta, Cursor, subagent teams), simultaneous chat users. |
-| **`--engine strata`** | **Stock Strata Worker** | Serial execution, single-slot dedicated pipeline, lower baseline VRAM footprint. | Maximum single-user decode speed when no multi-turn concurrency or agent queuing is required. |
+| **`--engine vllm`** *(Default)* | **Hydragen Hybrid Engine** | Continuous multi-slot batching with **Triton FusedMoE expert paging**, in-kernel dequantization, dynamic PCIe Gen4 DMA streaming, and Jaccard expert-affinity queue reordering. | High-concurrency agent workflows (Hermes, Letta, Cursor, multi-subagent teams) where dynamic expert paging and GPU-accelerated routing maximize aggregate throughput. |
+| **`--engine strata`** | **Enhanced Strata Multi-Slot Engine** | Native C++ multi-slot batching (`BGEN`/`BT`/`BDONE`) with pinned host-RAM expert arena, dynamic solo MTP promotion, and interactive chunk yielding. | High-performance multi-slot or solo inference using the native C++ pipeline worker. Supports concurrency whenever VRAM headroom permits slot allocation. |
 
 **Command-line examples:**
 ```bash
-# Launch with Hydragen hybrid multi-slot engine (default):
-hydragen --engine vllm --config hydragen.json
+# Launch with Hydragen hybrid Triton PagedMoE engine (2 concurrent slots):
+hydragen --engine vllm --batch 2 --config hydragen.json
 
-# Launch in stock single-slot mode:
-hydragen --engine strata --config hydragen.json
+# Launch with Enhanced Strata multi-slot engine (2 concurrent slots):
+hydragen --engine strata --batch 2 --config hydragen.json
 ```
 
 ---
