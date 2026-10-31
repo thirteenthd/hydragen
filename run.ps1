@@ -9,6 +9,11 @@ if (Test-Path $activateScript) {
     & $activateScript
 }
 
+$binDir = Join-Path $scriptDir "bin"
+if (Test-Path $binDir) {
+    $env:PATH = "$binDir;$env:PATH"
+}
+
 $configFile = "hydragen.json"
 if (-not (Test-Path $configFile)) {
     if (Test-Path "strata-iq3_xxs.json") {

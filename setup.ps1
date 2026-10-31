@@ -76,13 +76,22 @@ if (-not (Test-Path $strataExe)) {
         Write-Host "[+] Copying local Strata binary..." -ForegroundColor Green
         Copy-Item "..\Strata\engine\strata.exe" $strataExe
     } else {
-        Write-Host "[+] Downloading precompiled Strata worker binary (Windows x64)..." -ForegroundColor Yellow
-        $winUrl = "https://github.com/Niko1221/Strata/releases/download/v0.34.0/strata-windows-x64.zip"
-        $zipPath = Join-Path $binDir "strata-win.zip"
+        Write-Host "[+] Downloading precompiled Strata worker binary (v0.2.9 / engine 0.1.55)..." -ForegroundColor Yellow
+        $cudaVer = "cuda12"
+        if (Get-Command nvcc -ErrorAction SilentlyContinue) {
+            $nvccOut = nvcc --version | Out-String
+            if ($nvccOut -match "release 13") {
+                $cudaVer = "cuda13"
+            }
+        }
+        Write-Host "[+] Selected CUDA target: $cudaVer" -ForegroundColor Cyan
+        $winUrl = "https://github.com/Niko1221/Strata/releases/download/v0.2.9/strata-engine-0.1.55-windows-x86_64-cuda-${cudaVer}.tar.gz"
+        $tarPath = Join-Path $binDir "strata-engine.tar.gz"
         try {
-            Invoke-WebRequest -Uri $winUrl -OutFile $zipPath -UseBasicParsing
-            Expand-Archive -Path $zipPath -DestinationPath $binDir -Force
-            Remove-Item $zipPath -Force
+            Invoke-WebRequest -Uri $winUrl -OutFile $tarPath -UseBasicParsing
+            tar -xzf $tarPath -C $binDir
+            Remove-Item $tarPath -Force
+            Write-Host "[+] Successfully extracted Strata v0.2.9 worker to $binDir" -ForegroundColor Green
         } catch {
             Write-Warning "[!] Auto-download failed. You can copy your compiled 'strata.exe' into $binDir\strata.exe."
         }

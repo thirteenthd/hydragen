@@ -77,15 +77,26 @@ if [ ! -f "$BIN_DIR/strata" ]; then
         echo "[+] Linking local Strata worker binary..."
         ln -sf "$(cd ../Strata && pwd)/engine/strata" "$BIN_DIR/strata"
     else
-        echo "[+] Downloading precompiled Strata worker binary (Linux x86_64)..."
-        STRATA_DL_URL="https://github.com/Niko1221/Strata/releases/download/v0.34.0/strata-linux-x64.tar.gz"
+        echo "[+] Downloading precompiled Strata worker binary (v0.2.9 / engine 0.1.55)..."
+        CUDA_VER="cuda12"
+        if command -v nvcc &>/dev/null; then
+            if nvcc --version | grep -q "release 13"; then
+                CUDA_VER="cuda13"
+            fi
+        elif [ -d "/usr/local/cuda-13" ] || [ -d "/usr/local/cuda-13.1" ]; then
+            CUDA_VER="cuda13"
+        fi
+        echo "[+] Selected CUDA target: $CUDA_VER"
+        STRATA_DL_URL="https://github.com/Niko1221/Strata/releases/download/v0.2.9/strata-engine-0.1.55-linux-x86_64-cuda-${CUDA_VER}.tar.gz"
+        echo "[+] Fetching $STRATA_DL_URL..."
         if curl -sL --fail "$STRATA_DL_URL" -o "$BIN_DIR/strata.tar.gz"; then
             tar -xzf "$BIN_DIR/strata.tar.gz" -C "$BIN_DIR"
             rm -f "$BIN_DIR/strata.tar.gz"
+            echo "[+] Successfully unpacked Strata v0.2.9 worker into $BIN_DIR"
         else
             echo "[!] Auto-download failed. You can copy your compiled 'strata' binary into $BIN_DIR/strata."
         fi
-        chmod +x "$BIN_DIR/strata" 2>/dev/null || true
+        chmod +x "$BIN_DIR/strata" "$BIN_DIR/strata-vision" 2>/dev/null || true
     fi
 fi
 
