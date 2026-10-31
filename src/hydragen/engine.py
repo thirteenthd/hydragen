@@ -33,6 +33,14 @@ from hydragen.triton_moe import (
 class VLLMEngine:
     """Hybrid vLLM PagedMoE + Triton Backend implementing Strata's Engine Protocol."""
 
+    @staticmethod
+    def _find_fallback_model() -> Optional[str]:
+        for base in [Path.cwd(), Path.cwd() / "models", Path.home() / "models"]:
+            if base.exists():
+                for p in base.glob("*.gguf"):
+                    return str(p.resolve())
+        return None
+
     def __init__(
         self,
         cfg: Dict[str, Any],
@@ -57,8 +65,15 @@ class VLLMEngine:
         shard = (
             model_shard
             or self.cfg.get("native")
-            or "/home/thirteenthd/Strata-data/models/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf"
+            or self.cfg.get("model")
+            or os.environ.get("HYDRAGEN_MODEL")
+            or self._find_fallback_model()
         )
+        if not shard or not os.path.exists(shard):
+            raise FileNotFoundError(
+                f"Model shard not found: {shard}. "
+                "Specify a valid GGUF file in your config or via HYDRAGEN_MODEL."
+            )
         print(f"[hydragen] Initializing VLLMEngine with shard: {Path(shard).name}")
         print(f"[hydragen] Concurrency slots: {self.batch}, STRATA_ROUTE_PRIOR={self.route_prior}")
 
@@ -83,7 +98,7 @@ class VLLMEngine:
                 )
             )
             args = engine_args(self.cfg)
-            log_path = self.cfg.get("log") or "/home/thirteenthd/Strata/strata-iq3_xxs.log"
+            log_path = self.cfg.get("log") or os.environ.get("HYDRAGEN_LOG") or os.path.join(self.cfg.get("cwd") or ".", "hydragen.log")
             env = self.cfg.get("env")
             print(f"[hydragen] Launching resident 48-layer pipeline worker: {exe}")
             self.backend = StrataEngine(
