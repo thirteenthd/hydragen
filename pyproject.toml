@@ -19,6 +19,8 @@ dependencies = [
     "torch>=2.4.0",
     "triton>=3.0.0",
     "psutil",
+    "regex",
+    "Pillow",
 ]
 
 [project.optional-dependencies]
