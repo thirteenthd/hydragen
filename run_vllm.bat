@@ -7,5 +7,5 @@ if not exist "%CONFIG_FILE%" (
     )
 )
 :found
-echo [strata-vllm] Starting server using config: %CONFIG_FILE%
+echo [hydragen] Starting server using config: %CONFIG_FILE%
 python -m serve.server --engine vllm --config "%CONFIG_FILE%" --port 8080 --api-monitor --no-api-key %*

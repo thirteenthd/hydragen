@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Launch Strata with Hybrid vLLM + Triton PagedMoE Backend
+# Launch Hydragen with Hybrid vLLM + Triton PagedMoE Backend
 # ============================================================================
 if [ -x "/home/thirteenthd/vllm-env/bin/python" ]; then
     PYTHON_BIN="/home/thirteenthd/vllm-env/bin/python"
@@ -23,7 +23,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
     fi
 fi
 
-echo "[strata-vllm] Starting server using config: $CONFIG_FILE"
+echo "[hydragen] Starting server using config: $CONFIG_FILE"
 exec "$PYTHON_BIN" -m serve.server \
     --engine vllm \
     --config "$CONFIG_FILE" \
