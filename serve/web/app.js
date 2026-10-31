@@ -838,17 +838,16 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     }
   }
 
-  // Scale Decode to the lower ~20-26% of the gauge, and Prefill above it in the upper 50-100%
-  const maxDecodeVal = Math.max(...decodeSeries, curSpeedVal, 70);
-  const maxDecodeAxis = maxDecodeVal * 4.2;
-  const maxPrefillVal = Math.max(...prefillSeries, curPrefillVal, 500);
-  const scaledPrefillSeries = prefillSeries.map((v) => {
-    if (!v || v <= 0) return 0;
-    const norm = Math.min(1, v / maxPrefillVal);
-    return maxPrefillVal * (0.48 + 0.52 * norm);
-  });
+  // Independent auto-scaling for Decode (token generation) and Prefill (prompt processing)
+  // Both series use their own dynamic maximum, giving token generation full vertical dynamic
+  // range (~80-115 tok/s) rather than squashing it into the bottom 20% to fit 2000+ tok/s prefill speeds.
+  const maxDecodeVal = Math.max(...decodeSeries, curSpeedVal, 20);
+  const maxDecodeAxis = maxDecodeVal * 1.15;
+  const maxPrefillVal = Math.max(...prefillSeries, curPrefillVal, 200);
+  const maxPrefillAxis = maxPrefillVal * 1.15;
+
   spark("sp-speed", decodeSeries, maxDecodeAxis);
-  spark("sp-prefill", scaledPrefillSeries, maxPrefillVal);
+  spark("sp-prefill", prefillSeries, maxPrefillAxis);
   // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
   const per = (f) => (hw.gpus || []).map((g) => `GPU ${g.index} ${f(g)}`).join(" · ");
   const multi = (hw.gpus || []).length > 1;
