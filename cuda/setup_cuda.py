@@ -72,7 +72,7 @@ strata_src = os.environ.get('STRATA_SRC_DIR', '/home/thirteenthd/Strata/src/kern
 if os.path.isdir(strata_src):
     import subprocess
     out_so = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'serve', 'libstrata_iq_kernels.so'))
-    bridge_cu = os.path.abspath(os.path.join(os.path.dirname(__file__), 'strata_vllm_bridge.cu'))
+    bridge_cu = os.path.abspath(os.path.join(os.path.dirname(__file__), 'hydragen_bridge.cu'))
     strata_root = os.path.abspath(os.path.join(strata_src, '..', '..', '..'))
     cmd = [
         f'{root}/bin/nvcc', '-O3', '--shared', '-Xcompiler', '-fPIC', '-arch=sm_86',
