@@ -19,7 +19,6 @@ dependencies = [
     "torch>=2.4.0",
     "triton>=3.0.0",
     "psutil",
-    "vllm>=0.6.0; sys_platform != 'win32'",
 ]
 
 [project.optional-dependencies]
