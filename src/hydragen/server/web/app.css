@@ -102,8 +102,6 @@ main { flex: 1; min-height: 0; display: flex; }
 .speed-values > div:last-child { text-align: right; }
 .speed-values .st-metric__value { font-size: clamp(20px, 2.2vw, var(--st-fs-stat)); }
 .st-metric__spark .speed-prefill { color: var(--st-info, #0f97ff); }
-.speed-values .speed-prefill .st-metric__value { color: var(--st-info-text, #0668c2); }
-[data-theme="dark"] .speed-values .speed-prefill .st-metric__value { color: var(--st-info, #0f97ff); }
 .st-metric__spark[data-tone="warn"] { color: var(--st-warn); }
 .st-metric__spark[data-tone="info"] { color: var(--st-info); }
 .monitor-row { display: grid; grid-template-columns: minmax(min(260px, 100%), 1fr) minmax(0, 2.4fr); gap: var(--st-s-4); }
@@ -663,6 +661,10 @@ main { flex: 1; min-height: 0; display: flex; }
 /* ------------------------------------------------ Queue Sub-card in Concurrency States */
 .slot-tile.slot-tile--queue {
   border-style: solid;
+}
+
+.slot-tile.slot-tile--queue .slot-tile__progress-wrap {
+  margin-top: auto;
 }
 
 .slot-tile.slot-tile--queue.is-idle {

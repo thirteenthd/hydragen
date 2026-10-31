@@ -504,13 +504,8 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
           </div>
         </div>
         <div class="slot-tile__progress-wrap">
-          <div class="slot-tile__bar-track">
-            <div class="slot-tile__bar-fill is-idle" id="queue-tile-fill" style="width: 0%"></div>
-            <div class="slot-tile__ticks"></div>
-          </div>
           <div class="slot-tile__detail">
             <span class="slot-tile__phase" id="queue-tile-phase">Direct admission</span>
-            <span class="slot-tile__tokens" id="queue-tile-detail">0 / ${maxSlots} slots occupied</span>
           </div>
         </div>`;
       slotsGrid.appendChild(qTile);
@@ -604,24 +599,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
       const qStatus = $("queue-metric-status");
       if (qStatus) qStatus.textContent = isQActive ? "Queuing" : "Direct";
 
-      const qFill = $("queue-tile-fill");
-      if (qFill) {
-        qFill.style.width = isQActive ? `${Math.min(100, Math.max(15, queuedCount * 25))}%` : "0%";
-        qFill.className = `slot-tile__bar-fill ${isQActive ? "is-queued" : "is-idle"}`;
-      }
-
       const qPhase = $("queue-tile-phase");
       if (qPhase) {
         qPhase.textContent = isQActive
-          ? `${queuedCount} ${queuedCount === 1 ? "request" : "requests"} waiting for next free slot`
-          : "Slots available · Direct admission";
-      }
-
-      const qDetail = $("queue-tile-detail");
-      if (qDetail) {
-        qDetail.textContent = curConcurrency >= maxSlots
-          ? `${curConcurrency} / ${maxSlots} slots occupied`
-          : `${maxSlots - curConcurrency} of ${maxSlots} slots free`;
+          ? `${queuedCount} ${queuedCount === 1 ? "request" : "requests"} waiting`
+          : "Direct admission";
       }
     }
 
