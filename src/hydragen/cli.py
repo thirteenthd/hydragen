@@ -11,23 +11,18 @@ def main() -> int:
     """Launch the Hydragen server with the Triton + PagedExpertManager backend."""
     cur_dir = os.getcwd()
     file_dir = os.path.dirname(os.path.abspath(__file__))
-    src_parent = os.path.dirname(os.path.dirname(file_dir))
+    repo_root = os.path.dirname(os.path.dirname(file_dir))
     server_dir = os.path.join(file_dir, "server")
-    tools_dir = os.path.join(src_parent, "tools")
+    tools_dir = os.path.join(repo_root, "tools")
     cur_tools = os.path.join(cur_dir, "tools")
+    serve_dir = os.path.join(repo_root, "serve")
+    cur_serve = os.path.join(cur_dir, "serve")
     strata_dir = os.environ.get("STRATA_DIR")
     vllm_dir = os.environ.get("VLLM_DIR")
 
-    for p in (cur_dir, src_parent, server_dir, tools_dir, cur_tools, strata_dir, vllm_dir):
+    for p in (cur_dir, repo_root, tools_dir, cur_tools, strata_dir, vllm_dir):
         if p and os.path.isdir(p) and p not in sys.path:
             sys.path.insert(0, p)
-
-    if "serve" not in sys.modules:
-        try:
-            import hydragen.server as server_pkg
-            sys.modules["serve"] = server_pkg
-        except Exception:
-            pass
 
     # Register vLLM quantization plugin
     from hydragen.vllm_plugin import register_strata_vllm_plugin
