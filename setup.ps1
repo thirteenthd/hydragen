@@ -226,7 +226,7 @@ if (-not (Test-Path $cfgPath)) {
     "--max-context", "131072",
     "--kv", "int8",
     "--vision",
-    "--vram-reserve-mib", "576",
+    "--vram-reserve-mib", "768",
     "--pcie-frac", "0.20",
     "--spec-min-p", "0.45",
     "--coupled-draft",
