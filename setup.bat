@@ -85,7 +85,13 @@ if not exist "%STRATA_EXE%" (
     )
 )
 
-REM 7. Generate default config if missing
+REM 7. Ensure strata_control and tools modules are available
+if not exist "%SCRIPT_DIR%strata_control" if not exist "..\Strata\strata_control" (
+    echo [+] Downloading Strata control modules (v0.2.9 / 0.1.55)...
+    powershell -Command "try { Invoke-WebRequest -Uri 'https://github.com/Niko1221/Strata/releases/download/v0.2.9/strata-control-0.1.55-windows-x86_64.zip' -OutFile '%SCRIPT_DIR%bin\control.zip' -UseBasicParsing; Expand-Archive -Path '%SCRIPT_DIR%bin\control.zip' -DestinationPath '%SCRIPT_DIR%' -Force; Remove-Item '%SCRIPT_DIR%bin\control.zip' -Force; Write-Host '[+] Extracted strata_control and tools' -ForegroundColor Green } catch { Write-Warning 'Control modules download failed' }"
+)
+
+REM 8. Generate default config if missing
 set "CONFIG_FILE=%SCRIPT_DIR%hydragen.json"
 if not exist "%CONFIG_FILE%" (
     echo [+] Generating default hydragen.json template...

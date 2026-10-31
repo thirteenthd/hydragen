@@ -98,7 +98,23 @@ if (-not (Test-Path $strataExe)) {
     }
 }
 
-# 7. Generate default hydragen.json
+# 7. Ensure strata_control and tools modules are available
+$ctrlDir = Join-Path $scriptDir "strata_control"
+if ((-not (Test-Path $ctrlDir)) -and (-not (Test-Path "..\Strata\strata_control"))) {
+    Write-Host "[+] Downloading Strata control modules (v0.2.9 / 0.1.55)..." -ForegroundColor Yellow
+    $ctrlUrl = "https://github.com/Niko1221/Strata/releases/download/v0.2.9/strata-control-0.1.55-windows-x86_64.zip"
+    $zipPath = Join-Path $binDir "control.zip"
+    try {
+        Invoke-WebRequest -Uri $ctrlUrl -OutFile $zipPath -UseBasicParsing
+        Expand-Archive -Path $zipPath -DestinationPath $scriptDir -Force
+        Remove-Item $zipPath -Force
+        Write-Host "[+] Extracted strata_control and tools" -ForegroundColor Green
+    } catch {
+        Write-Warning "[!] Control modules auto-download failed."
+    }
+}
+
+# 8. Generate default hydragen.json
 $cfgPath = Join-Path $scriptDir "hydragen.json"
 if (-not (Test-Path $cfgPath)) {
     Write-Host "[+] Generating default hydragen.json template..." -ForegroundColor Yellow

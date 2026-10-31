@@ -58,8 +58,18 @@ from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tools"))
-sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
+for _cand in [
+    os.environ.get("STRATA_DIR"),
+    str(ROOT),
+    str(ROOT / "serve"),
+    str(ROOT / "tools"),
+    str(ROOT.parent / "Strata"),
+    str(ROOT.parent / "Strata" / "tools"),
+    os.path.expanduser("~/.local/share/strata/terminal/0.1.55"),
+    os.path.expanduser("~/.local/share/strata/terminal/0.1.46.2"),
+]:
+    if _cand and os.path.isdir(_cand) and _cand not in sys.path:
+        sys.path.insert(0, _cand)
 from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
                             tool_choice_of, unmark_think_literals)

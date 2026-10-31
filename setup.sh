@@ -109,7 +109,20 @@ if [ ! -f "$BIN_DIR/strata" ]; then
     fi
 fi
 
-# 6. Generate Default Config if Missing
+# 6. Ensure strata_control and tools modules are available
+if [ ! -d "$SCRIPT_DIR/strata_control" ] && [ ! -d "../Strata/strata_control" ]; then
+    echo "[+] Downloading Strata control modules (v0.2.9 / 0.1.55)..."
+    CTRL_URL="https://github.com/Niko1221/Strata/releases/download/v0.2.9/strata-control-0.1.55-linux-x86_64.tar.gz"
+    if curl -sL --fail "$CTRL_URL" -o "$BIN_DIR/control.tar.gz"; then
+        tar -xzf "$BIN_DIR/control.tar.gz" -C "$SCRIPT_DIR" strata_control tools 2>/dev/null || tar -xzf "$BIN_DIR/control.tar.gz" -C "$SCRIPT_DIR"
+        rm -f "$BIN_DIR/control.tar.gz"
+        echo "[+] Successfully unpacked strata_control and tools into $SCRIPT_DIR"
+    else
+        echo "[!] Control modules auto-download failed."
+    fi
+fi
+
+# 7. Generate Default Config if Missing
 CONFIG_FILE="$SCRIPT_DIR/hydragen.json"
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "[+] Generating default hydragen.json template..."
