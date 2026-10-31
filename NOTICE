@@ -1,0 +1,14 @@
+Hydragen
+Copyright (c) 2026 thirteenthd (https://github.com/thirteenthd/Hydragen)
+
+This project builds upon, integrates with, and acknowledges the foundational work of:
+
+1. Strata (https://github.com/Niko1221/Strata)
+   Developed by Niko Veit (@Niko1221)
+   Provides the tiered memory architecture, host-RAM expert arena offloading,
+   GSQ sub-4-bit quantization, and MTP speculative decoding foundations.
+
+2. vLLM (https://github.com/vllm-project/vllm)
+   Developed by the vLLM Team
+   Provides the continuous batching architecture, PagedAttention KV management,
+   and Triton FusedMoE execution paradigms.

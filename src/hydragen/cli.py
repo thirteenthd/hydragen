@@ -17,7 +17,7 @@ def main() -> int:
             sys.path.insert(0, p)
 
     # Register vLLM quantization plugin
-    from strata_vllm.vllm_plugin import register_strata_vllm_plugin
+    from hydragen.vllm_plugin import register_strata_vllm_plugin
 
     register_strata_vllm_plugin()
 
