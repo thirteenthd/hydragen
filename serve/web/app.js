@@ -882,9 +882,14 @@ function facts(el, rows) {
 }
 // INFO cvec=project:4-44[:singleL] | add:A-B | 0
 function projectionText(c) {
-  if (!c || c === "0" || c === 0) return null;
-  const [mode, range, single] = String(c).split(":");
-  const [a, b] = (range || "").split("-");
+  if (!c || c === "0" || c === 0 || c === "1" || c === 1) return null;
+  const parts = String(c).split(":");
+  if (parts.length < 2) return null;
+  const mode = parts[0];
+  const range = parts[1] || "";
+  const [a, b] = range.split("-");
+  if (!a || !b) return null;
+  const single = parts[2] || "";
   return `${mode === "project" ? "Projection" : "Additive"} control vector on layers ${a}–${b}` +
          `${single ? ` (layer ${single.replace("single", "")}'s direction)` : ""}. Per chat in Sampling. Its package ` +
          "describes the vector as a refusal-direction projection; measure the speed yourself";
