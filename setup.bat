@@ -104,7 +104,7 @@ if not exist "%CONFIG_FILE%" (
         echo     "--spec", "4",
         echo     "--max-context", "131072",
         echo     "--kv", "int8",
-        echo     "--vram-reserve-mib", "384",
+        echo     "--vram-reserve-mib", "576",
         echo     "--pcie-frac", "0.20",
         echo     "--spec-min-p", "0.45",
         echo     "--adapt-async", "1",
