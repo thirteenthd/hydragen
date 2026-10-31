@@ -36,4 +36,4 @@ where = ["src"]
 include = ["hydragen*"]
 
 [tool.setuptools.package-data]
-"hydragen.server" = ["libstrata_iq_kernels.so", "web/**/*", "web/*"]
+"hydragen.server" = ["libstrata_iq_kernels.so", "web/**/*", "web/*", "*.jinja", "chat_template.jinja"]
