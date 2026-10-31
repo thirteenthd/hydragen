@@ -54,10 +54,31 @@ Write-Host "[+] Installing Hydragen and dependencies..." -ForegroundColor Yellow
 & python -m pip install --upgrade pip
 & python -m pip install -e .
 
-# 6. Ensure bin directory
+# 6. Ensure bin directory & precompiled worker binary
 $binDir = Join-Path $scriptDir "bin"
 if (-not (Test-Path $binDir)) {
     New-Item -ItemType Directory -Path $binDir | Out-Null
+}
+$strataExe = Join-Path $binDir "strata.exe"
+if (-not (Test-Path $strataExe)) {
+    if ($env:STRATA_DIR -and (Test-Path (Join-Path $env:STRATA_DIR "engine\strata.exe"))) {
+        Write-Host "[+] Copying Strata binary from `$env:STRATA_DIR..." -ForegroundColor Green
+        Copy-Item (Join-Path $env:STRATA_DIR "engine\strata.exe") $strataExe
+    } elseif (Test-Path "..\Strata\engine\strata.exe") {
+        Write-Host "[+] Copying local Strata binary..." -ForegroundColor Green
+        Copy-Item "..\Strata\engine\strata.exe" $strataExe
+    } else {
+        Write-Host "[+] Downloading precompiled Strata worker binary (Windows x64)..." -ForegroundColor Yellow
+        $winUrl = "https://github.com/Niko1221/Strata/releases/download/v0.34.0/strata-windows-x64.zip"
+        $zipPath = Join-Path $binDir "strata-win.zip"
+        try {
+            Invoke-WebRequest -Uri $winUrl -OutFile $zipPath -UseBasicParsing
+            Expand-Archive -Path $zipPath -DestinationPath $binDir -Force
+            Remove-Item $zipPath -Force
+        } catch {
+            Write-Warning "[!] Auto-download failed. You can copy your compiled 'strata.exe' into $binDir\strata.exe."
+        }
+    }
 }
 
 # 7. Generate default hydragen.json

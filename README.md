@@ -307,7 +307,61 @@ python tests/test_end_to_end_triton_vllm.py
 
 ---
 
-## 6. Attribution & Acknowledgments
+## 6. Engine Selection & Workload Tuning Guide
+
+Hydragen allows you to easily switch between inference engines and fine-tune scheduling, memory, and speculative execution parameters to match your specific hardware and workload.
+
+### A. Switching Inference Engines
+
+You can switch engines directly via the `--engine` command-line flag or inside your configuration file:
+
+| Flag | Engine Name | Key Features | Best Used For |
+| :--- | :--- | :--- | :--- |
+| **`--engine vllm`** *(Default)* | **Hydragen Hybrid Engine** | Multi-slot continuous batching, Triton FusedMoE expert paging, dynamic PCIe streaming, live Concurrency States dashboard, Jaccard expert-affinity request reordering. | High-concurrency agent workflows (Hermes, Letta, Cursor, subagent teams), simultaneous chat users. |
+| **`--engine strata`** | **Stock Strata Worker** | Serial execution, single-slot dedicated pipeline, lower baseline VRAM footprint. | Maximum single-user decode speed when no multi-turn concurrency or agent queuing is required. |
+
+**Command-line examples:**
+```bash
+# Launch with Hydragen hybrid multi-slot engine (default):
+hydragen --engine vllm --config hydragen.json
+
+# Launch in stock single-slot mode:
+hydragen --engine strata --config hydragen.json
+```
+
+---
+
+### B. Tuning Parameters for Different Workloads
+
+All settings can be specified in `hydragen.json` or passed as command-line arguments to `hydragen`:
+
+#### 1. Concurrency Slots (`--batch <N>`)
+* **`--batch 1` (Solo Mode):** Single stream execution. Allows dynamic solo MTP promotion for maximum single-turn speed (up to **113.8 tok/s**).
+* **`--batch 2` (Recommended Default for 12 GB GPUs):** Sustains 2 concurrent streams at **102–118 combined tok/s** without risking VRAM overflow at 128k context.
+* **`--batch 3` or `4`:** Best for multi-agent workloads with higher VRAM cards (16 GB–24 GB, e.g. RTX 3090/4090/4080) or when using shorter context windows (32k–64k). Any excess requests wait cleanly in the FIFO queue displayed on the monitor.
+
+#### 2. Context Length & KV Cache Tiering
+* **`--max-context <tokens>`:** Sets the total sequence length (e.g., `32768`, `65536`, `131072`).
+* **`--kv int8`:** Quantizes KV cache to 8-bit, cutting KV memory consumption by 50% so a 128k context fits on 12 GB GPUs.
+* **`--kv-resident <positions>`:** Specifies how many token positions are pinned in fast GPU VRAM (e.g., `32768`), with remainder paged to host RAM.
+
+#### 3. Speculative Decoding Depth (`--spec <N>` / MTP)
+* **`--spec 4` (Recommended):** Enables 4-layer Multi-Token Prediction (MTP) speculative drafting, giving a **2.3x–2.65x speedup** on code and structured generation tasks.
+* **`--spec-min-p 0.05`:** Lowers the draft acceptance probability threshold, allowing speculative drafting to engage even on shorter agent turns.
+* **`--spec 0`:** Disables speculative decoding if you need to minimize memory pressure.
+
+#### 4. VRAM Reservation Headroom (`--vram-reserve-mib <MiB>`)
+* **`--vram-reserve-mib 1152`:** Sets aside dedicated VRAM headroom for Triton Fused MoE kernels, dynamic expert swap buffers, and CUDA graph capture. If you experience out-of-memory errors on 12 GB GPUs, increase this value to `1280` or `1536`.
+
+#### 5. Dynamic PCIe Expert Streaming (`--pcie-frac <ratio>`)
+* **`--pcie-frac 0.20`:** Allows the GPU to stream up to 20% of routed experts across PCIe Gen4 DMA in parallel with computation when expert slots are crowded, hiding memory latency and boosting hit rates.
+
+#### 6. Expert Cache Routing Bias (`STRATA_ROUTE_PRIOR`)
+* **`STRATA_ROUTE_PRIOR=0.8` (Environment Variable):** Biases top-10 expert routing toward currently resident VRAM experts. Keeps cache hit rate at **75%–89.6%** without sacrificing reasoning accuracy.
+
+---
+
+## 7. Attribution & Acknowledgments
 
 Hydragen builds upon and brings together two foundational open-source AI projects:
 
