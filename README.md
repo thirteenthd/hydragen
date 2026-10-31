@@ -218,6 +218,9 @@ hydragen/
 
 ### Automated One-Click Setup & Updater
 
+> [!TIP]
+> **For Autonomous AI Agents:** If an AI coding agent (Antigravity, Claude Code, Cursor, Devin) is installing or managing this service, refer to [**`AGENTS.md`**](AGENTS.md) for non-interactive preflight checks, automated polling scripts, and headless testing recipes.
+
 Clone the repository and run the setup script for your platform:
 
 **Linux / WSL2:**
