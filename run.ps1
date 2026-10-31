@@ -4,14 +4,23 @@
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
-$activateScript = Join-Path $scriptDir ".venv\Scripts\Activate.ps1"
-if (Test-Path $activateScript) {
-    & $activateScript
+# Prepend virtual environment Scripts and bin to PATH
+$venvScripts = Join-Path $scriptDir ".venv\Scripts"
+if (Test-Path $venvScripts) {
+    $env:PATH = "$venvScripts;$env:PATH"
 }
 
 $binDir = Join-Path $scriptDir "bin"
 if (Test-Path $binDir) {
     $env:PATH = "$binDir;$env:PATH"
+}
+
+# Optional activation if execution policy allows
+$activateScript = Join-Path $venvScripts "Activate.ps1"
+if (Test-Path $activateScript) {
+    try {
+        & $activateScript
+    } catch {}
 }
 
 $configFile = "hydragen.json"
@@ -22,4 +31,11 @@ if (-not (Test-Path $configFile)) {
 }
 
 Write-Host "[hydragen] Starting server using config: $configFile" -ForegroundColor Green
-& hydragen --config $configFile --port 8080 --api-monitor @args
+
+# Invoke hydragen CLI directly from venv
+$hydragenExe = Join-Path $venvScripts "hydragen.exe"
+if (Test-Path $hydragenExe) {
+    & $hydragenExe --config $configFile --port 8080 --api-monitor @args
+} else {
+    & python -m hydragen.cli --config $configFile --port 8080 --api-monitor @args
+}
