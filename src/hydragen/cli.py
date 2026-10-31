@@ -28,7 +28,8 @@ def main() -> int:
 
     argv = list(sys.argv[1:])
     if "--engine" not in argv:
-        argv = ["--engine", "vllm"] + argv
+        default_engine = os.environ.get("HYDRAGEN_ENGINE", "strata")
+        argv = ["--engine", default_engine] + argv
     if "--config" not in argv:
         for candidate in ["hydragen.json", "strata-iq3_xxs.json", "config.json"]:
             if os.path.exists(candidate):
