@@ -13,10 +13,12 @@ def main() -> int:
     file_dir = os.path.dirname(os.path.abspath(__file__))
     src_parent = os.path.dirname(os.path.dirname(file_dir))
     server_dir = os.path.join(file_dir, "server")
+    tools_dir = os.path.join(src_parent, "tools")
+    cur_tools = os.path.join(cur_dir, "tools")
     strata_dir = os.environ.get("STRATA_DIR")
     vllm_dir = os.environ.get("VLLM_DIR")
 
-    for p in (cur_dir, src_parent, server_dir, strata_dir, vllm_dir):
+    for p in (cur_dir, src_parent, server_dir, tools_dir, cur_tools, strata_dir, vllm_dir):
         if p and os.path.isdir(p) and p not in sys.path:
             sys.path.insert(0, p)
 
