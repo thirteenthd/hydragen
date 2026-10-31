@@ -135,7 +135,6 @@ const METRICS = [
   {key: "pcie", label: "PCIe", icon: "link", unit: "", series: "gpu_pcie_rx_mb", tone: "info"},
   {key: "cpu", label: "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100},
   {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info"},
-  {key: "queue", label: "Queued requests", icon: "layers", unit: "", series: "concurrency", tone: "warn"},
 ];
 $("metrics").innerHTML = METRICS.map((m) => `
   <div class="st-card metric-card"><div class="st-metric">
@@ -447,7 +446,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
 
   const slotsGrid = $("slots-bars-grid");
   if (slotsGrid) {
-    if (slotsGrid.children.length !== maxSlots) {
+    if (slotsGrid.children.length !== (maxSlots + 1)) {
       slotsGrid.innerHTML = "";
       for (let i = 0; i < maxSlots; i++) {
         const tile = document.createElement("div");
@@ -482,6 +481,39 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
           </div>`;
         slotsGrid.appendChild(tile);
       }
+
+      // Append Queue sub-card as the last element in Concurrency States
+      const qTile = document.createElement("div");
+      qTile.className = "slot-tile slot-tile--queue is-idle";
+      qTile.id = "slot-queue-tile";
+      qTile.innerHTML = `
+        <div class="slot-tile__top">
+          <div class="slot-tile__header">
+            <span class="slot-tile__name">Queue</span>
+            <span class="slot-tile__badge tone-idle" id="queue-tile-badge">0 Queued</span>
+          </div>
+          <div class="slot-tile__metrics">
+            <div class="slot-tile__metric">
+              <span class="slot-tile__metric-val" id="queue-metric-count">0</span>
+              <span class="slot-tile__metric-sub">Waiting</span>
+            </div>
+            <div class="slot-tile__metric">
+              <span class="slot-tile__metric-val" id="queue-metric-status">Direct</span>
+              <span class="slot-tile__metric-sub">Admission</span>
+            </div>
+          </div>
+        </div>
+        <div class="slot-tile__progress-wrap">
+          <div class="slot-tile__bar-track">
+            <div class="slot-tile__bar-fill is-idle" id="queue-tile-fill" style="width: 0%"></div>
+            <div class="slot-tile__ticks"></div>
+          </div>
+          <div class="slot-tile__detail">
+            <span class="slot-tile__phase" id="queue-tile-phase">Direct admission</span>
+            <span class="slot-tile__tokens" id="queue-tile-detail">0 / ${maxSlots} slots occupied</span>
+          </div>
+        </div>`;
+      slotsGrid.appendChild(qTile);
     }
 
     for (let i = 0; i < maxSlots; i++) {
@@ -555,6 +587,42 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
       }
       if (phaseEl) phaseEl.textContent = phaseText;
       if (tokensEl) tokensEl.textContent = tokensText;
+    }
+
+    // Update Queue Sub-card (Last sub-card in Concurrency States)
+    const qTile = $("slot-queue-tile");
+    if (qTile) {
+      const isQActive = queuedCount > 0;
+      qTile.className = `slot-tile slot-tile--queue ${isQActive ? "is-queued has-queue" : "is-idle"}`;
+      const qBadge = $("queue-tile-badge");
+      if (qBadge) {
+        qBadge.textContent = isQActive ? `${queuedCount} Queued` : "0 Queued";
+        qBadge.className = `slot-tile__badge ${isQActive ? "tone-queued" : "tone-idle"}`;
+      }
+      const qCount = $("queue-metric-count");
+      if (qCount) qCount.textContent = fmt(queuedCount);
+      const qStatus = $("queue-metric-status");
+      if (qStatus) qStatus.textContent = isQActive ? "Queuing" : "Direct";
+
+      const qFill = $("queue-tile-fill");
+      if (qFill) {
+        qFill.style.width = isQActive ? `${Math.min(100, Math.max(15, queuedCount * 25))}%` : "0%";
+        qFill.className = `slot-tile__bar-fill ${isQActive ? "is-queued" : "is-idle"}`;
+      }
+
+      const qPhase = $("queue-tile-phase");
+      if (qPhase) {
+        qPhase.textContent = isQActive
+          ? `${queuedCount} ${queuedCount === 1 ? "request" : "requests"} waiting for next free slot`
+          : "Slots available · Direct admission";
+      }
+
+      const qDetail = $("queue-tile-detail");
+      if (qDetail) {
+        qDetail.textContent = curConcurrency >= maxSlots
+          ? `${curConcurrency} / ${maxSlots} slots occupied`
+          : `${maxSlots - curConcurrency} of ${maxSlots} slots free`;
+      }
     }
 
     const subEl = $("slots-dashboard-sub");
@@ -811,19 +879,6 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
               hw.disk_write_mb == null ? "" : `write ${fmt(hw.disk_write_mb, 1)} MB/s`);
   }
   spark("sp-disk", h.disk_read_mb);
-
-  // Queue Metric Card (Last card in METRICS)
-  setMetric(
-    "queue",
-    queuedCount === 0 ? "0" : fmt(queuedCount),
-    queuedCount === 1 ? "request" : "requests",
-    queuedCount === 0 ? "No requests queued" : `${queuedCount} waiting for next free slot`
-  );
-  const qCard = $("card-queue") || ($("mv-queue") ? $("mv-queue").closest(".metric-card") : null);
-  if (qCard) {
-    qCard.classList.toggle("has-queue", queuedCount > 0);
-  }
-  spark("sp-queue", rawConc, Math.max(2, maxSlots));
 
   // context fill: the running request, else the last one
   const ctx = eng.max_context || 0;

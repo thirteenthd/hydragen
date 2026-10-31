@@ -5313,10 +5313,10 @@ class Service:
             budget = max_new - min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
             if max_new <= 32768: print(f"[strata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
                   "(\"answer_room\": false in the config turns this off)", flush=True)
-        if (thinking and not budget and self.answer_room and self.family == "deepseek41"
+        if (thinking and not budget and self.answer_room
                 and max_new and DS41_SMALL_CAP_MIN <= max_new < ANSWER_ROOM_MIN_CAP):
-            # DeepSeek-V4.1 only: a short max_tokens (/v1/messages and /v1/chat/completions with 200-600) was spent
-            # entirely on the thinking, so no text block ever arrived.  With no budget of the client's own, the thinking
+            # A short max_tokens (/v1/messages and /v1/chat/completions with 200-1000, e.g. 500) can be spent
+            # entirely on the thinking, so no text block ever arrived. With no budget of the client's own, the thinking
             # is capped at half of max_tokens; then the wrap-up, </think> and the answer follow in the other half.
             budget = max_new // 2
             print(f"[strata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
