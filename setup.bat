@@ -76,9 +76,6 @@ if not exist "%STRATA_EXE%" (
     if defined STRATA_DIR if exist "%STRATA_DIR%\engine\strata.exe" (
         echo [+] Copying Strata binary from STRATA_DIR...
         copy /Y "%STRATA_DIR%\engine\strata.exe" "%STRATA_EXE%" >nul
-    ) else if exist "..\Strata\engine\strata.exe" (
-        echo [+] Copying local Strata binary...
-        copy /Y "..\Strata\engine\strata.exe" "%STRATA_EXE%" >nul
     ) else (
         echo [+] Downloading precompiled Strata worker binary (v0.2.9 / engine 0.1.55)...
         powershell -Command "try { Invoke-WebRequest -Uri 'https://github.com/Niko1221/Strata/releases/download/v0.2.9/strata-engine-0.1.55-windows-x86_64-cuda-cuda12.tar.gz' -OutFile '%SCRIPT_DIR%bin\strata-engine.tar.gz' -UseBasicParsing; tar -xzf '%SCRIPT_DIR%bin\strata-engine.tar.gz' -C '%SCRIPT_DIR%bin'; Remove-Item '%SCRIPT_DIR%bin\strata-engine.tar.gz' -Force; Write-Host '[+] Extracted Strata worker into bin\' -ForegroundColor Green } catch { Write-Warning 'Auto-download failed; please copy strata.exe into bin\' }"
