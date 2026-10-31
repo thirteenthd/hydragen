@@ -34,7 +34,7 @@ strata_gguf = "hydragen.vllm_plugin:register_strata_vllm_plugin"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["hydragen*", "strata_vllm*"]
+include = ["hydragen*"]
 
 [tool.setuptools.package-data]
 "hydragen.server" = ["libstrata_iq_kernels.so", "web/**/*", "web/*"]
