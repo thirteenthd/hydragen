@@ -10,7 +10,7 @@
     "--expert-profile",
     "data/expert-profile.bin",
     "--expert-cache",
-    "auto",
+    "2200",
     "--prefill",
     "auto:8192",
     "--spec",
