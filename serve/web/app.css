@@ -658,6 +658,33 @@ main { flex: 1; min-height: 0; display: flex; }
   font-variant-numeric: tabular-nums;
 }
 
+/* ------------------------------------------------ Queue Sub-card in Concurrency States */
+.slot-tile.slot-tile--queue {
+  border-style: solid;
+}
+
+.slot-tile.slot-tile--queue.is-idle {
+  opacity: 0.9;
+}
+
+.slot-tile.is-queued,
+.slot-tile.has-queue {
+  border-color: color-mix(in srgb, var(--st-warn, #f59e0b) 60%, var(--st-line));
+  background: color-mix(in srgb, var(--st-warn, #f59e0b) 8%, var(--st-surface-2));
+  box-shadow: 0 0 12px color-mix(in srgb, var(--st-warn, #f59e0b) 15%, transparent);
+}
+
+.slot-tile__badge.tone-queued {
+  background: color-mix(in srgb, var(--st-warn, #f59e0b) 20%, transparent);
+  color: var(--st-warn, #f59e0b);
+  font-weight: var(--st-fw-bold);
+}
+
+.slot-tile__bar-fill.is-queued {
+  background: linear-gradient(90deg, var(--st-warn, #f59e0b), color-mix(in srgb, var(--st-warn, #f59e0b) 70%, white));
+  box-shadow: 0 0 8px var(--st-warn, #f59e0b);
+}
+
 /* ------------------------------------------------ Queued Metric Card Highlight */
 .metric-card.has-queue {
   border-color: color-mix(in srgb, var(--st-warn, #f59e0b) 60%, var(--st-line));
