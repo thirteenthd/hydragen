@@ -8,8 +8,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "=========================================================="
-echo "         Hydragen Engine Automated Setup"
+echo "      Hydragen Engine Automated Setup & Updater           "
 echo "=========================================================="
+
+# Check if this is an update run
+if [ "$1" = "--update" ] || [ "$1" = "-u" ]; then
+    echo "[+] Updating Hydragen from git repository..."
+    if [ -d ".git" ]; then
+        git pull || true
+    fi
+fi
 
 # 1. Check Python
 PYTHON_CMD=""
@@ -109,11 +117,16 @@ if [ ! -f "$CONFIG_FILE" ]; then
 EOF
 fi
 
+chmod +x "$SCRIPT_DIR/run.sh" 2>/dev/null || true
+
 echo ""
 echo "=========================================================="
 echo "         Hydragen Setup Complete!"
 echo "=========================================================="
 echo "To start the server:"
-echo "  1. (If not activated) source .venv/bin/activate"
-echo "  2. hydragen --config hydragen.json --port 8080 --api-monitor"
+echo "  ./run.sh"
+echo "  (or: hydragen --config hydragen.json --port 8080 --api-monitor)"
+echo ""
+echo "To update in the future:"
+echo "  ./setup.sh --update"
 echo "=========================================================="

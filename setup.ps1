@@ -7,8 +7,16 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
 Write-Host "==========================================================" -ForegroundColor Cyan
-Write-Host "         Hydragen Engine Automated Setup (PowerShell)    " -ForegroundColor Cyan
+Write-Host "   Hydragen Engine Automated Setup & Updater (PowerShell) " -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
+
+# Check if update requested
+if ($args -contains "--update" -or $args -contains "-u") {
+    Write-Host "[+] Updating Hydragen from git repository..." -ForegroundColor Yellow
+    if (Test-Path ".git") {
+        & git pull
+    }
+}
 
 # 1. Check Python
 $pyCmd = Get-Command python -ErrorAction SilentlyContinue
@@ -115,6 +123,9 @@ Write-Host "==========================================================" -Foregro
 Write-Host "         Hydragen Windows Setup Complete!                 " -ForegroundColor Green
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host "To start the server:"
-Write-Host "  1. .venv\Scripts\Activate.ps1"
-Write-Host "  2. hydragen --config hydragen.json --port 8080 --api-monitor"
+Write-Host "  .\run.ps1"
+Write-Host "  (or: hydragen --config hydragen.json --port 8080 --api-monitor)"
+Write-Host ""
+Write-Host "To update in the future:"
+Write-Host "  .\setup.ps1 -u"
 Write-Host "==========================================================" -ForegroundColor Cyan
