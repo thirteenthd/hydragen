@@ -8,6 +8,10 @@ if exist ".venv\Scripts\activate.bat" (
     call ".venv\Scripts\activate.bat"
 )
 
+if exist "%~dp0bin" (
+    set "PATH=%~dp0bin;%PATH%"
+)
+
 set "CONFIG_FILE=hydragen.json"
 if not exist "%CONFIG_FILE%" (
     if exist "strata-iq3_xxs.json" set "CONFIG_FILE=strata-iq3_xxs.json"
