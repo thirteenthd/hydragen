@@ -17,9 +17,9 @@ import re
 from typing import Any, Dict, List, Optional
 import torch
 
-from strata_vllm.expert_manager import PagedExpertManager
-from strata_vllm.gguf_loader import StrataGGUFMoELoader, register_strata_gguf_types
-from strata_vllm.triton_moe import triton_paged_moe_forward
+from hydragen.expert_manager import PagedExpertManager
+from hydragen.gguf_loader import StrataGGUFMoELoader, register_strata_gguf_types
+from hydragen.triton_moe import triton_paged_moe_forward
 
 
 _SHARED_EXPERT_MANAGERS: Dict[str, PagedExpertManager] = {}
