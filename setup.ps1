@@ -6,6 +6,13 @@ $ProgressPreference = "SilentlyContinue"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
+# Clean up any legacy or unpacked Strata installer CLI (setup.py) so setuptools
+# builds strictly from pyproject.toml without mistaking it for a package setup script.
+$straySetupPy = Join-Path $scriptDir "setup.py"
+if (Test-Path $straySetupPy) {
+    Remove-Item $straySetupPy -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host "   Hydragen Engine Automated Setup & Updater (PowerShell) " -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
@@ -48,7 +55,6 @@ foreach ($c in $candidates) {
 }
 
 if (-not $pyCmd) {
-    # If not found yet, check generic python command
     $genCheck = Get-Command python -ErrorAction SilentlyContinue
     if ($genCheck) {
         $pyCmd = "python"
@@ -90,7 +96,7 @@ if (Test-Path $activateScript) {
     try {
         & $activateScript
     } catch {
-        # Restricted execution policy won't block python/pip execution directly
+        # Execution policy won't block python/pip execution directly
     }
 }
 Write-Host "[+] Virtual environment ready: $venvDir" -ForegroundColor Green
@@ -114,12 +120,7 @@ if (-not $cudaAvailable) {
     Write-Host "[+] PyTorch with CUDA is already installed." -ForegroundColor Green
 }
 
-# 5. Install Hydragen package in editable mode
-Write-Host "[+] Installing Hydragen and dependencies..." -ForegroundColor Yellow
-& $venvPy -m pip install --upgrade pip
-& $venvPy -m pip install -e .
-
-# 6. Ensure bin directory & precompiled worker binary
+# 5. Ensure bin directory & precompiled worker binary
 $binDir = Join-Path $scriptDir "bin"
 if (-not (Test-Path $binDir)) {
     New-Item -ItemType Directory -Path $binDir | Out-Null
@@ -157,7 +158,7 @@ if (-not (Test-Path $strataExe)) {
     }
 }
 
-# 7. Ensure strata_control, tools, and data modules are available
+# 6. Ensure strata_control, tools, and data modules are available
 $ctrlDir = Join-Path $scriptDir "strata_control"
 if (-not (Test-Path $ctrlDir)) {
     Write-Host "[+] Downloading Strata control & data modules (v0.2.9 / 0.1.55)..." -ForegroundColor Yellow
@@ -175,6 +176,20 @@ if (-not (Test-Path $ctrlDir)) {
     } catch {
         Write-Warning "[!] Control modules auto-download failed: $_"
     }
+}
+
+# Clean up any unpacked Strata installer CLI (setup.py) so setuptools does not mistake it for a package config
+if (Test-Path $straySetupPy) {
+    Remove-Item $straySetupPy -Force -ErrorAction SilentlyContinue
+}
+
+# 7. Install Hydragen package in editable mode
+Write-Host "[+] Installing Hydragen and dependencies..." -ForegroundColor Yellow
+& $venvPy -m pip install --upgrade pip
+& $venvPy -m pip install -e .
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "[-] Failed to install Hydragen package. Please review the pip output above."
+    exit $LASTEXITCODE
 }
 
 # 8. Model Storage Configuration

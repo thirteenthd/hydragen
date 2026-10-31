@@ -7,6 +7,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Clean up any legacy or unpacked Strata installer CLI (setup.py) so setuptools
+# builds strictly from pyproject.toml without mistaking it for a package setup script.
+rm -f "$SCRIPT_DIR/setup.py"
+
 echo "=========================================================="
 echo "      Hydragen Engine Automated Setup & Updater           "
 echo "=========================================================="
@@ -140,6 +144,7 @@ if [ ! -d "$SCRIPT_DIR/strata_control" ] || [ ! -d "$SCRIPT_DIR/data" ]; then
     if curl -sL --fail "$CTRL_URL" -o "$BIN_DIR/control.tar.gz"; then
         tar -xzf "$BIN_DIR/control.tar.gz" -C "$SCRIPT_DIR" strata_control tools data 2>/dev/null || tar -xzf "$BIN_DIR/control.tar.gz" -C "$SCRIPT_DIR"
         rm -f "$BIN_DIR/control.tar.gz"
+        rm -f "$SCRIPT_DIR/setup.py"
         echo "[+] Successfully unpacked strata_control, tools, and data into $SCRIPT_DIR"
     else
         echo "[!] Control modules auto-download failed."

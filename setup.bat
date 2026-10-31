@@ -8,6 +8,8 @@ REM ============================================================================
 set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
 
+if exist "%SCRIPT_DIR%setup.py" del /f /q "%SCRIPT_DIR%setup.py"
+
 echo ==========================================================
 echo      Hydragen Engine Automated Setup ^& Updater (Windows)
 echo ==========================================================
@@ -58,18 +60,13 @@ if not defined VIRTUAL_ENV (
 )
 
 REM 4. Check & Install PyTorch with CUDA (if not already installed)
-python -c "import torch; print(torch.cuda.is_available())" 2>nul | findstr /i "True" >nul
+python -c "import importlib.util as u; s = u.find_spec('torch'); m = __import__('torch') if s else None; print(bool(m and m.cuda.is_available()))" 2>nul | findstr /i "True" >nul
 if errorlevel 1 (
     echo [+] Installing PyTorch with CUDA 12.4 support...
-    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+    pip install torch --index-url https://download.pytorch.org/whl/cu124
 )
 
-REM 5. Install Hydragen package in editable mode
-echo [+] Installing Hydragen and dependencies...
-python -m pip install --upgrade pip
-python -m pip install -e .
-
-REM 6. Ensure bin directory & precompiled worker binary
+REM 5. Ensure bin directory & precompiled worker binary
 if not exist "%SCRIPT_DIR%bin" mkdir "%SCRIPT_DIR%bin"
 set "STRATA_EXE=%SCRIPT_DIR%bin\strata.exe"
 if not exist "%STRATA_EXE%" (
@@ -82,11 +79,17 @@ if not exist "%STRATA_EXE%" (
     )
 )
 
-REM 7. Ensure strata_control and tools modules are available
+REM 6. Ensure strata_control and tools modules are available
 if not exist "%SCRIPT_DIR%strata_control" (
     echo [+] Downloading Strata control modules (v0.2.9 / 0.1.55)...
     powershell -Command "try { Invoke-WebRequest -Uri 'https://github.com/Niko1221/Strata/releases/download/v0.2.9/strata-control-0.1.55-windows-x86_64.zip' -OutFile '%SCRIPT_DIR%bin\control.zip' -UseBasicParsing; Expand-Archive -Path '%SCRIPT_DIR%bin\control.zip' -DestinationPath '%SCRIPT_DIR%' -Force; Remove-Item '%SCRIPT_DIR%bin\control.zip' -Force; Write-Host '[+] Extracted strata_control and tools' -ForegroundColor Green } catch { Write-Warning 'Control modules download failed' }"
 )
+if exist "%SCRIPT_DIR%setup.py" del /f /q "%SCRIPT_DIR%setup.py"
+
+REM 7. Install Hydragen package in editable mode
+echo [+] Installing Hydragen and dependencies...
+python -m pip install --upgrade pip
+python -m pip install -e .
 
 REM 8. Generate default config if missing
 set "CONFIG_FILE=%SCRIPT_DIR%hydragen.json"
