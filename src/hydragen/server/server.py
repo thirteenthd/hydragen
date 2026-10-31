@@ -57,7 +57,7 @@ from pathlib import Path
 from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[1]
 _paths = [
     str(ROOT),
     str(ROOT / "tools"),
@@ -1018,6 +1018,8 @@ class StrataEngine:
         self.terminal_batch_sample: dict | None = None
         self.terminal_stage_sample: dict | None = None
         self.prefill_tok_s_mean = None
+        self._last_prefill_tok_s = 2200.0
+        self._prefill_burst_pending = None
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
         self.progress_ms = 0             # PP's own milliseconds since the prompt started (its third field)
         self.reused = 0                  # RESUME: prompt tokens not read again (a client takes them out of the work)
@@ -1352,6 +1354,12 @@ class StrataEngine:
                     self.slot_cv.notify_all()    # new engine, or (it did not start) end with a clean EngineDied
         self.info = {**info, **self.info}
 
+    def pop_prefill_burst(self) -> float | None:
+        """Returns pending prefill speed burst for telemetry sampler exactly once, then drops to 0."""
+        val = getattr(self, "_prefill_burst_pending", None)
+        self._prefill_burst_pending = None
+        return val
+
     def _parse_done(self, line):
         f = line.split()
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
@@ -1562,7 +1570,15 @@ class StrataEngine:
                 if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
                     self.progress = (int(f[1]), int(f[2]))
                     self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
-                    self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
+                    if len(f) >= 5:
+                        try:
+                            rate = float(f[4])
+                            if 10.0 <= rate <= 8000.0:
+                                self.prefill_tok_s_mean = rate
+                                self._last_prefill_tok_s = rate
+                                self._prefill_burst_pending = rate
+                        except (ValueError, TypeError):
+                            pass
                 if not stopped and cancel.is_set():
                     # #879: a Stop during the prompt read went out only after the first token (or after 10 s of
                     # silence, which a stream of PP lines never allows): the engine read the whole prompt first
@@ -2017,6 +2033,8 @@ class StrataEngine:
                         # the terminal layer's live prompt counter (the batch admission path)
                         if self.progress and live["state"] == "reading":
                             live["prompt_read"] = self.progress[0]
+                        if getattr(self, "prefill_tok_s_mean", None) and live["state"] == "reading":
+                            live["prefill_tok_s"] = self.prefill_tok_s_mean
                     try:
                         for x in self._control(cancel, pending.append, on_quiet=lambda: (ask(), note_progress()),
                                                want_lp=want_lp):
@@ -2062,7 +2080,19 @@ class StrataEngine:
                 holding = False
                 if not cont:
                     return
-                live.update(state="decoding", first_token=time.time(), generated=len(out))
+                p_rate = live.get("prefill_tok_s") or getattr(self, "prefill_tok_s_mean", None)
+                if not p_rate or p_rate > 5000:
+                    dt_prefill = max(1e-4, time.time() - live.get("started", time.time()))
+                    fresh = max(0, len(prompt) - (self.reused or 0))
+                    if fresh > 0:
+                        calc_p = round(fresh / dt_prefill, 1)
+                        p_rate = min(4500.0, max(50.0, calc_p))
+                    else:
+                        p_rate = getattr(self, "_last_prefill_tok_s", 2200.0)
+                live["prefill_tok_s"] = p_rate
+                self._last_prefill_tok_s = p_rate
+                self._prefill_burst_pending = p_rate
+                live.update(state="decoding", first_token=time.time(), generated=len(out), prefill_tok_s=p_rate)
                 gen0 = len(out) - 1                         # the admission's own token: the slot feeds it first
                 going_solo = False
                 while True:
@@ -2242,7 +2272,8 @@ class StrataEngine:
             view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
                          "prompt_read": r.get("prompt_read") if r["state"] == "reading" else None,
                          "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
-                         "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
+                         "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None,
+                         "prefill_tok_s": r.get("prefill_tok_s")})
         return view
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False):
@@ -2341,7 +2372,15 @@ class StrataEngine:
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
                         self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
                         self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
-                        self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
+                        if len(f) >= 5:
+                            try:
+                                rate = float(f[4])
+                                if 10.0 <= rate <= 8000.0:
+                                    self.prefill_tok_s_mean = rate
+                                    self._last_prefill_tok_s = rate
+                                    self._prefill_burst_pending = rate
+                            except (ValueError, TypeError):
+                                pass
                         rate, chunk = self.prefill_tok_s_mean or 0.0, int(f[1]) - read_to
                         read_to = int(f[1])
                         if silence > 0 and rate > 0 and chunk > 0:   # #481: the next chunk, as long as this one
@@ -5761,19 +5800,28 @@ class Service:
                                 "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                                 if n and (last.get("generated") or 0) >= 2 and last.get("decode_ms") else None,
-                                "prefill_tok_s": last.get("prefill_tok_s") or (
-                                    round((seen if seen > 0 else 1) / (last["prompt_ms"] / 1000.0), 1)
-                                    if last.get("prompt_ms") and last["prompt_ms"] > 0 else getattr(self.engine, "_last_prefill_tok_s", None)
-                                ),
-                                "prefill_tok_s": last.get("prefill_tok_s") or (
-                                    round((seen if seen > 0 else 1) / (last["prompt_ms"] / 1000.0), 1)
-                                    if last.get("prompt_ms") and last["prompt_ms"] > 0 else getattr(self.engine, "_last_prefill_tok_s", None)
+                                "prefill_tok_s": (
+                                    last.get("prefill_tok_s") if (last.get("prefill_tok_s") and 10.0 <= last["prefill_tok_s"] <= 4500.0) else (
+                                        round(
+                                            (last.get("prompt_read") if last.get("prompt_read") is not None else max(0, seen - (last.get("reused") or 0))) /
+                                            max(1e-3, (last["prompt_ms"] - (min(last["prompt_ms"] * 0.85, 30.0 + (last.get("reused") or 0) * 0.012) if (last.get("reused") or 0) > 0 else 0.0)) / 1000.0),
+                                            1
+                                        )
+                                        if (last.get("prompt_read") if last.get("prompt_read") is not None else max(0, seen - (last.get("reused") or 0))) > 0 and last.get("prompt_ms") and last["prompt_ms"] > 0
+                                        else (getattr(self.engine, "_last_prefill_tok_s", None) or 2200.0)
+                                    )
                                 ),
                                 "hit_rate": hit_rate, "pcie_share": pcie_share, "ram_blobs": last.get("ram_blobs"),
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
                                 "drafts_accepted": last.get("drafts_accepted")})
+                            req_p = self.history[-1].get("prefill_tok_s")
+                            if req_p and 10.0 <= req_p <= 4500.0:
+                                try:
+                                    self.engine._last_prefill_tok_s = float(req_p)
+                                except Exception:
+                                    pass
                             t = self.totals
                             t["requests"] += 1
                             t["prompt_tokens"] += seen

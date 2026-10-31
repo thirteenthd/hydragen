@@ -437,6 +437,8 @@ class VLLMEngine:
                     pread = r.get("prompt_read") or 0
                     prefill_s = ft - started if ft else (now - started)
                     p_tok_s = round(pread / max(1e-4, prefill_s), 1) if pread and prefill_s > 0 else None
+                    if p_tok_s and p_tok_s > 4500:
+                        p_tok_s = min(4500.0, p_tok_s)
                     view.append(
                         {
                             "slot": b,
@@ -678,7 +680,7 @@ class VLLMEngine:
                         measured_prefill = round(prompt_read / max(1e-4, dt_fresh), 1)
                     else:
                         measured_prefill = round(float(self._last_prefill_tok_s), 1)
-                    if 10.0 <= measured_prefill <= 100000.0:
+                    if 10.0 <= measured_prefill <= 4500.0:
                         self._last_prefill_tok_s = measured_prefill
                         self._prefill_burst_pending = measured_prefill
 
@@ -768,7 +770,7 @@ class VLLMEngine:
                     restore_ms = actual_reused * 0.010 if actual_reused > 0 else 0.0
                     dt_fresh_s = max(fresh_toks / 1800.0, (p_ms - restore_ms) / 1000.0)
                     measured_rate = round(fresh_toks / max(1e-4, dt_fresh_s), 1)
-                    if 10.0 <= measured_rate <= 100000.0:
+                    if 10.0 <= measured_rate <= 4500.0:
                         self._last_prefill_tok_s = measured_rate
             if self.backend is not None:
                 try:

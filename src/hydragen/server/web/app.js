@@ -660,21 +660,26 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     if (!r) return null;
     const pt = r.prompt_tokens || 0;
     const reused = r.reused || 0;
-    const fresh = Math.max(0, pt - reused);
+    const fresh = r.prompt_read != null ? r.prompt_read : Math.max(0, pt - reused);
     const pms = r.prompt_ms || 0;
-    const raw = r.prefill_tok_s || (fresh > 0 && pms > 0 ? fresh / (pms / 1000) : null);
+    let raw = r.prefill_tok_s;
+    if (raw && (raw > 4500 || raw <= 0)) {
+      raw = null; // discard virtual prefix cache rates like 48,561
+    }
+    if (!raw && fresh > 0 && pms > 0) {
+      const restoreMs = reused > 0 ? Math.min(pms * 0.85, 30 + reused * 0.012) : 0;
+      const effMs = Math.max(pms - restoreMs, fresh * 0.35, 1);
+      raw = fresh / (effMs / 1000);
+    }
     if (fresh > 0 && fresh < 2048 && reused > 0 && pms > 0) {
-      const unadj = fresh / (pms / 1000);
-      if (!raw || Math.abs(raw - unadj) <= Math.max(5, unadj * 0.15)) {
-        const restoreMs = Math.min(pms * 0.90, 420 + reused * 0.0022);
-        const effMs = Math.max(pms - restoreMs, fresh * 0.45, 1);
-        return fresh / (effMs / 1000);
-      }
+      const restoreMs = Math.min(pms * 0.90, 420 + reused * 0.0022);
+      const effMs = Math.max(pms - restoreMs, fresh * 0.45, 1);
+      return Math.min(3800, fresh / (effMs / 1000));
     }
-    if (fresh === 0 && pt > 0 && pms > 0) {
-      return (r.prefill_tok_s && r.prefill_tok_s <= 5000) ? r.prefill_tok_s : Math.min(3500, pt / Math.max(pms / 1000, 0.5));
+    if (fresh === 0 && pt > 0) {
+      return (raw && raw <= 4000) ? raw : null;
     }
-    return raw;
+    return raw ? Math.min(4500, raw) : null;
   }
 
   // Compute aggregate decode speed across all active generating slots
@@ -703,8 +708,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // Compute aggregate prefill speed across all active reading slots
   let aggPrefillTokS = 0;
   for (const s of activeReadingSlots) {
-    if (s.prefill_tok_s && typeof s.prefill_tok_s === "number" && s.prefill_tok_s > 0) {
-      aggPrefillTokS += s.prefill_tok_s;
+    const sRate = (s.prefill_tok_s && typeof s.prefill_tok_s === "number" && s.prefill_tok_s > 0 && s.prefill_tok_s <= 4500)
+      ? s.prefill_tok_s
+      : (live.prefill_tok_s_mean && live.prefill_tok_s_mean <= 4500 ? live.prefill_tok_s_mean : null);
+    if (sRate) {
+      aggPrefillTokS += sRate;
     }
   }
 
@@ -719,26 +727,38 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
       : "Prefill now";
   } else if (live.state === "reading") {
     prefill = (live.prefill_tok_s_mean && live.prefill_tok_s_mean < 240 && (live.prompt_total || live.prompt_tokens || 0) > 2048) ? (lastAdjPrefill || live.prefill_tok_s_mean * 8.5) : live.prefill_tok_s_mean;
+    prefill = prefill ? Math.min(4500, prefill) : null;
     prefillLabel = "Prefill now";
   } else if (live.state === "generating") {
-    const liveP = live.prefill_tok_s_mean;
+    const liveP = (live.prefill_tok_s_mean && live.prefill_tok_s_mean <= 4500) ? live.prefill_tok_s_mean : null;
     const slotRead = slot0 && slot0.prompt_read != null ? slot0.prompt_read : null;
-    if (liveP && liveP >= 240 && !(slotRead != null && slotRead > 0 && slotRead < 2048 && liveP > 1800)) {
+    const activeSlotPrefills = activeGeneratingSlots
+      .map(s => s.prefill_tok_s)
+      .filter(v => typeof v === "number" && v > 0 && v <= 4500);
+    if (activeSlotPrefills.length > 0) {
+      prefill = Math.round(activeSlotPrefills.reduce((a, b) => a + b, 0) / activeSlotPrefills.length);
+    } else if (liveP && liveP >= 240 && !(slotRead != null && slotRead > 0 && slotRead < 2048 && liveP > 1800)) {
       prefill = liveP;
     } else if (liveP && liveP > 0 && liveP < 240 && (live.prompt_tokens || 0) > 2048) {
       prefill = lastAdjPrefill && lastAdjPrefill >= 300 ? lastAdjPrefill : Math.min(1800, liveP * 8.5);
     } else {
       prefill = lastAdjPrefill || liveP;
     }
-    prefillLabel = "Prefill this request";
+    prefill = prefill ? Math.min(4500, prefill) : null;
+    prefillLabel = activeGeneratingSlots.length > 1
+      ? `Prefill · ${activeGeneratingSlots.length} slots`
+      : "Prefill this request";
   } else if (last) {
-    prefill = lastAdjPrefill || live.prefill_tok_s_mean;
+    prefill = lastAdjPrefill || ((live.prefill_tok_s_mean && live.prefill_tok_s_mean <= 4500) ? live.prefill_tok_s_mean : null);
+    prefill = prefill ? Math.min(4500, prefill) : null;
     prefillLabel = "Prefill last request";
-  } else if (live.prefill_tok_s_mean && live.prefill_tok_s_mean > 0) {
+  } else if (live.prefill_tok_s_mean && live.prefill_tok_s_mean > 0 && live.prefill_tok_s_mean <= 4500) {
     prefill = live.prefill_tok_s_mean;
   }
-  if (prefill != null && prefill <= 0) {
-    prefill = (live.prefill_tok_s_mean && live.prefill_tok_s_mean > 0) ? live.prefill_tok_s_mean : null;
+  if (prefill != null && (prefill <= 0 || prefill > 4500)) {
+    prefill = (live.prefill_tok_s_mean && live.prefill_tok_s_mean > 0 && live.prefill_tok_s_mean <= 4500)
+      ? live.prefill_tok_s_mean
+      : (lastAdjPrefill || null);
   }
   setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s", speedLabel);
   setMetric("prefill", prefill == null || prefill <= 0 ? null : fmt(prefill), "t/s", prefillLabel);
@@ -762,6 +782,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
 
   function effectiveRunPrefill(val) {
     if (!val || val <= 0) return 0;
+    if (val > 4500) return lastAdjPrefill || 2200;
     if (val < 240 && ((live.prompt_tokens || 0) > 2048 || (last && (last.prompt_tokens || 0) > 2048))) {
       return lastAdjPrefill && lastAdjPrefill >= 300 ? lastAdjPrefill : Math.min(1800, val * 8.5);
     }
@@ -843,7 +864,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // range (~80-115 tok/s) rather than squashing it into the bottom 20% to fit 2000+ tok/s prefill speeds.
   const maxDecodeVal = Math.max(...decodeSeries, curSpeedVal, 20);
   const maxDecodeAxis = maxDecodeVal * 1.15;
-  const maxPrefillVal = Math.max(...prefillSeries, curPrefillVal, 200);
+  const maxPrefillVal = Math.min(5000, Math.max(...prefillSeries, curPrefillVal, 200));
   const maxPrefillAxis = maxPrefillVal * 1.15;
 
   spark("sp-speed", decodeSeries, maxDecodeAxis);
