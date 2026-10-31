@@ -60,8 +60,21 @@ echo [+] Installing Hydragen and dependencies...
 python -m pip install --upgrade pip
 python -m pip install -e .
 
-REM 6. Ensure bin directory exists
+REM 6. Ensure bin directory & precompiled worker binary
 if not exist "%SCRIPT_DIR%bin" mkdir "%SCRIPT_DIR%bin"
+set "STRATA_EXE=%SCRIPT_DIR%bin\strata.exe"
+if not exist "%STRATA_EXE%" (
+    if defined STRATA_DIR if exist "%STRATA_DIR%\engine\strata.exe" (
+        echo [+] Copying Strata binary from STRATA_DIR...
+        copy /Y "%STRATA_DIR%\engine\strata.exe" "%STRATA_EXE%" >nul
+    ) else if exist "..\Strata\engine\strata.exe" (
+        echo [+] Copying local Strata binary...
+        copy /Y "..\Strata\engine\strata.exe" "%STRATA_EXE%" >nul
+    ) else (
+        echo [+] Downloading precompiled Strata worker binary (Windows x64)...
+        powershell -Command "try { Invoke-WebRequest -Uri 'https://github.com/Niko1221/Strata/releases/download/v0.34.0/strata-windows-x64.zip' -OutFile '%SCRIPT_DIR%bin\strata.zip' -UseBasicParsing; Expand-Archive -Path '%SCRIPT_DIR%bin\strata.zip' -DestinationPath '%SCRIPT_DIR%bin' -Force; Remove-Item '%SCRIPT_DIR%bin\strata.zip' -Force } catch { Write-Warning 'Auto-download failed; please copy strata.exe into bin\' }"
+    )
+)
 
 REM 7. Generate default config if missing
 set "CONFIG_FILE=%SCRIPT_DIR%hydragen.json"

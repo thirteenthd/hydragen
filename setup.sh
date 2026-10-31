@@ -58,7 +58,7 @@ echo "[+] Installing Hydragen and dependencies..."
 python -m pip install --upgrade pip
 python -m pip install -e .
 
-# 5. Check for Worker Binary
+# 5. Check & Fetch Precompiled Worker Binary
 BIN_DIR="$SCRIPT_DIR/bin"
 mkdir -p "$BIN_DIR"
 if [ ! -f "$BIN_DIR/strata" ]; then
@@ -68,6 +68,16 @@ if [ ! -f "$BIN_DIR/strata" ]; then
     elif [ -f "../Strata/engine/strata" ]; then
         echo "[+] Linking local Strata worker binary..."
         ln -sf "$(cd ../Strata && pwd)/engine/strata" "$BIN_DIR/strata"
+    else
+        echo "[+] Downloading precompiled Strata worker binary (Linux x86_64)..."
+        STRATA_DL_URL="https://github.com/Niko1221/Strata/releases/download/v0.34.0/strata-linux-x64.tar.gz"
+        if curl -sL --fail "$STRATA_DL_URL" -o "$BIN_DIR/strata.tar.gz"; then
+            tar -xzf "$BIN_DIR/strata.tar.gz" -C "$BIN_DIR"
+            rm -f "$BIN_DIR/strata.tar.gz"
+        else
+            echo "[!] Auto-download failed. You can copy your compiled 'strata' binary into $BIN_DIR/strata."
+        fi
+        chmod +x "$BIN_DIR/strata" 2>/dev/null || true
     fi
 fi
 
