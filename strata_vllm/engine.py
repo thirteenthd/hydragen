@@ -91,9 +91,9 @@ class VLLMEngine:
             )
             self.max_context = getattr(self.backend, "max_context", max_context)
             self.batch = int(getattr(self.backend, "batch", self.batch) or self.batch)
-            # Ensure at least 850 MiB of VRAM headroom for Triton Fused MoE + PagedExpertManager
+            # Ensure at least 960 MiB of VRAM headroom for Triton Fused MoE + PagedExpertManager + CUDA graphs
             try:
-                self.backend.vram(reserve_mib=850, timeout=30.0)
+                self.backend.vram(reserve_mib=960, timeout=30.0)
             except Exception:
                 pass
         else:
@@ -211,6 +211,7 @@ class VLLMEngine:
         `PagedExpertManager` (async PCIe DMA + `libstrata_iq_kernels.so` dequant) ->
         Triton `fused_moe_indexed_slot_kernel`.
         """
+        torch.cuda.set_device(self.device)
         with self.triton_lock, torch.cuda.stream(self.triton_stream):
             t0 = time.perf_counter()
             if layer_idx not in self.router_gates:
@@ -546,6 +547,7 @@ class VLLMEngine:
         embeddings: Optional[Any] = None,
     ) -> Iterator[int]:
         """Generate tokens through the hybrid vLLM PagedMoE + Triton pipeline."""
+        torch.cuda.set_device(self.device)
         prompt_len = len(ids)
         reused_tokens = self._match_prefix_cache(ids)
         prompt_read = max(0, prompt_len - reused_tokens)

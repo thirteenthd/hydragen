@@ -182,17 +182,28 @@ def test_vllm_engine_live_triton_step():
         standalone_triton_only=True,
     )
     cancel = threading.Event()
-    toks1 = list(eng.generate([1, 2, 3, 4, 5], max_new=4, sampling={}, cancel=cancel))
-    toks2 = list(eng.generate([1, 2, 3, 4, 5], max_new=4, sampling={}, cancel=cancel))
-    assert len(toks1) == 4 and len(toks2) == 4
-    assert eng.last.get("triton_moe_ms", 0) > 0
-    assert eng.last.get("triton_hit_rate", 0) > 0
-    assert eng.last.get("triton_pcie_mb", 0) > 0
+    last_stats = {}
+
+    # Stress-test 12 consecutive agent turns across worker threads to verify LRU eviction & thread/stream safety
+    def _worker_turn(turn_idx: int):
+        prompt = [10 + turn_idx * 7 + i for i in range(8)]
+        out = list(eng.generate(prompt, max_new=64, sampling={}, cancel=cancel))
+        assert len(out) == 8
+        assert eng.last.get("triton_moe_ms", 0) > 0
+        assert eng.last.get("triton_hit_rate", 0) > 0
+        assert eng.last.get("triton_pcie_mb", 0) > 0
+        last_stats.update(eng.last)
+
+    for t_idx in range(12):
+        th = threading.Thread(target=_worker_turn, args=(t_idx,))
+        th.start()
+        th.join()
+
     print(
-        f"[PASS] VLLMEngine.generate() executed Compressed GGUF MoE: "
-        f"triton_moe_ms={eng.last['triton_moe_ms']} ms, "
-        f"triton_hit_rate={eng.last['triton_hit_rate']*100:.1f}%, "
-        f"triton_pcie_mb={eng.last['triton_pcie_mb']} MB"
+        f"[PASS] VLLMEngine.generate() 12-turn multi-thread stress test passed: "
+        f"triton_moe_ms={last_stats['triton_moe_ms']} ms, "
+        f"triton_hit_rate={last_stats['triton_hit_rate']*100:.1f}%, "
+        f"triton_pcie_mb={last_stats['triton_pcie_mb']} MB"
     )
 
 

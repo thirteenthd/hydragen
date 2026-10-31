@@ -263,6 +263,12 @@ class StrataCUDAKernelBridge:
             return int(self._expert_scratch_bytes(int(cap_entries), int(n_ff)))
         return int(cap_entries) * (int(n_ff) * 8 + 4096)
 
+    @staticmethod
+    def _resolve_stream_ptr(cuda_stream: Any = None) -> int:
+        if cuda_stream is not None:
+            return int(cuda_stream.cuda_stream)
+        return int(torch.cuda.current_stream().cuda_stream)
+
     def native_expert_grouped_forward(
         self,
         gu_type: int,
@@ -286,7 +292,7 @@ class StrataCUDAKernelBridge:
         """Execute Strata's native INT8 grouped MoE directly on compressed GGUF VRAM blobs."""
         if self._native_expert_grouped is None:
             raise RuntimeError("strata_vllm_native_expert_grouped symbol not loaded in libstrata_iq_kernels.so")
-        stream_val = cuda_stream.cuda_stream if cuda_stream is not None else None
+        stream_val = self._resolve_stream_ptr(cuda_stream)
         self._native_expert_grouped(
             int(gu_type),
             int(d_type),
@@ -319,7 +325,7 @@ class StrataCUDAKernelBridge:
         cuda_stream: Any = None,
     ) -> None:
         """Weighted reduction over top-k expert outputs on GPU."""
-        stream_val = cuda_stream.cuda_stream if cuda_stream is not None else 0
+        stream_val = self._resolve_stream_ptr(cuda_stream)
         if self._moe_combine_multi is not None and stream_val != 0 and 1 <= top_k <= 15:
             self._moe_combine_multi(
                 ctypes.c_void_p(parts.data_ptr()),
@@ -363,7 +369,7 @@ class StrataCUDAKernelBridge:
         cuda_stream: Any = None,
     ) -> None:
         """Universal row-based GPU dequantization into FP16 (handles IQ*, Q2_0_STRATA=42, Q*_K)."""
-        stream_val = cuda_stream.cuda_stream if cuda_stream is not None else None
+        stream_val = self._resolve_stream_ptr(cuda_stream)
         if self._dequant_f16_rows is not None:
             self._dequant_f16_rows(
                 int(ggml_type),
@@ -390,7 +396,7 @@ class StrataCUDAKernelBridge:
         cols: int = 256,
     ) -> None:
         """Dequantize contiguous blocks directly into destination FP16 tensor."""
-        stream_val = cuda_stream.cuda_stream if cuda_stream is not None else None
+        stream_val = self._resolve_stream_ptr(cuda_stream)
         # Use universal dequant_f16_rows when type is Q2_0_STRATA (42) or K-quant
         if ggml_type in (2, 6, 7, 8, 11, 12, 13, 14, 20, 23, 42) and self._dequant_f16_rows is not None:
             rows = max(1, num_elements // cols)
@@ -434,7 +440,7 @@ class StrataCUDAKernelBridge:
         n_tok = logits.shape[0]
         ids = torch.empty((n_tok, 10), dtype=torch.int32, device=logits.device)
         weights = torch.empty((n_tok, 10), dtype=torch.float32, device=logits.device)
-        stream_val = cuda_stream.cuda_stream if cuda_stream is not None else None
+        stream_val = self._resolve_stream_ptr(cuda_stream)
         if self._route_prior_top10 is not None and logits.shape[1] == 512:
             self._route_prior_top10(
                 ctypes.c_void_p(logits.data_ptr()),
