@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "strata-vllm"
+version = "0.34.0"
+description = "Modular Hybrid vLLM + Triton Paged MoE Engine for Strata GGUF Models on 12 GB GPUs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Derek Chung", email = "derekchung-800house@users.noreply.github.com"}
+]
+dependencies = [
+    "numpy",
+    "gguf",
+    "torch",
+    "triton",
+]
+
+[project.scripts]
+strata-vllm = "strata_vllm.cli:main"
+
+[project.entry-points."vllm.general_plugins"]
+strata_gguf = "strata_vllm.vllm_plugin:register_strata_vllm_plugin"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["strata_vllm*"]

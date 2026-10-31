@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Launch Strata with vLLM PagedMoE Backend
+# Launch Strata with Hybrid vLLM + Triton PagedMoE Backend
 # ============================================================================
-PYTHON_BIN="$(which python3 || which python)"
+if [ -x "/home/thirteenthd/vllm-env/bin/python" ]; then
+    PYTHON_BIN="/home/thirteenthd/vllm-env/bin/python"
+else
+    PYTHON_BIN="$(which python3 || which python)"
+fi
+
+if [ -d "/home/thirteenthd/cuda-toolkit" ]; then
+    export CUDA_HOME="/home/thirteenthd/cuda-toolkit"
+    export PATH="/home/thirteenthd/cuda-toolkit/bin:$PATH"
+    export LD_LIBRARY_PATH="/home/thirteenthd/cuda-toolkit/lib64:/usr/local/cuda-13.1/lib64:${LD_LIBRARY_PATH}"
+fi
 
 CONFIG_FILE="strata-iq3_xxs.json"
 if [ ! -f "$CONFIG_FILE" ]; then

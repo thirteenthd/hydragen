@@ -23,7 +23,7 @@
     "int8",
     "--vision",
     "--vram-reserve-mib",
-    "600",
+    "900",
     "--pcie-frac",
     "0.20",
     "--spec-min-p",
