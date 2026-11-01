@@ -97,6 +97,32 @@ def get_hardware_info() -> dict:
                 hw["cpu_name"] = res_cpu.stdout.strip().splitlines()[0]
         except Exception:
             pass
+    else:
+        # Query System RAM & CPU on Linux
+        try:
+            with open("/proc/meminfo", "r") as f:
+                meminfo = {}
+                for line in f:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        meminfo[parts[0].strip()] = parts[1].strip()
+                if "MemTotal" in meminfo:
+                    kb = int(meminfo["MemTotal"].split()[0])
+                    hw["ram_total_gib"] = round(kb / (1024 * 1024), 1)
+                if "MemAvailable" in meminfo:
+                    kb = int(meminfo["MemAvailable"].split()[0])
+                    hw["ram_free_gib"] = round(kb / (1024 * 1024), 1)
+        except Exception:
+            pass
+
+        try:
+            with open("/proc/cpuinfo", "r") as f:
+                for line in f:
+                    if line.startswith("model name"):
+                        hw["cpu_name"] = line.split(":", 1)[1].strip()
+                        break
+        except Exception:
+            pass
 
     return hw
 
