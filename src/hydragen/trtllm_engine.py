@@ -194,8 +194,15 @@ class TRTLLMEngine:
             except Exception:
                 pass
 
-        # 3. Virtual Paged KV Block Manager
-        self.kv_manager = TRTPagedBlockManager(block_size=16, max_blocks=4096)
+        # 3. Virtual Paged KV Block Manager (Native C++ libpaged_kv.so with fallback)
+        try:
+            from hydragen.paged_kv import PagedKVManager
+            self.kv_manager = PagedKVManager(block_size=16, num_blocks=4096)
+            is_native = getattr(self.kv_manager, "_handle", None) is not None
+            print(f"[hydragen:trtllm] Initialized PagedKVManager (Native C++ backend: {is_native})")
+        except Exception as e:
+            print(f"[hydragen:trtllm] PagedKVManager init note: {e}")
+            self.kv_manager = TRTPagedBlockManager(block_size=16, max_blocks=4096)
 
         # 4. Expert Manager & Locality
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")

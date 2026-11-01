@@ -65,14 +65,25 @@ __global__ void paged_attention_decode_kernel(
 
             float dot = q_val * k_val;
 
-            // Warp reduce dot product across HEAD_DIM
+            // Warp reduce dot product
             #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
                 dot += __shfl_down_sync(0xffffffff, dot, offset);
             }
 
-            if (lane == 0) {
-                s_logits[t] = dot;
+            int warp_id = tid / 32;
+            int lane_id = tid % 32;
+            if (lane_id == 0) {
+                s_warp_reduce[warp_id] = dot;
+            }
+            __syncthreads();
+
+            if (tid == 0) {
+                float total_dot = 0.0f;
+                for (int w = 0; w < (HEAD_DIM / 32); ++w) {
+                    total_dot += s_warp_reduce[w];
+                }
+                s_logits[t] = total_dot;
             }
             __syncthreads();
 
