@@ -1209,8 +1209,59 @@ class StrataEngine:
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
         self.wlock = threading.Lock()                   # stdin writes from several request threads
-        self.pump = threading.Thread(target=self._pump, daemon=True)
-        self.pump.start()
+
+        # Bottleneck 5: Fast C++ Lock-Free SPSC IPC
+        self.fast_ipc = None
+        use_fast_ipc = os.environ.get("STRATA_FAST_IPC", "1") != "0"
+        if use_fast_ipc:
+            try:
+                from hydragen.fast_ipc import FastEngineIPC
+                if self.proc is not None and getattr(self.proc, "stdout", None) is not None:
+                    self.fast_ipc = FastEngineIPC(self.proc.stdout.fileno(), num_slots=max(1, self.batch))
+                    if self.fast_ipc.is_available:
+                        def _on_ctl(line_str: str):
+                            if line_str == "EOF":
+                                self.lines.put(None)
+                                for q in self.slot_q:
+                                    q.put(None)
+                                return
+                            if line_str.startswith(FATAL_PREFIXES):
+                                if self.proc is not None:
+                                    self.silent_note = "Unrecoverable native verification failure: " + line_str[4:].strip()
+                                    self.ended = True
+                                try:
+                                    self.proc.terminate()
+                                except OSError:
+                                    pass
+                                return
+                            if line_str.startswith("BSTAT"):
+                                sample = parse_batch_window_sample(line_str)
+                                if sample is not None:
+                                    self.terminal_batch_sample = {**sample, "observed_monotonic": time.monotonic()}
+                                return
+                            if line_str.startswith("PSTAT"):
+                                sample = parse_stage_in_flight_sample(line_str)
+                                if sample is not None:
+                                    self.terminal_stage_sample = {**sample, "observed_monotonic": time.monotonic()}
+                                return
+                            if line_str.startswith("BDONE ") and self.slot_q:
+                                try:
+                                    self.slot_q[int(line_str.split()[1])].put(line_str)
+                                except (IndexError, ValueError):
+                                    pass
+                            self.lines.put(line_str)
+
+                        self.fast_ipc.set_control_callback(_on_ctl)
+                        print(f"[strata] Fast C++ Lock-Free IPC active on fd {self.proc.stdout.fileno()} ({max(1, self.batch)} slots)", flush=True)
+            except Exception as e:
+                print(f"[strata] Fast IPC init note: {e}", flush=True)
+                self.fast_ipc = None
+
+        if self.fast_ipc is None or not self.fast_ipc.is_available:
+            self.pump = threading.Thread(target=self._pump, daemon=True)
+            self.pump.start()
+        else:
+            self.pump = None
 
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
@@ -2102,32 +2153,69 @@ class StrataEngine:
                 gen0 = len(out) - 1                         # the admission's own token: the slot feeds it first
                 going_solo = False
                 while True:
-                    try:
-                        line = self.slot_q[slot].get(timeout=10.0)
-                    except queue.Empty:
-                        if cancel.is_set() and not stop_sent:
-                            self._send(f"BSTOP {slot}")
-                            stop_sent = True
-                        yield None
-                        continue
-                    if line is None:
-                        phase = "none"
-                        raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
-                    if line.startswith("BT "):
-                        t = int(line.split()[2])
-                        out.append(t)
-                        live["generated"] = len(out)
-                        if cancel.is_set():
-                            if not stop_sent:
+                    if getattr(self, "fast_ipc", None) is not None and self.fast_ipc.is_available:
+                        try:
+                            t = self.fast_ipc.read_token(slot, timeout_ms=500)
+                        except StopIteration:
+                            line = None
+                            try:
+                                line = self.slot_q[slot].get(timeout=0.5)
+                            except queue.Empty:
+                                line = f"BDONE {slot} stop"
+                            t = None
+                        except Exception as e:
+                            phase = "none"
+                            raise EngineDied(f"the engine stopped unexpectedly: {e}")
+
+                        if t is not None:
+                            out.append(t)
+                            live["generated"] = len(out)
+                            if cancel.is_set():
+                                if not stop_sent:
+                                    self._send(f"BSTOP {slot}")
+                                    stop_sent = True
+                                continue
+                            yield t
+                            if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
+                                                                                      embeddings):
+                                self._send(f"BSTOP {slot}")         # alone now: on with the drafts (below)
+                                going_solo = True
+                            continue
+                        elif line is None:
+                            if cancel.is_set() and not stop_sent:
                                 self._send(f"BSTOP {slot}")
                                 stop_sent = True
+                            yield None
                             continue
-                        yield t
-                        if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
-                                                                                  embeddings):
-                            self._send(f"BSTOP {slot}")         # alone now: on with the drafts (below)
-                            going_solo = True
-                    elif line.startswith("BDONE "):
+                    else:
+                        try:
+                            line = self.slot_q[slot].get(timeout=10.0)
+                        except queue.Empty:
+                            if cancel.is_set() and not stop_sent:
+                                self._send(f"BSTOP {slot}")
+                                stop_sent = True
+                            yield None
+                            continue
+                        if line is None:
+                            phase = "none"
+                            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                        if line.startswith("BT "):
+                            t = int(line.split()[2])
+                            out.append(t)
+                            live["generated"] = len(out)
+                            if cancel.is_set():
+                                if not stop_sent:
+                                    self._send(f"BSTOP {slot}")
+                                    stop_sent = True
+                                continue
+                            yield t
+                            if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
+                                                                                      embeddings):
+                                self._send(f"BSTOP {slot}")         # alone now: on with the drafts (below)
+                                going_solo = True
+                            continue
+
+                    if line.startswith("BDONE "):
                         phase = "none"
                         f = line.split()
                         self._apply_bdone(f)
@@ -2619,6 +2707,12 @@ class StrataEngine:
             pass
         finally:
             if self.proc.poll() is not None:
+                if getattr(self, "fast_ipc", None) is not None:
+                    try:
+                        self.fast_ipc.close()
+                    except Exception:
+                        pass
+                    self.fast_ipc = None
                 if self.pump is not None and self.pump.ident is not None:   # a restart can stop before starting it
                     self.pump.join(timeout=2)
                 try:

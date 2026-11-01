@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""serve/fast_ipc.py - Python ctypes wrapper for C++ Fast Lock-Free IPC."""
+"""src/hydragen/fast_ipc.py - Python ctypes wrapper for C++ Fast Lock-Free IPC."""
 
 from __future__ import annotations
 
 import ctypes
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
+
+CONTROL_CB_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p)
 
 
 class FastEngineIPC:
@@ -20,7 +22,7 @@ class FastEngineIPC:
             return cls._lib
 
         search_paths = [
-            Path(__file__).resolve().parent.parent / "lib" / "libstrata_fast_ipc.so",
+            Path(__file__).resolve().parent.parent.parent / "lib" / "libstrata_fast_ipc.so",
             Path.cwd() / "lib" / "libstrata_fast_ipc.so",
             Path("/home/thirteenthd/hydragen/lib/libstrata_fast_ipc.so"),
         ]
@@ -31,6 +33,13 @@ class FastEngineIPC:
                     lib = ctypes.CDLL(str(p))
                     lib.strata_fast_ipc_create.argtypes = [ctypes.c_int, ctypes.c_int]
                     lib.strata_fast_ipc_create.restype = ctypes.c_void_p
+
+                    lib.strata_fast_ipc_set_control_callback.argtypes = [
+                        ctypes.c_void_p,
+                        CONTROL_CB_TYPE,
+                        ctypes.c_void_p,
+                    ]
+                    lib.strata_fast_ipc_set_control_callback.restype = None
 
                     lib.strata_fast_ipc_read_token.argtypes = [
                         ctypes.c_void_p,
@@ -56,6 +65,7 @@ class FastEngineIPC:
     def __init__(self, stdout_fd: int, num_slots: int = 4):
         self._lib = self._get_lib()
         self._handle = None
+        self._cb_ref = None
         if self._lib is not None and stdout_fd >= 0:
             self._handle = self._lib.strata_fast_ipc_create(int(stdout_fd), int(num_slots))
 
@@ -63,8 +73,21 @@ class FastEngineIPC:
     def is_available(self) -> bool:
         return self._handle is not None
 
+    def set_control_callback(self, cb_func: Callable[[str], None]) -> None:
+        """Register a callback for non-token control lines (BSTAT, PSTAT, INFO, etc.)."""
+        if self._handle is not None and self._lib is not None:
+            def _thunk(c_line, udata):
+                try:
+                    s = c_line.decode("utf-8", errors="replace") if c_line else ""
+                    cb_func(s)
+                except Exception:
+                    pass
+
+            self._cb_ref = CONTROL_CB_TYPE(_thunk)
+            self._lib.strata_fast_ipc_set_control_callback(self._handle, self._cb_ref, None)
+
     def read_token(self, slot: int, timeout_ms: int = 500) -> Optional[int]:
-        """Read next token for a slot.
+        """Read next token for a slot directly from C++ lock-free SPSC ring buffer.
         Returns:
             int: token id if token received
             None: if timed out or still generating
@@ -92,3 +115,4 @@ class FastEngineIPC:
             self._lib.strata_fast_ipc_stop(self._handle)
             self._lib.strata_fast_ipc_destroy(self._handle)
             self._handle = None
+            self._cb_ref = None
