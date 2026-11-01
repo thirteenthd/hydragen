@@ -45,7 +45,7 @@
     "16",
     "--prompt-cache-tail",
     "--batch",
-    "4",
+    "2",
     "--batch-mtp",
     "--kv-resident",
     "32768"
@@ -76,7 +76,7 @@
     "STRATA_PREFILL_EQUAL": "1",
     "STRATA_ROUTE_PRIOR": "0.85"
   },
-  "parallel": 4,
+  "parallel": 2,
   "reasoning_loop_recovery": "recover",
   "reasoning_close_retry": true,
   "repeat_stop_tokens": 64

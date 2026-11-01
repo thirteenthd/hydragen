@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -98,6 +99,103 @@ def get_hardware_info() -> dict:
             pass
 
     return hw
+
+
+def analyze_context_logs() -> dict:
+    """Analyze historical inference log files to automatically suggest optimal context window."""
+    candidate_logs = [
+        ROOT / "hydragen.log",
+        ROOT / "hydragen-service.log",
+        Path("C:/Users/thirt/.gemini/antigravity/scratch/Strata/strata-service.log"),
+        Path("C:/Users/thirt/.gemini/antigravity/scratch/Strata/strata-iq3_s.log"),
+    ]
+    # Include any local log files
+    for p in ROOT.glob("*.log"):
+        if p not in candidate_logs:
+            candidate_logs.append(p)
+
+    contexts = []
+    seen_lines = set()
+    for lp in candidate_logs:
+        if not lp.is_file():
+            continue
+        try:
+            with open(lp, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if len(line) < 300 and line in seen_lines:
+                        continue
+                    if len(seen_lines) < 200000:
+                        seen_lines.add(line)
+
+                    # Pattern 1: strata serve: prompt 143084 tokens ... 380 generated
+                    m = re.search(r"prompt\s+(\d+)\s+tokens.*?(\d+)\s+generated", line)
+                    if m:
+                        contexts.append(int(m.group(1)) + int(m.group(2)))
+                        continue
+
+                    # Pattern 2: [strata] reading the prompt: \d+ of (\d+) tokens
+                    m2 = re.search(r"reading the prompt:\s+[\d,]+\s+of\s+([\d,]+)\s+tokens", line)
+                    if m2:
+                        contexts.append(int(m2.group(1).replace(",", "")))
+                        continue
+
+                    # Pattern 3: [strata] parked (\d+) tokens
+                    m3 = re.search(r"parked\s+(\d+)\s+tokens", line)
+                    if m3:
+                        contexts.append(int(m3.group(1)))
+                        continue
+        except Exception:
+            pass
+
+    if not contexts:
+        return {"has_data": False, "suggested_ctx": "200k", "default_idx": 0, "reason": "No logs found"}
+
+    sorted_ctx = sorted(contexts)
+    n = len(sorted_ctx)
+    c_max = max(sorted_ctx)
+    p50 = sorted_ctx[n // 2]
+    p90 = sorted_ctx[int(n * 0.90)]
+    p95 = sorted_ctx[int(n * 0.95)]
+    p99 = sorted_ctx[int(n * 0.99)]
+    over_128k = sum(1 for c in sorted_ctx if c > 131072)
+    pct_over_128k = (over_128k / n) * 100.0
+
+    # Decision threshold logic
+    if c_max <= 28000 and p95 <= 24000:
+        suggested = "32k"
+        default_idx = 3
+        reason = f"Historical requests peaked at {c_max:,} tokens (P95: {p95:,}). Setting 32k saves ~180 MiB VRAM for extra resident experts."
+    elif c_max <= 58000 and p95 <= 48000:
+        suggested = "64k"
+        default_idx = 2
+        reason = f"Historical requests peaked at {c_max:,} tokens (P95: {p95:,}). Setting 64k provides full headroom while saving VRAM."
+    elif c_max <= 120000 and p95 <= 105000:
+        suggested = "128k"
+        default_idx = 1
+        reason = f"Historical requests peaked at {c_max:,} tokens (P95: {p95:,}). 128k covers 99%+ of historical sessions."
+    else:
+        suggested = "200k"
+        default_idx = 0
+        reason = (
+            f"Workload peaked at {c_max:,} tokens with P90 at {p90:,} and P95 at {p95:,}. "
+            f"Over {pct_over_128k:.1f}% of historical requests exceeded 128k tokens! "
+            f"Setting context below 200k would risk HTTP 400 Context Overflow errors."
+        )
+
+    return {
+        "has_data": True,
+        "count": n,
+        "min": min(sorted_ctx),
+        "max": c_max,
+        "p50": p50,
+        "p90": p90,
+        "p95": p95,
+        "p99": p99,
+        "pct_over_128k": round(pct_over_128k, 1),
+        "suggested_ctx": suggested,
+        "default_idx": default_idx,
+        "reason": reason,
+    }
 
 
 def run_benchmark(cfg: dict) -> dict:
@@ -226,7 +324,7 @@ def main():
     parser = argparse.ArgumentParser(description="Hydragen AI Engine Performance & Concurrency Tuner")
     parser.add_argument("--benchmark", action="store_true", help="Run live latency benchmark before tuning")
     parser.add_argument("--preset", choices=["max-concurrency", "peak-speed", "balanced"], help="Auto preset")
-    parser.add_argument("--ctx", choices=["32k", "64k", "128k", "200k"], default="200k", help="Context window")
+    parser.add_argument("--ctx", choices=["auto", "32k", "64k", "128k", "200k"], default=None, help="Context window (default: auto log-suggested)")
     parser.add_argument("--mode", choices=["desktop", "headless"], help="Display environment mode")
     parser.add_argument("--apply", action="store_true", help="Apply settings without prompting")
     args = parser.parse_args()
@@ -291,17 +389,34 @@ def main():
     )
 
     # Step 4: Choose Context Window
-    print(bold("\n--- [Step 4/5] Context Window Capacity ---"))
-    ctx_choice = args.ctx or ask_choice(
-        "Select Context Window (Max Context Length)",
-        [
-            ("200k", "200,000 tokens (200k) - Full ultra-long context for massive document analysis & coding sessions"),
-            ("128k", "131,072 tokens (128k) - Deep research and multi-turn codebase reasoning"),
-            ("64k", "65,536 tokens (64k) - High-throughput balanced context"),
-            ("32k", "32,768 tokens (32k) - Lightweight context with maximum VRAM expert headroom"),
-        ],
-        default_idx=0,
-    )
+    print(bold("\n--- [Step 4/5] Context Window Capacity & Historical Log Analysis ---"))
+    log_stats = analyze_context_logs()
+    if log_stats["has_data"]:
+        print(cyan(f"  [Log Analysis] Extracted {log_stats['count']:,} historical inference requests across log files:"))
+        print(f"    • Median context:   {log_stats['p50']:,} tokens")
+        print(f"    • 90th percentile:  {log_stats['p90']:,} tokens")
+        print(f"    • 95th percentile:  {log_stats['p95']:,} tokens")
+        print(f"    • Historical peak:  {log_stats['max']:,} tokens")
+        print(green(f"  • Auto-Recommendation: {log_stats['suggested_ctx'].upper()} - {log_stats['reason']}"))
+    else:
+        print("  [Log Analysis] No prior inference logs found. Using standard 200k long-context profile.")
+
+    if args.ctx and args.ctx != "auto":
+        ctx_choice = args.ctx
+        print(cyan(f"Selected explicit context window flag: {ctx_choice}"))
+    else:
+        default_ctx_idx = log_stats["default_idx"]
+        sug = log_stats["suggested_ctx"]
+        ctx_choice = ask_choice(
+            "Select Context Window (Max Context Length)",
+            [
+                ("200k", f"200,000 tokens (200k) - Full ultra-long context for massive document analysis & coding{' [Auto-Recommended from Logs]' if sug == '200k' else ''}"),
+                ("128k", f"131,072 tokens (128k) - Deep research and multi-turn codebase reasoning{' [Auto-Recommended from Logs]' if sug == '128k' else ''}"),
+                ("64k", f"65,536 tokens (64k) - High-throughput balanced context{' [Auto-Recommended from Logs]' if sug == '64k' else ''}"),
+                ("32k", f"32,768 tokens (32k) - Lightweight context with maximum VRAM expert headroom{' [Auto-Recommended from Logs]' if sug == '32k' else ''}"),
+            ],
+            default_idx=default_ctx_idx,
+        )
     ctx_tokens = {"32k": 32768, "64k": 65536, "128k": 131072, "200k": 204800}.get(ctx_choice, 204800)
 
     # KV Storage Precision
