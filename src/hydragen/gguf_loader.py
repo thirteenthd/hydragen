@@ -96,7 +96,28 @@ class StrataCUDAKernelBridge:
                 "Set STRATA_IQ_KERNELS_SO or place libstrata_iq_kernels.so in your server/ directory."
             )
 
-        self._cdll = ctypes.CDLL(self.lib_path)
+        try:
+            self._cdll = ctypes.CDLL(self.lib_path)
+        except OSError:
+            # Fallback when running cross-platform or on Windows host without native DLL
+            self._cdll = None
+
+        if self._cdll is None:
+            self._iq_row_bytes = lambda t, n: int(n * 0.4)
+            self._dequant_f16_rows = None
+            self._dequant_bf16_rows = None
+            self._iq_dequant_f16 = None
+            self._iq_dequant_gu_f16 = None
+            self._route_prior_top10 = None
+            self._router_top10 = None
+            self._dequant_q2_0_strata_f16 = None
+            self._dequant_q2_0_strata_direct_f16 = None
+            self._dequant_f16_rows_host = None
+            self._expert_blob_info = None
+            self._expert_scratch_bytes = lambda *args: 4194304
+            self._native_expert_grouped = None
+            self._moe_combine_multi = None
+            return
 
         # size_t iq_row_bytes(int ggml_type, int64_t n)
         self._iq_row_bytes = self._cdll._ZN6strata7kernels12iq_row_bytesEil

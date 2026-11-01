@@ -118,6 +118,17 @@ async function loadHealth() {
   try {
     health = await (await fetch("health")).json();
     renderEmptyChat();
+    const tag = $("engine-tag");
+    if (tag) {
+      const isTRT = health.engine === "trtllm";
+      const isVLLM = health.engine === "vllm";
+      const engName = isTRT ? "TensorRT-LLM" : (isVLLM ? "vLLM" : "Strata");
+      tag.textContent = engName;
+      tag.title = health.engine_label || (isTRT ? "TensorRT-LLM (In-Flight Batching + Paged KV)" : (isVLLM ? "vLLM (Triton + PagedMoE)" : "Strata (Native C++/CUDA)"));
+      tag.style.background = isTRT ? "rgba(118, 185, 0, 0.18)" : (isVLLM ? "rgba(16, 185, 129, 0.18)" : "rgba(59, 130, 246, 0.18)");
+      tag.style.borderColor = isTRT ? "rgba(118, 185, 0, 0.4)" : (isVLLM ? "rgba(16, 185, 129, 0.4)" : "rgba(59, 130, 246, 0.4)");
+      tag.style.color = isTRT ? "#76b900" : (isVLLM ? "#10b981" : "#3b82f6");
+    }
     $("tab-btn-images").hidden = !health.image_generation;
     if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
@@ -953,7 +964,8 @@ function renderAbout(eng, hw, st) {
   const kv = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit"}[eng.kv] || eng.kv;
   facts($("facts-engine"), [
     ["Model", eng.model],
-    ["Engine", eng.version ? `v${eng.version}` : "built from source"],
+    ["Engine Backend", (health && health.engine_label) ? health.engine_label : (eng.engine === "vllm-triton-pagedmoe" ? "vLLM (Triton + PagedMoE)" : "Strata (Native C++/CUDA)")],
+    ["Engine Version", eng.version ? `v${eng.version}` : "built from source"],
     ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
     ["KV cache", kv ? `${kv}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null],
     ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],

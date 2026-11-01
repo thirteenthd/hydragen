@@ -82,7 +82,7 @@ async function refresh() {
     const loading = records.some(r => r.state === "loading");
     text("loaded", loading ? "Loading…" : inflight ? "In use" : status.loaded ? "Loaded" : "Unloaded");
     $("model-state").className = `value ${inflight || loading ? "busy" : status.loaded ? "loaded" : ""}`;
-    const engLabel = status.engine_label || (status.engine_type === "vllm" || status.engine === "vllm-triton-pagedmoe" ? "vLLM" : "Strata");
+    const engLabel = status.engine_label || (status.engine_type === "trtllm" ? "TensorRT-LLM" : (status.engine_type === "vllm" || status.engine === "vllm-triton-pagedmoe" ? "vLLM" : "Strata"));
     text("model", `${status.model} • ${engLabel}`); text("count", records.length);
     text("active", inflight ? `${inflight} active / queued` : status.auto_load ? "Loads automatically on the next request" : "No active requests");
     const last = records.find(r => !active(r));
