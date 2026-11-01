@@ -16,9 +16,9 @@ if [ ! -f "${NVCC}" ]; then
     NVCC="nvcc"
 fi
 
-CUDA_HOME="$(dirname "$(dirname "$("${NVCC}" --version | grep -o '/.*' | head -n 1 || echo '/usr/local/cuda')")"
+CUDA_HOME="/usr/local/cuda-13.1"
 if [ ! -d "${CUDA_HOME}/include" ]; then
-    CUDA_HOME="/usr/local/cuda-13.1"
+    CUDA_HOME="/usr/local/cuda"
 fi
 
 echo "====================================================="
