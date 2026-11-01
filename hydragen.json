@@ -42,10 +42,10 @@
     "--conversation-cache-mib",
     "6144",
     "--conversation-cache-slots",
-    "8",
+    "16",
     "--prompt-cache-tail",
     "--batch",
-    "2",
+    "4",
     "--batch-mtp"
   ],
   "cwd": ".",
@@ -75,7 +75,7 @@
     "STRATA_PREFILL_EQUAL": "1",
     "STRATA_ROUTE_PRIOR": "0.85"
   },
-  "parallel": 2,
+  "parallel": 4,
   "reasoning_loop_recovery": "recover",
   "reasoning_close_retry": true,
   "repeat_stop_tokens": 64
