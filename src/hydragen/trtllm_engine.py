@@ -194,6 +194,18 @@ class TRTLLMEngine:
             except Exception:
                 pass
 
+        # 2b. Fast C++ Lock-Free IPC Bridge (Bottleneck 5 optimization)
+        self.fast_ipc = None
+        try:
+            from hydragen.fast_ipc import FastEngineIPC
+            proc = getattr(self.backend, "proc", None) if self.backend is not None else None
+            if proc is not None and getattr(proc, "stdout", None) is not None:
+                self.fast_ipc = FastEngineIPC(proc.stdout.fileno(), num_slots=self.batch)
+                if self.fast_ipc.is_available:
+                    print(f"[hydragen:trtllm] Fast C++ Lock-Free IPC initialized ({self.batch} slots)")
+        except Exception as e:
+            print(f"[hydragen:trtllm] Fast IPC note: {e}")
+
         # 3. Virtual Paged KV Block Manager (Native C++ libpaged_kv.so with fallback)
         try:
             from hydragen.paged_kv import PagedKVManager
@@ -323,6 +335,12 @@ class TRTLLMEngine:
         return self.backend.alive() if self.backend is not None else True
 
     def close(self):
+        if hasattr(self, "fast_ipc") and self.fast_ipc is not None:
+            try:
+                self.fast_ipc.close()
+            except Exception:
+                pass
+            self.fast_ipc = None
         if self.backend is not None and hasattr(self.backend, "close"):
             self.backend.close()
 
