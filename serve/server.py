@@ -2157,6 +2157,7 @@ class StrataEngine:
                 gen0 = len(out) - 1                         # the admission's own token: the slot feeds it first
                 going_solo = False
                 while True:
+                    line = None
                     if getattr(self, "fast_ipc", None) is not None and self.fast_ipc.is_available:
                         try:
                             t = self.fast_ipc.read_token(slot, timeout_ms=500)
