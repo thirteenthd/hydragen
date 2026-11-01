@@ -222,6 +222,7 @@ private:
             }
             m_slots[0]->ring.push({tok, 1});
             notify_slot(0);
+            forward_control(line);
             return;
         }
 
