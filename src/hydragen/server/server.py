@@ -4939,8 +4939,12 @@ class Service:
 
         busy, ctx = bool(s.get("busy")), self.reported_ctx()
         images = self.vision is not None
+        is_vllm = getattr(self.engine, "expert_manager", None) is not None
+        eng_backend = "vllm" if is_vllm else "strata"
+        eng_label = "vLLM (Triton + PagedMoE)" if is_vllm else "Strata (Native C++/CUDA)"
         return {
-            "service": "strata", "model": self.model,
+            "service": "hydragen", "model": self.model,
+            "engine_type": eng_backend, "engine_label": eng_label,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
@@ -7243,10 +7247,14 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
             elif path in ("/health", "/api/health"):
+                is_vllm = getattr(svc.engine, "expert_manager", None) is not None
+                eng_backend = "vllm" if is_vllm else "strata"
+                eng_label = "vLLM (Triton + PagedMoE)" if is_vllm else "Strata (Native C++/CUDA)"
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
-                                 "loaded": svc.loaded(), "service": "strata"})
+                                 "loaded": svc.loaded(), "service": "hydragen",
+                                 "engine": eng_backend, "engine_label": eng_label})
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
                 f = svc.images.file(path[len("/v1/images/files/"):]) if svc.images is not None else None
