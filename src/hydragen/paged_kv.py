@@ -79,6 +79,8 @@ class PagedKVManager:
 
     def _load_native_lib(self) -> Optional[ctypes.CDLL]:
         candidates = [
+            os.environ.get("LIBPAGED_KV_SO", ""),
+            os.path.join(os.path.dirname(__file__), "..", "..", "lib", "libpaged_kv.so"),
             os.path.join(os.path.dirname(__file__), "libpaged_kv.so"),
             os.path.join(os.path.dirname(__file__), "server", "libpaged_kv.so"),
             os.path.join(os.path.dirname(__file__), "..", "..", "build", "libpaged_kv.so"),
@@ -243,6 +245,25 @@ class PagedKVManager:
             used_memory_bytes=allocated * block_bytes,
             fragmentation_ratio=round(frag, 4),
         )
+
+    def allocate_blocks(self, seq_id: int, num_tokens: int) -> List[int]:
+        success = self.allocate_sequence(seq_id, num_tokens)
+        if not success:
+            return []
+        if self._handle is not None:
+            n_blocks = self._native_lib.paged_kv_get_num_blocks(self._handle, seq_id)
+            return list(range(n_blocks))
+        return list(self._seq_tables.get(seq_id, []))
+
+    def stats(self) -> Dict[str, Any]:
+        s = self.get_stats()
+        return {
+            "total_blocks": s.total_blocks,
+            "free_blocks": s.free_blocks,
+            "used_blocks": s.allocated_blocks,
+            "utilization": round(s.allocated_blocks / max(1, s.total_blocks), 3),
+            "block_size": self.block_size,
+        }
 
     def __del__(self):
         if self._handle is not None and self._native_lib is not None:

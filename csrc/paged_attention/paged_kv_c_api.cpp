@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "paged_kv_c_api.h"
 #include "paged_kv_manager.hpp"
+#include "paged_attention_kernel.cuh"
 
 using namespace hydragen::paged_kv;
 
@@ -94,6 +95,30 @@ void paged_kv_get_stats(void* handle, CPagedKVStats* out_stats) {
     out_stats->total_memory_bytes = stats.total_memory_bytes;
     out_stats->used_memory_bytes = stats.used_memory_bytes;
     out_stats->fragmentation_ratio = stats.fragmentation_ratio;
+}
+
+void paged_attention_decode(
+    float* out,
+    const float* q,
+    const void* k_cache,
+    const void* v_cache,
+    const int32_t* block_tables,
+    const int32_t* context_lens,
+    int32_t num_seqs,
+    int32_t num_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t block_size,
+    int32_t max_blocks,
+    float scale,
+    int32_t is_int8_kv,
+    void* stream
+) {
+    hydragen::paged_attention::launch_paged_attention_decode_f16(
+        out, q, k_cache, v_cache, block_tables, context_lens,
+        num_seqs, num_heads, num_kv_heads, head_dim, block_size, max_blocks,
+        scale, is_int8_kv != 0, static_cast<cudaStream_t>(stream)
+    );
 }
 
 }
