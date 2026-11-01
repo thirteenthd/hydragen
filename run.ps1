@@ -30,12 +30,17 @@ if (-not (Test-Path $configFile)) {
     }
 }
 
+$portArg = @()
+if (-not ($args -contains "--port")) {
+    $portArg = @("--port", "8080")
+}
+
 Write-Host "[hydragen] Starting server using config: $configFile" -ForegroundColor Green
 
 # Invoke hydragen CLI directly from venv
 $hydragenExe = Join-Path $venvScripts "hydragen.exe"
 if (Test-Path $hydragenExe) {
-    & $hydragenExe --config $configFile --port 8080 --api-monitor @args
+    & $hydragenExe --config $configFile --api-monitor @portArg @args
 } else {
-    & python -m hydragen.cli --config $configFile --port 8080 --api-monitor @args
+    & python -m hydragen.cli --config $configFile --api-monitor @portArg @args
 }

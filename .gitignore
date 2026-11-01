@@ -13,6 +13,8 @@ htmlcov/
 .DS_Store
 Thumbs.db
 *.log
+*.bak
+*-service.log
 .venv/
 bin/
 data/
