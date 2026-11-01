@@ -4939,9 +4939,20 @@ class Service:
 
         busy, ctx = bool(s.get("busy")), self.reported_ctx()
         images = self.vision is not None
+        engine_type = (
+            getattr(self.engine, "engine_type", None)
+            or (getattr(self.engine, "info", {}) or {}).get("engine_type")
+        )
         is_vllm = getattr(self.engine, "expert_manager", None) is not None
-        eng_backend = "vllm" if is_vllm else "strata"
-        eng_label = "vLLM (Triton + PagedMoE)" if is_vllm else "Strata (Native C++/CUDA)"
+        if engine_type == "trtllm":
+            eng_backend = "trtllm"
+            eng_label = "TensorRT-LLM (In-Flight Batching + Paged KV)"
+        elif is_vllm:
+            eng_backend = "vllm"
+            eng_label = "vLLM (Triton + PagedMoE)"
+        else:
+            eng_backend = "strata"
+            eng_label = "Strata (Native C++/CUDA)"
         return {
             "service": "hydragen", "model": self.model,
             "engine_type": eng_backend, "engine_label": eng_label,
@@ -7247,9 +7258,20 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
             elif path in ("/health", "/api/health"):
+                engine_type = (
+                    getattr(svc.engine, "engine_type", None)
+                    or (getattr(svc.engine, "info", {}) or {}).get("engine_type")
+                )
                 is_vllm = getattr(svc.engine, "expert_manager", None) is not None
-                eng_backend = "vllm" if is_vllm else "strata"
-                eng_label = "vLLM (Triton + PagedMoE)" if is_vllm else "Strata (Native C++/CUDA)"
+                if engine_type == "trtllm":
+                    eng_backend = "trtllm"
+                    eng_label = "TensorRT-LLM (In-Flight Batching + Paged KV)"
+                elif is_vllm:
+                    eng_backend = "vllm"
+                    eng_label = "vLLM (Triton + PagedMoE)"
+                else:
+                    eng_backend = "strata"
+                    eng_label = "Strata (Native C++/CUDA)"
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
@@ -8823,7 +8845,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             event_sink = None
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--engine", choices=["mock", "strata", "vllm"], default="mock")
+    ap.add_argument("--engine", choices=["mock", "strata", "vllm", "trtllm"], default="mock")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
@@ -9137,6 +9159,22 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         effort_end = None
         from serve.vllm_engine import VLLMEngine
         engine = VLLMEngine(cfg, tok, batch_slots=a.parallel or 4)
+        vision = None
+        if cfg.get("vision"):
+            print("loading the vision encoder ...", flush=True)
+            vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+                        if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
+                    for k, v in cfg["vision"].items() if not (k == "exe" and engine_component.is_reference(v))}
+            if engine_component.is_reference(cfg["vision"].get("exe")):
+                vcfg["exe"] = _component_exe(cfg["vision"]["exe"], cfg)
+            env = child_env(cfg, offline=a.offline)
+            vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
+                            env=vision_env(cfg, env), lazy=lazy)
+        sampling_defaults = sampling_defaults_from_config(cfg)
+    elif a.engine == "trtllm":
+        effort_end = None
+        from serve.trtllm_engine import TRTLLMEngine
+        engine = TRTLLMEngine(cfg, tok, batch_slots=a.parallel or 4)
         vision = None
         if cfg.get("vision"):
             print("loading the vision encoder ...", flush=True)
