@@ -871,7 +871,7 @@ def btrace(*a):
         print("[batch-trace]", threading.get_ident() % 10000, *a, file=sys.stderr, flush=True)
 
 
-EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
+EOS_IDS = {248044, 248046, 151643, 151644, 151645, 128001, 128009, 1, 2}   # default --eos-ids across DeepSeek, Qwen, and Llama
 
 
 # The engine's own words for a verifier that cannot go on (its GPU waits were released, or an earlier window never
@@ -1018,6 +1018,7 @@ class StrataEngine:
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
+        self.eos_ids = set(EOS_IDS)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.terminal_stages: list[dict] = []  # final layer ranges from this engine start's bounded stderr log
@@ -2161,7 +2162,7 @@ class StrataEngine:
                             try:
                                 line = self.slot_q[slot].get(timeout=0.5)
                             except queue.Empty:
-                                line = f"BDONE {slot} stop"
+                                line = f"BDONE {slot} {len(out)} stop {round((time.time() - live.get('first_token', time.time())) * 1000, 1)}"
                             t = None
                         except Exception as e:
                             phase = "none"
@@ -2261,8 +2262,13 @@ class StrataEngine:
             except EngineDied:
                 pass
             bdone_in = False
-            if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and self.gen == born:
-                bd = self._bdone_after_eos(slot)            # (#1869) the slot's figures, not the admission's
+            eos_set = getattr(self, "eos_ids", EOS_IDS) | EOS_IDS
+            if phase == "slot" and slot is not None and self.gen == born:
+                bd = None
+                if (out and out[-1] in eos_set) or (left is not None and len(out) >= left) or (isinstance(max_new, (int, float)) and len(out) >= int(max_new)):
+                    bd = self._bdone_after_eos(slot, wait_s=1.0)
+                elif not self.slot_q[slot].empty():
+                    bd = self._bdone_after_eos(slot, wait_s=0.2)
                 if bd is not None:
                     self._apply_bdone(bd.split())
                     bdone_in = True
@@ -2363,10 +2369,15 @@ class StrataEngine:
                     view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b])})
                 continue
             ft = r.get("first_token")
+            tok_s = None
+            if ft and r.get("state") == "decoding" and now > ft:
+                dt = now - ft
+                if dt >= 0.05 and r.get("generated", 0) > 0:
+                    tok_s = round(r["generated"] / dt, 1)
             view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
                          "prompt_read": r.get("prompt_read") if r["state"] == "reading" else None,
                          "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
-                         "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None,
+                         "tok_s": tok_s,
                          "prefill_tok_s": r.get("prefill_tok_s")})
         return view
 
@@ -4202,6 +4213,9 @@ class Service:
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        EOS_IDS.update(self.stop_ids)
+        if hasattr(self.engine, "eos_ids"):
+            self.engine.eos_ids.update(self.stop_ids)
         self.family = None                              # the model family ("deepseek41"): set_family() below
         self.parser_cls = OutputParser                  # reads the model's output (reasoning, content, tool calls)
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
@@ -4224,6 +4238,9 @@ class Service:
             from serve import dsml
             eos = (getattr(self.tok, "special_ids", None) or {}).get("eos", 1)
             self.stop_ids = {int(eos)}
+            EOS_IDS.update(self.stop_ids)
+            if hasattr(self.engine, "eos_ids"):
+                self.engine.eos_ids.update(self.stop_ids)
             self.parser_cls = dsml.DsmlOutputParser
             self._force_text = dsml.to_dsml_force
         import serve.frontend as _frontend

@@ -204,11 +204,11 @@ private:
                 slot = slot * 10 + (*p - '0');
                 p++;
             }
+            forward_control(line);
             if (slot >= 0 && slot < m_num_slots) {
                 m_slots[slot]->ring.push({0, -1});
                 notify_slot(slot);
             }
-            forward_control(line);
             return;
         }
 
@@ -220,26 +220,21 @@ private:
                 tok = tok * 10 + (*p - '0');
                 p++;
             }
+            forward_control(line);
             m_slots[0]->ring.push({tok, 1});
             notify_slot(0);
-            forward_control(line);
             return;
         }
 
         // Fast parsing of single-stream "DONE"
         if (len >= 4 && std::strncmp(line, "DONE", 4) == 0) {
+            forward_control(line);
             m_slots[0]->ring.push({0, -1});
             notify_slot(0);
-            forward_control(line);
             return;
         }
 
-        // Error lines
-        if (len >= 3 && std::strncmp(line, "ERR", 3) == 0) {
-            broadcast_all(-2);
-        }
-
-        // Forward all other control lines (BSTAT, PSTAT, INFO, PP, FATAL, etc.)
+        // Forward all other control lines (BSTAT, PSTAT, INFO, PP, ERR, FATAL, etc.)
         forward_control(line);
     }
 

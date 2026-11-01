@@ -266,6 +266,7 @@ class TRTLLMEngine:
         eos = self.tok.encode("<|im_end|>", parse_special=True) if self.tok else [248046]
         self.im_end_id = eos[0] if eos else 248046
         self._tl = threading.local()
+        self.eos_ids = getattr(self.backend, "eos_ids", set())
 
     def __getattr__(self, name: str) -> Any:
         if self.backend is not None and hasattr(self.backend, name):
@@ -300,21 +301,12 @@ class TRTLLMEngine:
     @property
     def last(self) -> Dict[str, Any]:
         if self.backend is not None and hasattr(self.backend, "last"):
-            val = self.backend.last
-            if isinstance(val, dict):
-                return {
-                    **val,
-                    "engine_type": "trtllm",
-                    "engine_label": "TensorRT-LLM (In-Flight Batching + Paged KV)",
-                }
-            return val
-        return {
-            "engine_type": "trtllm",
-            "engine_label": "TensorRT-LLM (In-Flight Batching + Paged KV)",
-        }
+            return self.backend.last
+        return getattr(self, "_last", {})
 
     @last.setter
     def last(self, value: Dict[str, Any]):
+        self._last = value
         if self.backend is not None:
             try:
                 self.backend.last = value
@@ -350,25 +342,33 @@ class TRTLLMEngine:
         return {"reserve_mib": reserve_mib or 256, "status": "ok"}
 
     def slots_view(self) -> List[Dict[str, Any]]:
+        if self.backend is not None and hasattr(self.backend, "slots_view"):
+            return self.backend.slots_view()
         with self.slot_lock:
             result = []
+            now = time.time()
             for i in range(self.batch):
                 item = self.slot_live[i]
                 if item is None:
-                    result.append({"slot": i, "state": "idle", "held": len(self.slot_held[i])})
+                    result.append({"slot": i, "state": "idle", "held_tokens": len(self.slot_held[i])})
                 else:
                     t_first = item.get("first_token")
-                    now = time.time()
-                    t_gen = max(1e-4, now - t_first) if t_first else 0.0
                     gen_toks = item.get("generated", 0)
-                    tok_s = round(gen_toks / t_gen, 1) if t_gen > 0 else 0.0
+                    tok_s = None
+                    if t_first and item.get("state") == "decoding" and now > t_first:
+                        dt = now - t_first
+                        if dt >= 0.05 and gen_toks > 0:
+                            tok_s = round(gen_toks / dt, 1)
+                    t_start = item.get("start_time", now)
                     result.append({
                         "slot": i,
-                        "state": item.get("state", "active"),
-                        "prompt": item.get("prompt", 0),
+                        "state": item.get("state", "decoding"),
+                        "prompt_tokens": item.get("prompt_total", item.get("prompt", 0)),
+                        "prompt_read": item.get("read"),
                         "generated": gen_toks,
+                        "elapsed_s": round(now - t_start, 1),
                         "tok_s": tok_s,
-                        "held": len(self.slot_held[i]),
+                        "prefill_tok_s": item.get("prefill_tok_s"),
                     })
             return result
 
