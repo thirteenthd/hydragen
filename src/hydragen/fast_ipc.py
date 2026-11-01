@@ -22,9 +22,12 @@ class FastEngineIPC:
             return cls._lib
 
         search_paths = [
+            Path(__file__).resolve().parent / "libstrata_fast_ipc.so",
+            Path(__file__).resolve().parent / "server" / "libstrata_fast_ipc.so",
             Path(__file__).resolve().parent.parent.parent / "lib" / "libstrata_fast_ipc.so",
             Path.cwd() / "lib" / "libstrata_fast_ipc.so",
             Path("/home/thirteenthd/hydragen/lib/libstrata_fast_ipc.so"),
+            Path("/home/thirteenthd/hydragen/serve/libstrata_fast_ipc.so"),
         ]
 
         for p in search_paths:
@@ -48,6 +51,10 @@ class FastEngineIPC:
                         ctypes.c_int32,
                     ]
                     lib.strata_fast_ipc_read_token.restype = ctypes.c_int32
+
+                    if hasattr(lib, "strata_fast_ipc_clear_slot"):
+                        lib.strata_fast_ipc_clear_slot.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+                        lib.strata_fast_ipc_clear_slot.restype = None
 
                     lib.strata_fast_ipc_stop.argtypes = [ctypes.c_void_p]
                     lib.strata_fast_ipc_stop.restype = None
@@ -85,6 +92,12 @@ class FastEngineIPC:
 
             self._cb_ref = CONTROL_CB_TYPE(_thunk)
             self._lib.strata_fast_ipc_set_control_callback(self._handle, self._cb_ref, None)
+
+    def clear_slot(self, slot: int) -> None:
+        """Clear and reset ring buffer for a given slot before starting a new batch request."""
+        if self._handle is not None and self._lib is not None:
+            if hasattr(self._lib, "strata_fast_ipc_clear_slot"):
+                self._lib.strata_fast_ipc_clear_slot(self._handle, int(slot))
 
     def read_token(self, slot: int, timeout_ms: int = 500) -> Optional[int]:
         """Read next token for a slot directly from C++ lock-free SPSC ring buffer.

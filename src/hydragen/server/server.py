@@ -871,7 +871,7 @@ def btrace(*a):
         print("[batch-trace]", threading.get_ident() % 10000, *a, file=sys.stderr, flush=True)
 
 
-EOS_IDS = {248044, 248046, 151643, 151644, 151645, 128001, 128009, 1, 2}   # default --eos-ids across DeepSeek, Qwen, and Llama
+EOS_IDS = {248044, 248046, 151643, 151644, 151645, 128001, 128009}   # default --eos-ids across DeepSeek, Qwen, and Llama (no ASCII punctuation)
 
 
 # The engine's own words for a verifier that cannot go on (its GPU waits were released, or an earlier window never
@@ -1218,7 +1218,7 @@ class StrataEngine:
             try:
                 from hydragen.fast_ipc import FastEngineIPC
                 if self.proc is not None and getattr(self.proc, "stdout", None) is not None:
-                    self.fast_ipc = FastEngineIPC(self.proc.stdout.fileno(), num_slots=max(1, self.batch))
+                    self.fast_ipc = FastEngineIPC(self.proc.stdout.fileno(), num_slots=max(8, self.batch))
                     if self.fast_ipc.is_available:
                         def _on_ctl(line_str: str):
                             if line_str == "EOF":
@@ -1990,7 +1990,8 @@ class StrataEngine:
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
-                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
+                        eos_set = getattr(self, "eos_ids", EOS_IDS) | EOS_IDS
+                        if cancel.is_set() or left <= 0 or (out and out[-1] in eos_set):
                             return
                         if reused0 is None:
                             reused0 = (self.last or {}).get("reused")
@@ -2059,6 +2060,8 @@ class StrataEngine:
                         holding, born = True, self.gen                  # (the engine it now has the control lines of)
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
+                    if getattr(self, "fast_ipc", None) is not None and self.fast_ipc.is_available:
+                        self.fast_ipc.clear_slot(slot)
                     head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
                     live = {"slot": slot, "request_id": getattr(cancel, "_strata_request_id", None),
                             "state": "reading", "prompt_tokens": len(prompt), "prompt_read": 0, "generated": 0,
@@ -2160,9 +2163,11 @@ class StrataEngine:
                         except StopIteration:
                             line = None
                             try:
-                                line = self.slot_q[slot].get(timeout=0.5)
+                                line = self.slot_q[slot].get(timeout=2.0)
                             except queue.Empty:
-                                line = f"BDONE {slot} {len(out)} stop {round((time.time() - live.get('first_token', time.time())) * 1000, 1)}"
+                                line = None
+                            if line is None:
+                                break
                             t = None
                         except Exception as e:
                             phase = "none"
@@ -5774,6 +5779,9 @@ class Service:
                         except GeneratorExit:               # the client went away: an engine that never acknowledges
                             leaving = True                  # the STOP below is ended, but no error replaces this
                             raise
+                        except Exception as e:
+                            finish = "error"
+                            raise
                         finally:
                             try:
                                 gen.close()             # STOP+drain to THIS request's DONE while still holding the
@@ -5917,6 +5925,8 @@ class Service:
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
                             seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
+                            if n == 0 and int(max_new) > 0 and finish == "length":
+                                finish = "error"
                             self.history.append({
                                 "id": request_id,
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False

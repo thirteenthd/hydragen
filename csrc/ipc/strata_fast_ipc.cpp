@@ -57,6 +57,11 @@ public:
         return m_tail.load(std::memory_order_relaxed) == m_head.load(std::memory_order_acquire);
     }
 
+    void clear() {
+        m_head.store(0, std::memory_order_relaxed);
+        m_tail.store(0, std::memory_order_relaxed);
+    }
+
 private:
     TokenPacket m_buffer[Capacity];
     alignas(64) std::atomic<size_t> m_head;
@@ -72,7 +77,7 @@ struct SlotContext {
 class FastEngineIpc {
 public:
     FastEngineIpc(int stdout_fd, int num_slots)
-        : m_fd(stdout_fd), m_num_slots(std::max(1, num_slots)), m_running(true),
+        : m_fd(stdout_fd), m_num_slots(std::max(8, num_slots)), m_running(true),
           m_control_cb(nullptr), m_control_user_data(nullptr) {
         for (int i = 0; i < m_num_slots; ++i) {
             m_slots.push_back(std::make_unique<SlotContext>());
@@ -99,6 +104,13 @@ public:
         for (int i = 0; i < m_num_slots; ++i) {
             std::lock_guard<std::mutex> lock(m_slots[i]->mtx);
             m_slots[i]->cv.notify_all();
+        }
+    }
+
+    void clear_slot(int slot) {
+        if (slot >= 0 && slot < m_num_slots) {
+            std::lock_guard<std::mutex> lock(m_slots[slot]->mtx);
+            m_slots[slot]->ring.clear();
         }
     }
 
@@ -212,25 +224,15 @@ private:
             return;
         }
 
-        // Fast parsing of single-stream "T <token_id>"
+        // Fast parsing of single-stream "T <token_id>" -> Forward to Python control lines only (never pollute batch slot 0)
         if (len >= 3 && line[0] == 'T' && line[1] == ' ') {
-            const char* p = line + 2;
-            int32_t tok = 0;
-            while (*p >= '0' && *p <= '9') {
-                tok = tok * 10 + (*p - '0');
-                p++;
-            }
             forward_control(line);
-            m_slots[0]->ring.push({tok, 1});
-            notify_slot(0);
             return;
         }
 
-        // Fast parsing of single-stream "DONE"
+        // Fast parsing of single-stream "DONE" -> Forward to Python control lines only (never pollute batch slot 0)
         if (len >= 4 && std::strncmp(line, "DONE", 4) == 0) {
             forward_control(line);
-            m_slots[0]->ring.push({0, -1});
-            notify_slot(0);
             return;
         }
 
@@ -305,6 +307,12 @@ void strata_fast_ipc_set_control_callback(strata_fast_ipc_t* ipc, strata_control
 int32_t strata_fast_ipc_read_token(strata_fast_ipc_t* ipc, int32_t slot, int32_t* out_token, int32_t timeout_ms) {
     if (!ipc) return -2;
     return reinterpret_cast<strata::ipc::FastEngineIpc*>(ipc)->read_token(slot, out_token, timeout_ms);
+}
+
+void strata_fast_ipc_clear_slot(strata_fast_ipc_t* ipc, int32_t slot) {
+    if (ipc) {
+        reinterpret_cast<strata::ipc::FastEngineIpc*>(ipc)->clear_slot(slot);
+    }
 }
 
 void strata_fast_ipc_stop(strata_fast_ipc_t* ipc) {
