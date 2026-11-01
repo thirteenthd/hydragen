@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -62,13 +63,19 @@ private:
     alignas(64) std::atomic<size_t> m_tail;
 };
 
+struct SlotContext {
+    SpscRingBuffer<4096> ring;
+    std::mutex mtx;
+    std::condition_variable cv;
+};
+
 class FastEngineIpc {
 public:
     FastEngineIpc(int stdout_fd, int num_slots)
         : m_fd(stdout_fd), m_num_slots(std::max(1, num_slots)), m_running(true) {
-        m_slots.resize(m_num_slots);
-        m_cvs.resize(m_num_slots);
-        m_mutexes.resize(m_num_slots);
+        for (int i = 0; i < m_num_slots; ++i) {
+            m_slots.push_back(std::make_unique<SlotContext>());
+        }
         m_reader_thread = std::thread(&FastEngineIpc::reader_loop, this);
     }
 
@@ -83,17 +90,19 @@ public:
         if (!m_running.exchange(false)) return;
         // Wake up any waiting consumers
         for (int i = 0; i < m_num_slots; ++i) {
-            std::lock_guard<std::mutex> lock(m_mutexes[i]);
-            m_cvs[i].notify_all();
+            std::lock_guard<std::mutex> lock(m_slots[i]->mtx);
+            m_slots[i]->cv.notify_all();
         }
     }
 
     int32_t read_token(int32_t slot, int32_t* out_token, int32_t timeout_ms) {
         if (slot < 0 || slot >= m_num_slots) return -2;
 
-        TokenPacket pkt;
+        SlotContext& sc = *m_slots[slot];
+        TokenPacket pkt{0, 0};
+
         // 1. Fast Lock-Free path
-        if (m_slots[slot].pop(pkt)) {
+        if (sc.ring.pop(pkt)) {
             if (pkt.status == 1) {
                 *out_token = pkt.token_id;
                 return 1;
@@ -104,15 +113,15 @@ public:
         if (timeout_ms == 0) return 0; // Immediate non-blocking poll
 
         // 2. Wait on condition variable if empty
-        std::unique_lock<std::mutex> lock(m_mutexes[slot]);
-        auto pred = [this, slot, &pkt]() {
-            return m_slots[slot].pop(pkt) || !m_running.load(std::memory_order_relaxed);
+        std::unique_lock<std::mutex> lock(sc.mtx);
+        auto pred = [this, &sc, &pkt]() {
+            return sc.ring.pop(pkt) || !m_running.load(std::memory_order_relaxed);
         };
 
         if (timeout_ms < 0) {
-            m_cvs[slot].wait(lock, pred);
+            sc.cv.wait(lock, pred);
         } else {
-            if (!m_cvs[slot].wait_for(lock, std::chrono::milliseconds(timeout_ms), pred)) {
+            if (!sc.cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), pred)) {
                 return 0; // Timeout
             }
         }
@@ -130,15 +139,15 @@ public:
 private:
     void notify_slot(int slot) {
         if (slot >= 0 && slot < m_num_slots) {
-            std::lock_guard<std::mutex> lock(m_mutexes[slot]);
-            m_cvs[slot].notify_one();
+            std::lock_guard<std::mutex> lock(m_slots[slot]->mtx);
+            m_slots[slot]->cv.notify_one();
         }
     }
 
     void broadcast_all(int status) {
         for (int i = 0; i < m_num_slots; ++i) {
             TokenPacket pkt{0, status};
-            m_slots[i].push(pkt);
+            m_slots[i]->ring.push(pkt);
             notify_slot(i);
         }
     }
@@ -161,7 +170,7 @@ private:
                 p++;
             }
             if (slot >= 0 && slot < m_num_slots) {
-                m_slots[slot].push({tok, 1});
+                m_slots[slot]->ring.push({tok, 1});
                 notify_slot(slot);
             }
             return;
@@ -176,7 +185,7 @@ private:
                 p++;
             }
             if (slot >= 0 && slot < m_num_slots) {
-                m_slots[slot].push({0, -1});
+                m_slots[slot]->ring.push({0, -1});
                 notify_slot(slot);
             }
             return;
@@ -190,14 +199,14 @@ private:
                 tok = tok * 10 + (*p - '0');
                 p++;
             }
-            m_slots[0].push({tok, 1});
+            m_slots[0]->ring.push({tok, 1});
             notify_slot(0);
             return;
         }
 
         // Fast parsing of single-stream "DONE"
         if (len >= 4 && std::strncmp(line, "DONE", 4) == 0) {
-            m_slots[0].push({0, -1});
+            m_slots[0]->ring.push({0, -1});
             notify_slot(0);
             return;
         }
@@ -246,9 +255,7 @@ private:
     std::atomic<bool> m_running;
     std::thread m_reader_thread;
 
-    std::vector<SpscRingBuffer<4096>> m_slots;
-    std::vector<std::condition_variable> m_cvs;
-    std::vector<std::mutex> m_mutexes;
+    std::vector<std::unique_ptr<SlotContext>> m_slots;
 };
 
 } // namespace strata::ipc
