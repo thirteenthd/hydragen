@@ -134,9 +134,32 @@ echo "ALL CONFIG PATHS VERIFIED VALID"
 
 Agents running without an interactive terminal should start the server in the background and poll the health endpoint until ready:
 
-### Start Daemon in Background:
+### Start Daemon in Background (Linux / WSL2):
 ```bash
 nohup ./run.sh --no-api-key > hydragen_run.log 2>&1 < /dev/null &
+```
+
+### Windows Service Management:
+On Windows, Hydragen can be registered and run as a permanent background service:
+```powershell
+# Register and start as a Windows Service (Administrative prompt required):
+& "C:\Hydragen\install-service.ps1"
+
+# Safe restart & release port 8080:
+& "C:\Hydragen\restart-service.bat"
+
+# Quick status check:
+& "C:\Hydragen\status-service.bat"
+```
+
+### Non-Interactive Hardware Tuning & Capacity Optimization:
+Agents can calibrate and apply optimal settings without manual prompt interaction:
+```bash
+# Auto-tune with log-derived context recommendation and balanced concurrency:
+python tune_hydragen.py --preset balanced --ctx auto --mode desktop --apply
+
+# Auto-tune for high concurrency on 24 GB GPUs with 200k context:
+python tune_hydragen.py --preset max-concurrency --ctx 200k --mode desktop --apply
 ```
 
 ### Wait / Poll for Readiness (Python Script):

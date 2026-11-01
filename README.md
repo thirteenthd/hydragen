@@ -274,6 +274,28 @@ Or invoke directly via the `hydragen` CLI entrypoint:
 hydragen --config hydragen.json --port 8080 --api-monitor
 ```
 
+### Running as a Windows Background Service (services.msc)
+
+Hydragen can be installed as a native Windows Service (`Hydragen AI Local Server`) managed by NSSM:
+
+1. **Install and Register Service:**
+   - Double-click **`install-as-windows-service.bat`** (or run `powershell -ExecutionPolicy Bypass -File .\install-service.ps1` as Administrator).
+   - This automatically replaces any legacy Strata service, registers `Hydragen`, configures `SERVICE_AUTO_START` (starts on Windows boot), and starts the server immediately on port 8080.
+2. **Service Management Utilities:**
+   ```powershell
+   .\restart-service.bat    # Gracefully cycle the service and release port 8080
+   .\stop-service.bat       # Stop the background service
+   .\start-service.bat      # Start the background service
+   .\status-service.bat     # Check running state and active port 8080 listeners
+   .\uninstall-from-windows-service.bat  # Cleanly unregister from services.msc
+   ```
+3. **Manage via Windows Services (`services.msc`):**
+   ```powershell
+   Start-Service Hydragen
+   Stop-Service Hydragen
+   Restart-Service Hydragen
+   ```
+
 ### Endpoints
 - **Web Chat & Live Monitor:** `http://localhost:8080/#monitor`
 - **OpenAI Chat Completions:** `POST http://localhost:8080/v1/chat/completions`
@@ -333,7 +355,62 @@ All settings can be specified in `hydragen.json` or passed as command-line argum
 
 ---
 
-## 7. Attribution & Acknowledgments
+## 7. Interactive Hardware Tuner & Capacity Calculator (`tune.bat` / `tune.ps1`)
+
+Hydragen includes an interactive, multi-tier hardware calibration and auto-tuning wizard ([`tune_hydragen.py`](tune_hydragen.py)) designed to benchmark and optimize your local install:
+
+```powershell
+# Interactive Wizard (CMD / Explorer)
+.\tune.bat
+
+# Interactive Wizard (PowerShell)
+powershell -ExecutionPolicy Bypass -File .\tune.ps1
+
+# Run with live decode & prefill latency benchmark
+.\tune.bat --benchmark
+
+# Non-interactive preset application
+.\tune.bat --preset max-concurrency --ctx auto --apply
+```
+
+### The 5-Step Tuning Workflow
+
+```mermaid
+flowchart TD
+    HW["Hardware Detection & Baseline Benchmark"] --> Mode["Environment: Normal Desktop vs. Headless Server"]
+    Mode --> Model["Model Selection: IQ3_S vs. IQ3_XXS"]
+    Model --> Engine["Engine Architecture: Strata (Peak Latency) vs. vLLM (Batching)"]
+    Engine --> CTX["Log-Driven Context Demand Analysis (32k / 64k / 128k / 200k)"]
+    CTX --> Concurrency["Concurrency Target: 1 Solo / 2 Balanced / 4 Max Slots"]
+    Concurrency --> AutoTune["Auto-Calculate Resident Experts, PCIe Frac & Cache Slots"]
+    AutoTune --> Apply["Write to hydragen.json & Option to Restart Service"]
+```
+
+1. **Hardware Detection & Baseline Benchmark:** Automatically detects GPU VRAM, free memory, CPU topology, system RAM, and optionally runs a live hardware calibration sweep measuring decode speed and PCIe round-trip latency.
+2. **Environment Mode (VRAM Headroom):**
+   * **Normal Desktop PC:** Windows 11 DWM, GPU monitors, and desktop apps reserve **1,024 MiB** VRAM (`--vram-reserve-mib 1024`) to eliminate display stuttering and TDR driver resets.
+   * **Headless Server / Dedicated GPU:** Reduces reservation to **448 MiB**, unlocking ~600 MiB of VRAM to host **350+ extra resident experts**.
+3. **Model Selection:** Recommends models based on available VRAM and RAM:
+   * **`IQ3_S` (Recommended for 24 GB GPUs + 64 GB+ RAM):** Highest fidelity quantization (~83.6 GB pack); holds **2,400+ resident experts** in VRAM with high cache hit rates (~85–92%).
+   * **`IQ3_XXS` (Recommended for 12 GB–16 GB GPUs):** Balanced footprint (~76.5 GB pack); holds **2,200–2,800 resident experts**.
+4. **Log-Driven Context Window Auto-Detection:**
+   Before asking for a context window, the tuner analyzes your historical server logs (`hydragen.log`, `hydragen-service.log`, and `strata-service.log`), extracts historical request lengths, computes statistical percentiles, and auto-selects the optimal context threshold:
+   
+   | Workload Pattern | Threshold Criteria | Auto-Suggested Context | Benefit / Rationale |
+   | :--- | :--- | :--- | :--- |
+   | **Light Chat & Q&A** | $C_{\max} \le 28\text{k}$ and $P_{95} \le 24\text{k}$ | **32k (`32768`)** | Saves ~180 MiB VRAM; frees up room for **100+ additional resident experts** in VRAM. |
+   | **Standard Documents & Summaries** | $C_{\max} \le 58\text{k}$ and $P_{95} \le 48\text{k}$ | **64k (`65536`)** | Full headroom for moderate chats while saving ~120 MiB VRAM. |
+   | **Deep Research & Medium Codebases** | $C_{\max} \le 120\text{k}$ and $P_{95} \le 105\text{k}$ | **128k (`131072`)** | Safely covers 99%+ of multi-turn sessions with room for thinking budgets. |
+   | **Ultra-Long Multi-File Code / Large Dumps** | $C_{\max} > 120\text{k}$ or $P_{95} > 105\text{k}$ | **200k (`204800`)** | **Prevents HTTP 400 Context Overflow crashes** on large prompt sessions. |
+
+5. **Concurrency Profile & 200k Capacity on 24 GB VRAM + 128 GB RAM:**
+   * **`--kv int8` (1,056 Bytes/token):** Thanks to Flash-Next's hybrid architecture (4 QSA attention layers + 44 recurrent GDN layers), a full 200k context consumes only **206.2 MiB per stream**.
+   * **KV Streaming (`--kv-resident 32768`):** Keeps 32k tokens in VRAM (33.0 MiB) and streams the 168k tail (173.2 MiB) from host RAM over PCIe 4.0 x16.
+   * **Capacity Limits:** Supports **4 active simultaneous generating streams** (`--batch 4` at ~15–18 tok/s each, or 2 slots at ~30 tok/s each) and holds **over 350 resident 200k conversations in 128 GB RAM** (`--conversation-cache-mib 40960 --conversation-cache-slots 16+`) with zero re-prefill delay on session resumption.
+
+---
+
+## 8. Attribution & Acknowledgments
 
 Hydragen builds upon and brings together two foundational open-source AI projects:
 
