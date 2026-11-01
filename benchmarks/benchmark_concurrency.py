@@ -31,6 +31,18 @@ PROMPTS = [
         "Implement a custom React hook in TypeScript `useReconnectingWebSocket` that handles heartbeats, "
         "exponential backoff reconnection, and message batching with clean cleanup on unmount."
     ),
+    (
+        "Request D (Distributed Systems)",
+        "Explain the Raft consensus algorithm leader election and log replication steps. Detail how split-brain conditions are prevented."
+    ),
+    (
+        "Request E (Security & Auth)",
+        "Write an OAuth 2.0 PKCE flow explanation for single-page applications. Include code examples for code verifier and challenge generation."
+    ),
+    (
+        "Request F (Algorithms / Graph)",
+        "Implement Dijkstra's shortest path algorithm in C++ using a priority queue. Provide time and space complexity analysis."
+    ),
 ]
 
 
@@ -159,7 +171,7 @@ def run_benchmark(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--concurrency", type=int, default=2, choices=[1, 2, 3, 4])
+    parser.add_argument("--concurrency", type=int, default=2, choices=[1, 2, 3, 4, 5, 6])
     parser.add_argument("--url", type=str, default="http://127.0.0.1:8080/v1/chat/completions")
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--no-warmup", action="store_true")
