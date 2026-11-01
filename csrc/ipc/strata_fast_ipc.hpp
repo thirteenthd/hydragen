@@ -44,6 +44,12 @@ void strata_fast_ipc_set_control_callback(strata_fast_ipc_t* ipc, strata_control
 int32_t strata_fast_ipc_read_token(strata_fast_ipc_t* ipc, int32_t slot, int32_t* out_token, int32_t timeout_ms);
 
 /**
+ * Clears and resets the ring buffer for a given slot.
+ * Call before starting a new batch request in this slot to guarantee no stale tokens or EOF markers.
+ */
+void strata_fast_ipc_clear_slot(strata_fast_ipc_t* ipc, int32_t slot);
+
+/**
  * Stop the background reader thread.
  */
 void strata_fast_ipc_stop(strata_fast_ipc_t* ipc);
