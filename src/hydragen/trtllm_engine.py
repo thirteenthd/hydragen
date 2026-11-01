@@ -275,18 +275,22 @@ class TRTLLMEngine:
             return self.backend.pop_prefill_burst()
         return val
 
+    @property
     def prefill_tok_s_mean(self) -> Optional[float]:
         if self._active_prefill_tok_s is not None:
             return self._active_prefill_tok_s
         if self.backend is not None and hasattr(self.backend, "prefill_tok_s_mean"):
-            return self.backend.prefill_tok_s_mean()
+            val = getattr(self.backend, "prefill_tok_s_mean")
+            return val() if callable(val) else val
         return self._last_prefill_tok_s
 
+    @property
     def progress(self) -> Optional[Tuple[int, int]]:
         if self._active_prompt_progress is not None:
             return self._active_prompt_progress
         if self.backend is not None and hasattr(self.backend, "progress"):
-            return self.backend.progress()
+            val = getattr(self.backend, "progress")
+            return val() if callable(val) else val
         return None
 
     @property
