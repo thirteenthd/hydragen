@@ -14,6 +14,9 @@ extern "C" {
 // Opaque handle for Fast IPC instance
 typedef struct strata_fast_ipc_t strata_fast_ipc_t;
 
+// Callback signature for forwarding control lines (BSTAT, PSTAT, INFO, etc.)
+typedef void (*strata_control_callback_fn)(const char* line, void* user_data);
+
 /**
  * Creates and starts a high-performance C++ IPC reader thread over the engine's stdout file descriptor.
  * @param stdout_fd File descriptor of child process's stdout (e.g. proc.stdout.fileno())
@@ -21,6 +24,12 @@ typedef struct strata_fast_ipc_t strata_fast_ipc_t;
  * @return Pointer to initialized strata_fast_ipc_t, or nullptr on error.
  */
 strata_fast_ipc_t* strata_fast_ipc_create(int stdout_fd, int num_slots);
+
+/**
+ * Register a callback for non-token control lines (BSTAT, PSTAT, INFO, DONE, ERR, etc.)
+ * Allows the C++ reader to take exclusive ownership of stdout while preserving server telemetry.
+ */
+void strata_fast_ipc_set_control_callback(strata_fast_ipc_t* ipc, strata_control_callback_fn cb, void* user_data);
 
 /**
  * Reads the next token for a given batch slot directly from the lock-free ring buffer.
