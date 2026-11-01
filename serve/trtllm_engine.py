@@ -126,10 +126,19 @@ class TRTLLMEngine:
             env_cfg.get("STRATA_ROUTE_PRIOR", os.environ.get("STRATA_ROUTE_PRIOR", "0.8"))
         )
 
+        args = self.cfg.get("args") or []
+        native_arg = None
+        if isinstance(args, list) and "--native" in args:
+            try:
+                native_arg = args[args.index("--native") + 1]
+            except (ValueError, IndexError):
+                pass
+
         shard = (
             model_shard
             or self.cfg.get("native")
             or self.cfg.get("model")
+            or native_arg
             or os.environ.get("HYDRAGEN_MODEL")
             or self._find_fallback_model()
         )
