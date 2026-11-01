@@ -1,5 +1,5 @@
 @echo off
-title Hydragen Engine Performance & Concurrency Tuner
+title Hydragen Engine Performance and Concurrency Tuner
 cd /d "%~dp0"
 
 set "PYTHON=%~dp0.venv\Scripts\python.exe"
