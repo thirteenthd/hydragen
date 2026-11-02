@@ -179,7 +179,10 @@ class TRTLLMEngine:
                 print(f"[hydragen:trtllm] Native TRT-LLM Executor init warning: {e}. Falling back to Strata resident backend.")
 
         if self.trt_executor is None and "exe" in self.cfg:
-            from serve.server import StrataEngine, engine_args
+            try:
+                from hydragen.server.server import StrataEngine, engine_args
+            except ImportError:
+                from serve.server import StrataEngine, engine_args
 
             exe = (
                 self.cfg["exe"]

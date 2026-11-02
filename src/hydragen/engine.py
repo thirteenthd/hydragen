@@ -88,7 +88,10 @@ class VLLMEngine:
         # 2. Initialize Resident 48-Layer Neural Network Backend (unless standalone Triton test)
         self.backend = None
         if not self.standalone_triton_only and "exe" in self.cfg:
-            from serve.server import StrataEngine, engine_args
+            try:
+                from hydragen.server.server import StrataEngine, engine_args
+            except ImportError:
+                from serve.server import StrataEngine, engine_args
 
             exe = (
                 self.cfg["exe"]

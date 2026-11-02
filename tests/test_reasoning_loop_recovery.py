@@ -1,8 +1,12 @@
 """CPU-only regression for opt-in reasoning recovery: python -m unittest serve.test_reasoning_loop_recovery."""
 import threading
 import unittest
-from serve.server import (Service, ByteTokenizer, MockEngine, HIGH_EFFORT,
-                          reasoning_repeat_coverage, focused_recovery_prompt)
+try:
+    from hydragen.server.server import (Service, ByteTokenizer, MockEngine, HIGH_EFFORT,
+                                       reasoning_repeat_coverage, focused_recovery_prompt)
+except ImportError:
+    from serve.server import (Service, ByteTokenizer, MockEngine, HIGH_EFFORT,
+                              reasoning_repeat_coverage, focused_recovery_prompt)
 
 
 class Tokenizer(ByteTokenizer):
@@ -102,7 +106,10 @@ class ReasoningLoopRecovery(unittest.TestCase):
 
     def test_the_splice_keeps_a_literal_think_tag_as_text(self):
         """#537: the prompt is spliced as token ids, never decoded and encoded again."""
-        from serve.frontend import THINK_TAGS
+        try:
+            from hydragen.server.frontend import THINK_TAGS
+        except ImportError:
+            from serve.frontend import THINK_TAGS
         head = '<|im_start|>system\n' + HIGH_EFFORT
         marked = self.tok.encode(head + '<|im_end|>\n<|im_start|>user\nquote ' + THINK_TAGS['</think>'] +
                                  ' please<|im_end|>\n<|im_start|>assistant\n<think>\n', parse_special=True)

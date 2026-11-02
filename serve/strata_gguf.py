@@ -1,16 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""serve/strata_gguf.py - Re-exports StrataGGUFMoELoader & StrataCUDAKernelBridge from strata_vllm."""
+"""Compatibility shim redirecting to hydragen.server.strata_gguf."""
+import sys
+from hydragen.server import strata_gguf as _mod
+from hydragen.server.strata_gguf import *  # noqa: F401, F403
 
-from hydragen.gguf_loader import (
-    CUSTOM_STRATA_TYPES,
-    StrataCUDAKernelBridge,
-    StrataGGUFMoELoader,
-    register_strata_gguf_types,
-)
+if hasattr(_mod, "__all__"):
+    __all__ = _mod.__all__
 
-__all__ = [
-    "CUSTOM_STRATA_TYPES",
-    "StrataCUDAKernelBridge",
-    "StrataGGUFMoELoader",
-    "register_strata_gguf_types",
-]
+sys.modules[__name__] = _mod
