@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Test module forwarding shims between serve and hydragen."""
+import os
+import sys
+
+repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
 import serve.server
 import hydragen.server.server
 assert serve.server is hydragen.server.server
