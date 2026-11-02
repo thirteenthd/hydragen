@@ -19,6 +19,9 @@ print("serve.frontend is hydragen.server.frontend: OK")
 
 import serve.trtllm_engine
 import hydragen.trtllm_engine
+print("serve.trtllm_engine:", serve.trtllm_engine)
+print("hydragen.trtllm_engine:", hydragen.trtllm_engine)
+print("sys.modules['serve.trtllm_engine']:", sys.modules.get("serve.trtllm_engine"))
 assert serve.trtllm_engine is hydragen.trtllm_engine
 print("serve.trtllm_engine is hydragen.trtllm_engine: OK")
 
