@@ -55,11 +55,11 @@ class PagedExpertManager:
         self.pcie_bytes_transferred: int = 0
 
         # Create dedicated CUDA stream first so CUDA context & stream memory are accounted for
-        self.dma_stream = torch.cuda.Stream(device=device)
+        self.dma_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
 
         if self.compressed_cache and self.loader is not None:
             self.max_blob_bytes = self.MAX_COMPRESSED_BLOB_BYTES
-            if torch.cuda.is_available():
+            if device.type == "cuda" and torch.cuda.is_available():
                 free_b, _ = torch.cuda.mem_get_info(device)
                 # Leave >=110 MiB for Triton/CUDA scratch workspaces
                 usable_b = max(

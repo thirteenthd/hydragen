@@ -56,4 +56,22 @@ PAGED_KV_API int32_t paged_kv_export_tables(
 
 PAGED_KV_API void paged_kv_get_stats(void* handle, CPagedKVStats* out_stats);
 
+PAGED_KV_API void paged_attention_decode(
+    float* out,
+    const float* q,
+    const void* k_cache,
+    const void* v_cache,
+    const int32_t* block_tables,
+    const int32_t* context_lens,
+    int32_t num_seqs,
+    int32_t num_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t block_size,
+    int32_t max_blocks,
+    float scale,
+    int32_t is_int8_kv,
+    void* stream
+);
+
 }

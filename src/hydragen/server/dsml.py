@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from serve.frontend import Event, OutputParser
+from hydragen.server.frontend import Event, OutputParser
 
 DSML = "｜DSML｜"
 _OPEN = "<" + DSML

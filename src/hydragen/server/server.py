@@ -76,32 +76,32 @@ for _cand in reversed(_paths):
         if _cand in sys.path:
             sys.path.remove(_cand)
         sys.path.insert(0, _cand)
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+from hydragen.server.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
                             tool_choice_of, unmark_think_literals)
-from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
-from serve import runconfig  # noqa: E402
-from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
+from hydragen.server.mcp import McpCancelled, hub_from_config  # noqa: E402
+from hydragen.server import runconfig  # noqa: E402
+from hydragen.server.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
 from strata_control import tls  # noqa: E402
 
 tls.install()       # #3722: image URLs and tool servers over HTTPS are checked against the operating system's certificates
 from strata_control import hipblaslt_tuning  # noqa: E402
 from strata_control import vision_reader  # noqa: E402
-from serve.ds_pictures import DsPictures  # noqa: E402
+from hydragen.server.ds_pictures import DsPictures  # noqa: E402
 from strata_control import draft_layer  # noqa: E402
 from strata_control import drafting  # noqa: E402
 from strata_control import user_args  # noqa: E402
 from strata_control import gpu_roles  # noqa: E402
-from serve import ready as ready_file  # noqa: E402
-from serve import owner_guard  # noqa: E402
-from serve import launch_identity  # noqa: E402
-from serve import logit_bias as bias_api  # noqa: E402
-from serve import lifeline  # noqa: E402
-from serve.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
-from serve import responses as responses_api  # noqa: E402
-from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
-from serve import images as images_api  # noqa: E402
+from hydragen.server import ready as ready_file  # noqa: E402
+from hydragen.server import owner_guard  # noqa: E402
+from hydragen.server import launch_identity  # noqa: E402
+from hydragen.server import logit_bias as bias_api  # noqa: E402
+from hydragen.server import lifeline  # noqa: E402
+from hydragen.server.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
+from hydragen.server import responses as responses_api  # noqa: E402
+from hydragen.server.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
+from hydragen.server import images as images_api  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -398,75 +398,19 @@ class MockEngine:
             yield t
 
 
-class EngineDied(RuntimeError):
-    """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
-
-
-class EngineStarting(RuntimeError):
-    """The engine is (re)starting and has not said READY yet (#344): no context size to plan a request with - a 503,
-    not a 400 about the prompt."""
-
-
-class ClientGone(Exception):
-    """#1999: the client hung up while its request was being prepared (an image URL downloading, a picture encoding or
-    waiting for its turn): nothing is left to answer."""
-
-
-class ModelBusy(RuntimeError):
-    """Explicit model controls must not interrupt active or queued requests."""
-
-
-class QueueWaitExpired(RuntimeError):
-    """An inference call waited too long for its first engine turn."""
-
-
-class QueueCancelled(RuntimeError):
-    """The client left before its first serial engine turn."""
-
-
-class EngineSilent(EngineDied):
-    """#481: the engine said nothing for too long during a request (or never acknowledged a STOP): the two sides lost
-    step - the engine waiting for its next command, the server for this request's end - and the server ended it.  An
-    EngineDied, so the request ends with an error and the next one starts the engine again."""
-
-
-class EngineNonFinite(ValueError):
-    """#879: the engine's DONE (or a slot's BDONE) said `nonfinite`: a window's logits held a NaN or an infinity.  The
-    engine wrote none of that window's tokens and drops every cached state that may carry the poison, so its next
-    request reads the prompt from token 0.  Service.run sends a request that had produced nothing yet once more, and
-    ends one that had started (as "length").  A ValueError, so a stream that has started reports it as an error event."""
-
-
-class SessionRefused(ValueError):
-    """Disk sessions: the engine refused or failed a SAVE / RESTORE and is still in step (`SERR <kind> <published>
-    <reason>`).  `kind` is the engine's category - invalid (400), storage (507), memory (503), io (500); `published`:
-    a save whose new file already replaced the old one before a later step (the folder flush) failed."""
-
-    STATUS = {"invalid": 400, "storage": 507, "memory": 503, "io": 500}
-
-    def __init__(self, kind: str, message: str, published: bool = False):
-        super().__init__(message)
-        self.kind = kind if kind in self.STATUS else "io"
-        self.published = published
-
-    @property
-    def status(self) -> int:
-        return self.STATUS[self.kind]
-
-
-class EngineStuck(RuntimeError):
-    """The engine process did not end after QUIT, terminate and kill: the server keeps it (and says so) rather than
-    reporting its GPU and RAM as given back."""
-
-
-class GpuBusy(RuntimeError):
-    """The model is unloaded and the GPU has less free VRAM than min_free_vram_mib: something else (a game, another
-    model server) is using it, so the engine is not started into the little that is left.  `retry_after`: seconds
-    for the Retry-After header of the 503."""
-
-    def __init__(self, message="", retry_after=None):
-        super().__init__(message)
-        self.retry_after = retry_after
+from hydragen.server.exceptions import (
+    ClientGone,
+    EngineDied,
+    EngineNonFinite,
+    EngineSilent,
+    EngineStarting,
+    EngineStuck,
+    GpuBusy,
+    ModelBusy,
+    QueueCancelled,
+    QueueWaitExpired,
+    SessionRefused,
+)
 
 
 # The page's only CSP directive: its preview frames (srcdoc) may not load any address. Other directives are left out
@@ -618,7 +562,7 @@ def start_exit_note(rc: int | None, exe=None) -> str:
         return ""
     note = f"\nthe engine process ended: {words}"
     try:                                            # 0xC0000135: say which DLL (the loader prints nothing)
-        from serve.loader_diag import missing_note
+        from hydragen.server.loader_diag import missing_note
         note += missing_note(rc, exe)
     except Exception:
         pass
@@ -871,7 +815,7 @@ def btrace(*a):
         print("[batch-trace]", threading.get_ident() % 10000, *a, file=sys.stderr, flush=True)
 
 
-EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
+EOS_IDS = {248044, 248046, 151643, 151644, 151645, 128001, 128009}   # default --eos-ids across DeepSeek, Qwen, and Llama (no ASCII punctuation)
 
 
 # The engine's own words for a verifier that cannot go on (its GPU waits were released, or an earlier window never
@@ -1018,6 +962,7 @@ class StrataEngine:
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
+        self.eos_ids = set(EOS_IDS)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.terminal_stages: list[dict] = []  # final layer ranges from this engine start's bounded stderr log
@@ -1209,8 +1154,59 @@ class StrataEngine:
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
         self.wlock = threading.Lock()                   # stdin writes from several request threads
-        self.pump = threading.Thread(target=self._pump, daemon=True)
-        self.pump.start()
+
+        # Bottleneck 5: Fast C++ Lock-Free SPSC IPC
+        self.fast_ipc = None
+        use_fast_ipc = os.environ.get("STRATA_FAST_IPC", "1") != "0"
+        if use_fast_ipc:
+            try:
+                from hydragen.fast_ipc import FastEngineIPC
+                if self.proc is not None and getattr(self.proc, "stdout", None) is not None:
+                    self.fast_ipc = FastEngineIPC(self.proc.stdout.fileno(), num_slots=max(8, self.batch))
+                    if self.fast_ipc.is_available:
+                        def _on_ctl(line_str: str):
+                            if line_str == "EOF":
+                                self.lines.put(None)
+                                for q in self.slot_q:
+                                    q.put(None)
+                                return
+                            if line_str.startswith(FATAL_PREFIXES):
+                                if self.proc is not None:
+                                    self.silent_note = "Unrecoverable native verification failure: " + line_str[4:].strip()
+                                    self.ended = True
+                                try:
+                                    self.proc.terminate()
+                                except OSError:
+                                    pass
+                                return
+                            if line_str.startswith("BSTAT"):
+                                sample = parse_batch_window_sample(line_str)
+                                if sample is not None:
+                                    self.terminal_batch_sample = {**sample, "observed_monotonic": time.monotonic()}
+                                return
+                            if line_str.startswith("PSTAT"):
+                                sample = parse_stage_in_flight_sample(line_str)
+                                if sample is not None:
+                                    self.terminal_stage_sample = {**sample, "observed_monotonic": time.monotonic()}
+                                return
+                            if line_str.startswith("BDONE ") and self.slot_q:
+                                try:
+                                    self.slot_q[int(line_str.split()[1])].put(line_str)
+                                except (IndexError, ValueError):
+                                    pass
+                            self.lines.put(line_str)
+
+                        self.fast_ipc.set_control_callback(_on_ctl)
+                        print(f"[strata] Fast C++ Lock-Free IPC active on fd {self.proc.stdout.fileno()} ({max(1, self.batch)} slots)", flush=True)
+            except Exception as e:
+                print(f"[strata] Fast IPC init note: {e}", flush=True)
+                self.fast_ipc = None
+
+        if self.fast_ipc is None or not self.fast_ipc.is_available:
+            self.pump = threading.Thread(target=self._pump, daemon=True)
+            self.pump.start()
+        else:
+            self.pump = None
 
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
@@ -1938,7 +1934,8 @@ class StrataEngine:
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
-                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
+                        eos_set = getattr(self, "eos_ids", EOS_IDS) | EOS_IDS
+                        if cancel.is_set() or left <= 0 or (out and out[-1] in eos_set):
                             return
                         if reused0 is None:
                             reused0 = (self.last or {}).get("reused")
@@ -2007,6 +2004,8 @@ class StrataEngine:
                         holding, born = True, self.gen                  # (the engine it now has the control lines of)
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
+                    if getattr(self, "fast_ipc", None) is not None and self.fast_ipc.is_available:
+                        self.fast_ipc.clear_slot(slot)
                     head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
                     live = {"slot": slot, "request_id": getattr(cancel, "_strata_request_id", None),
                             "state": "reading", "prompt_tokens": len(prompt), "prompt_read": 0, "generated": 0,
@@ -2102,32 +2101,72 @@ class StrataEngine:
                 gen0 = len(out) - 1                         # the admission's own token: the slot feeds it first
                 going_solo = False
                 while True:
-                    try:
-                        line = self.slot_q[slot].get(timeout=10.0)
-                    except queue.Empty:
-                        if cancel.is_set() and not stop_sent:
-                            self._send(f"BSTOP {slot}")
-                            stop_sent = True
-                        yield None
-                        continue
-                    if line is None:
-                        phase = "none"
-                        raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
-                    if line.startswith("BT "):
-                        t = int(line.split()[2])
-                        out.append(t)
-                        live["generated"] = len(out)
-                        if cancel.is_set():
-                            if not stop_sent:
+                    line = None
+                    if getattr(self, "fast_ipc", None) is not None and self.fast_ipc.is_available:
+                        try:
+                            t = self.fast_ipc.read_token(slot, timeout_ms=500)
+                        except StopIteration:
+                            line = None
+                            try:
+                                line = self.slot_q[slot].get(timeout=2.0)
+                            except queue.Empty:
+                                line = None
+                            if line is None:
+                                break
+                            t = None
+                        except Exception as e:
+                            phase = "none"
+                            raise EngineDied(f"the engine stopped unexpectedly: {e}")
+
+                        if t is not None:
+                            out.append(t)
+                            live["generated"] = len(out)
+                            if cancel.is_set():
+                                if not stop_sent:
+                                    self._send(f"BSTOP {slot}")
+                                    stop_sent = True
+                                continue
+                            yield t
+                            if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
+                                                                                      embeddings):
+                                self._send(f"BSTOP {slot}")         # alone now: on with the drafts (below)
+                                going_solo = True
+                            continue
+                        elif line is None:
+                            if cancel.is_set() and not stop_sent:
                                 self._send(f"BSTOP {slot}")
                                 stop_sent = True
+                            yield None
                             continue
-                        yield t
-                        if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
-                                                                                  embeddings):
-                            self._send(f"BSTOP {slot}")         # alone now: on with the drafts (below)
-                            going_solo = True
-                    elif line.startswith("BDONE "):
+                    else:
+                        try:
+                            line = self.slot_q[slot].get(timeout=10.0)
+                        except queue.Empty:
+                            if cancel.is_set() and not stop_sent:
+                                self._send(f"BSTOP {slot}")
+                                stop_sent = True
+                            yield None
+                            continue
+                        if line is None:
+                            phase = "none"
+                            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                        if line.startswith("BT "):
+                            t = int(line.split()[2])
+                            out.append(t)
+                            live["generated"] = len(out)
+                            if cancel.is_set():
+                                if not stop_sent:
+                                    self._send(f"BSTOP {slot}")
+                                    stop_sent = True
+                                continue
+                            yield t
+                            if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
+                                                                                      embeddings):
+                                self._send(f"BSTOP {slot}")         # alone now: on with the drafts (below)
+                                going_solo = True
+                            continue
+
+                    if line.startswith("BDONE "):
                         phase = "none"
                         f = line.split()
                         self._apply_bdone(f)
@@ -2173,8 +2212,13 @@ class StrataEngine:
             except EngineDied:
                 pass
             bdone_in = False
-            if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and self.gen == born:
-                bd = self._bdone_after_eos(slot)            # (#1869) the slot's figures, not the admission's
+            eos_set = getattr(self, "eos_ids", EOS_IDS) | EOS_IDS
+            if phase == "slot" and slot is not None and self.gen == born:
+                bd = None
+                if (out and out[-1] in eos_set) or (left is not None and len(out) >= left) or (isinstance(max_new, (int, float)) and len(out) >= int(max_new)):
+                    bd = self._bdone_after_eos(slot, wait_s=1.0)
+                elif not self.slot_q[slot].empty():
+                    bd = self._bdone_after_eos(slot, wait_s=0.2)
                 if bd is not None:
                     self._apply_bdone(bd.split())
                     bdone_in = True
@@ -2275,10 +2319,15 @@ class StrataEngine:
                     view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b])})
                 continue
             ft = r.get("first_token")
+            tok_s = None
+            if ft and r.get("state") == "decoding" and now > ft:
+                dt = now - ft
+                if dt >= 0.05 and r.get("generated", 0) > 0:
+                    tok_s = round(r["generated"] / dt, 1)
             view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
                          "prompt_read": r.get("prompt_read") if r["state"] == "reading" else None,
                          "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
-                         "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None,
+                         "tok_s": tok_s,
                          "prefill_tok_s": r.get("prefill_tok_s")})
         return view
 
@@ -2619,6 +2668,12 @@ class StrataEngine:
             pass
         finally:
             if self.proc.poll() is not None:
+                if getattr(self, "fast_ipc", None) is not None:
+                    try:
+                        self.fast_ipc.close()
+                    except Exception:
+                        pass
+                    self.fast_ipc = None
                 if self.pump is not None and self.pump.ident is not None:   # a restart can stop before starting it
                     self.pump.join(timeout=2)
                 try:
@@ -3462,7 +3517,7 @@ def igpu_cards(indices: list[int], archs: dict[int, str] | None) -> set[int]:
 def gpu_vram_mib(indices: list[int], hip: bool = False) -> dict[int, int] | None:
     """Total VRAM of each card in MiB (NVML / amdgpu sysfs); None when any of them cannot be read."""
     try:
-        from serve.telemetry import gpu_reader
+        from hydragen.server.telemetry import gpu_reader
     except ImportError:
         return None
     out = {}
@@ -3799,74 +3854,10 @@ def vision_env(cfg: dict, env: dict, archs: dict[int, str] | None = None) -> dic
     return env
 
 
-class ByteTokenizer:
-    """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
-    SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
-
-    ALWAYS = ()                                     # specials matched without parse_special (type 4, as <think>)
-
-    @property
-    def max_special_len(self):
-        return max(len(s) for s in self.SPECIALS)
-
-    @property
-    def control_tokens(self):
-        return [s for s in self.SPECIALS if s not in self.ALWAYS]
-
-    def encode(self, text, parse_special=False, plain=()):
-        return self.encode_marked(text, parse_special, plain)[0]
-
-    def encode_marked(self, text, parse_special=False, plain=()):
-        """encode() and its resume points (after each special), as strata_tokenizer's for PromptEncoder."""
-        out, marks, i = [], [], 0
-        while i < len(text):
-            for k, s in enumerate(self.SPECIALS):
-                if (parse_special or s in self.ALWAYS) and text.startswith(s, i) and not any(
-                        a <= i < b for a, b in plain):
-                    out.append(256 + k)
-                    i += len(s)
-                    marks.append((i, len(out)))
-                    break
-            else:
-                out.extend(text[i].encode("utf-8"))
-                i += 1
-        return out, marks
-
-    def decode(self, ids, errors="replace"):
-        raw = bytearray()
-        for t in ids:
-            raw += self.SPECIALS[t - 256].encode() if t >= 256 else bytes([t])
-        return raw.decode("utf-8", errors=errors)
+from hydragen.server.tokenizer import ByteTokenizer, Detokenizer, StopMatcher
 
 
 # ------------------------------------------------------------------------------------------------ core
-class Detokenizer:
-    """Incremental decode: each token's bytes go through an incremental UTF-8 decoder, which emits the complete
-    characters and holds a multi-byte character split across tokens until it is complete (invalid bytes become
-    U+FFFD, as a whole decode with errors="replace" makes them).  Constant time per token - the old re-decode of
-    every generated id cost 2 ms per token after 8K tokens and 4 ms after 16K (perf-review F-1).  A tokenizer
-    without `token_bytes` (the tests' byte tokenizer) keeps the re-decode."""
-
-    def __init__(self, tok):
-        self.tok, self.ids, self.sent = tok, [], 0
-        self.inc = codecs.getincrementaldecoder("utf-8")(errors="replace") if hasattr(tok, "token_bytes") else None
-
-    def pending(self) -> bool:
-        """A character is split across the tokens so far: its first bytes are held."""
-        if self.inc is not None:
-            return bool(self.inc.getstate()[0])
-        return self.tok.decode(self.ids).endswith("\ufffd")
-
-    def push(self, t: int) -> str:
-        if self.inc is not None:
-            return self.inc.decode(self.tok.token_bytes(t))
-        self.ids.append(t)
-        text = self.tok.decode(self.ids)
-        if text.endswith("�"):
-            return ""
-        delta, self.sent = text[self.sent:], len(text)
-        return delta
-
 
 OPENAI_MAX_STOP = 4                                  # OpenAI's limit on `stop`
 
@@ -3925,38 +3916,7 @@ def stop_strings(req: dict) -> list[str]:
     return [x for x in stop if x]
 
 
-class StopMatcher:
-    """Cuts the answer's text at the first stop string.  Text that could still be the start of a stop string is held
-    back (only that tail, never more), so a stop string split across tokens or chunks is still found and never sent."""
 
-    def __init__(self, stops: list[str]):
-        self.stops, self.held, self.hit = stops, "", None
-
-    def push(self, text: str) -> str:
-        """-> the text that is safe to send now; after a match, self.hit is the stop string and nothing more comes."""
-        if self.hit is not None:
-            return ""
-        buf = self.held + text
-        first = None
-        for s in self.stops:
-            i = buf.find(s)
-            if i >= 0 and (first is None or i < first[0]):
-                first = (i, s)
-        if first is not None:
-            self.held, self.hit = "", first[1]
-            return buf[:first[0]]
-        keep = 0                                      # the longest end of buf that a stop string starts with
-        for s in self.stops:
-            for k in range(min(len(s) - 1, len(buf)), keep, -1):
-                if buf.endswith(s[:k]):
-                    keep = k
-                    break
-        self.held = buf[len(buf) - keep:] if keep else ""
-        return buf[:len(buf) - keep]
-
-    def flush(self) -> str:
-        held, self.held = self.held, ""
-        return held
 
 
 
@@ -4074,7 +4034,7 @@ class Service:
         # /metrics/prometheus' two throughput gauges need the totals as they stood at the last scrape, because
         # llama.cpp averages them over the window between two scrapes (#2341).
         self.scrape_bucket = (0, 0.0, 0, 0.0)
-        from serve.prometheus import Latencies
+        from hydragen.server.prometheus import Latencies
         self.latencies = Latencies()                     # GET /metrics in Prometheus text: the latency histograms
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
@@ -4108,6 +4068,9 @@ class Service:
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        EOS_IDS.update(self.stop_ids)
+        if hasattr(self.engine, "eos_ids"):
+            self.engine.eos_ids.update(self.stop_ids)
         self.family = None                              # the model family ("deepseek41"): set_family() below
         self.parser_cls = OutputParser                  # reads the model's output (reasoning, content, tool calls)
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
@@ -4127,12 +4090,15 @@ class Service:
         token, DSML tool calls, reasoning-effort words).  The others keep the defaults."""
         self.family = family
         if family == "deepseek41":
-            from serve import dsml
+            from hydragen.server import dsml
             eos = (getattr(self.tok, "special_ids", None) or {}).get("eos", 1)
             self.stop_ids = {int(eos)}
+            EOS_IDS.update(self.stop_ids)
+            if hasattr(self.engine, "eos_ids"):
+                self.engine.eos_ids.update(self.stop_ids)
             self.parser_cls = dsml.DsmlOutputParser
             self._force_text = dsml.to_dsml_force
-        import serve.frontend as _frontend
+        import hydragen.server.frontend as _frontend
         _frontend.use_family(family)
 
     _force_text = None
@@ -4281,7 +4247,7 @@ class Service:
                                        prompt_tokens=None, generated=None, max_tokens=None)
                 try:
                     if action == 'save' and getattr(self.engine, 'session_save_reclaim', False):
-                        from serve.session_save_retry import session_file
+                        from hydragen.server.session_save_retry import session_file
                         r = session_file(self, action, path, SessionRefused)
                     else:
                         r = self.engine.session_file(action, path)
@@ -4441,7 +4407,7 @@ class Service:
         """Free VRAM on the engine's (first) GPU, from the backend's reader - NVML, the amdgpu sysfs files (#301) or
         IOKit on macOS (Metal backend); None when it can't be read (then nothing is refused)."""
         try:
-            from serve.telemetry import gpu_reader
+            from hydragen.server.telemetry import gpu_reader
             g = gpu_reader(int(getattr(self, "gpu_index", 0) or 0), amd=getattr(self, "backend", None) == "hip")
             if not g.ok():
                 return None
@@ -4730,7 +4696,7 @@ class Service:
     def start_telemetry(self):
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
         if getattr(self, "telemetry", None) is None:
-            from serve.telemetry import Telemetry
+            from hydragen.server.telemetry import Telemetry
             self.telemetry = Telemetry(extra=self._telemetry_extra,
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
@@ -4939,9 +4905,20 @@ class Service:
 
         busy, ctx = bool(s.get("busy")), self.reported_ctx()
         images = self.vision is not None
+        engine_type = (
+            getattr(self.engine, "engine_type", None)
+            or (getattr(self.engine, "info", {}) or {}).get("engine_type")
+        )
         is_vllm = getattr(self.engine, "expert_manager", None) is not None
-        eng_backend = "vllm" if is_vllm else "strata"
-        eng_label = "vLLM (Triton + PagedMoE)" if is_vllm else "Strata (Native C++/CUDA)"
+        if engine_type == "trtllm":
+            eng_backend = "trtllm"
+            eng_label = "TensorRT-LLM (In-Flight Batching + Paged KV)"
+        elif is_vllm:
+            eng_backend = "vllm"
+            eng_label = "vLLM (Triton + PagedMoE)"
+        else:
+            eng_backend = "strata"
+            eng_label = "Strata (Native C++/CUDA)"
         return {
             "service": "hydragen", "model": self.model,
             "engine_type": eng_backend, "engine_label": eng_label,
@@ -5652,6 +5629,9 @@ class Service:
                         except GeneratorExit:               # the client went away: an engine that never acknowledges
                             leaving = True                  # the STOP below is ended, but no error replaces this
                             raise
+                        except Exception as e:
+                            finish = "error"
+                            raise
                         finally:
                             try:
                                 gen.close()             # STOP+drain to THIS request's DONE while still holding the
@@ -5795,6 +5775,8 @@ class Service:
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
                             seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
+                            if n == 0 and int(max_new) > 0 and finish == "length":
+                                finish = "error"
                             self.history.append({
                                 "id": request_id,
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
@@ -7024,7 +7006,7 @@ def make_handler(svc: Service):
                     self.wfile.write(body)
                 return
             if path == "/metrics":
-                from serve import prometheus
+                from hydragen.server import prometheus
                 if prometheus.wants_prometheus(self.headers.get("Accept", ""), urlsplit(self.path).query):
                     if self._authorized():   # a scraper: the text format, vLLM's names (serve/prometheus.py)
                         body = prometheus.render(svc.metrics(), svc.latencies.snapshot()).encode()
@@ -7247,9 +7229,20 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
             elif path in ("/health", "/api/health"):
+                engine_type = (
+                    getattr(svc.engine, "engine_type", None)
+                    or (getattr(svc.engine, "info", {}) or {}).get("engine_type")
+                )
                 is_vllm = getattr(svc.engine, "expert_manager", None) is not None
-                eng_backend = "vllm" if is_vllm else "strata"
-                eng_label = "vLLM (Triton + PagedMoE)" if is_vllm else "Strata (Native C++/CUDA)"
+                if engine_type == "trtllm":
+                    eng_backend = "trtllm"
+                    eng_label = "TensorRT-LLM (In-Flight Batching + Paged KV)"
+                elif is_vllm:
+                    eng_backend = "vllm"
+                    eng_label = "vLLM (Triton + PagedMoE)"
+                else:
+                    eng_backend = "strata"
+                    eng_label = "Strata (Native C++/CUDA)"
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
@@ -8611,7 +8604,7 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
                    *, offline: bool = False):
     """Opt-in data-parallel replicas (serve/replicas.py): one StrataEngine per card group, each with its own cards, log
     and CPU cores, started together; the ReplicaEngine in front spreads the requests."""
-    from serve import replicas as rp
+    from hydragen.server import replicas as rp
     n = len(groups)
     cpus = rp.cpu_sets(n, cfg.get("replica_cpus") is not False)
     print(f"[strata] {n} replicas on the cards {' | '.join(','.join(map(str, g)) for g in groups)}"
@@ -8655,7 +8648,7 @@ def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bo
     """Opt-in split serving (serve/split.py): a prefill engine and a decode engine, one card each, the same model and the
     same session settings.  Started one after the other, so a shared expert arena is filled once; the SplitEngine in
     front hands a long prompt from the first to the second."""
-    from serve import split as sp
+    from hydragen.server import split as sp
     sp.check_cfg(cfg, spec)
     arena, arena_note = sp.arena_path(cfg, spec)
     work = sp.session_dir(spec)
@@ -8823,7 +8816,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             event_sink = None
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--engine", choices=["mock", "strata", "vllm"], default="mock")
+    ap.add_argument("--engine", choices=["mock", "strata", "vllm", "trtllm"], default="mock")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
@@ -9108,12 +9101,12 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             effort_end = effort_end_args(cfg, exe, tok)  # #458
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        from serve import replicas as rp
+        from hydragen.server import replicas as rp
         try:
             groups = rp.gpu_groups(cfg)
         except rp.ReplicaConfigError as e:
             raise SystemExit(f"[strata] config {e}")
-        from serve import split as split_mod
+        from hydragen.server import split as split_mod
         try:
             split = split_mod.split_spec(cfg)
             if split:
@@ -9135,8 +9128,24 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             print(note, flush=True)
     elif a.engine == "vllm":
         effort_end = None
-        from serve.vllm_engine import VLLMEngine
+        from hydragen.server.vllm_engine import VLLMEngine
         engine = VLLMEngine(cfg, tok, batch_slots=a.parallel or 4)
+        vision = None
+        if cfg.get("vision"):
+            print("loading the vision encoder ...", flush=True)
+            vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+                        if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
+                    for k, v in cfg["vision"].items() if not (k == "exe" and engine_component.is_reference(v))}
+            if engine_component.is_reference(cfg["vision"].get("exe")):
+                vcfg["exe"] = _component_exe(cfg["vision"]["exe"], cfg)
+            env = child_env(cfg, offline=a.offline)
+            vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
+                            env=vision_env(cfg, env), lazy=lazy)
+        sampling_defaults = sampling_defaults_from_config(cfg)
+    elif a.engine == "trtllm":
+        effort_end = None
+        from hydragen.trtllm_engine import TRTLLMEngine
+        engine = TRTLLMEngine(cfg, tok, batch_slots=a.parallel or 4)
         vision = None
         if cfg.get("vision"):
             print("loading the vision encoder ...", flush=True)
@@ -9158,7 +9167,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
     if (cfg.get("arch") or "") == "deepseek41":
-        from serve import dsml
+        from hydragen.server import dsml
         tpl, swapped = dsml.pick_template(tpl)
         if swapped:
             print("[strata] this pack's chat template spells the tool-call block differently from the V4.1 model's; "
@@ -9214,7 +9223,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
               f"{icfg.get('backend') or '?'} (POST /v1/images/generations; GPU policy {svc.images.policy})", flush=True)
     if cfg.get("prevent_sleep") is not None and not isinstance(cfg["prevent_sleep"], bool):
         raise SystemExit(f"[strata] config \"prevent_sleep\" must be true or false, not {cfg['prevent_sleep']!r}")
-    from serve.keepawake import KeepAwake
+    from hydragen.server.keepawake import KeepAwake
     svc.keep_awake = KeepAwake.create(cfg.get("prevent_sleep") is True)      # #1727: opt-in, Windows only
     if cfg.get("reasoning_effort") is not None:         # #1641: the thinking level of requests that name none
         try:
@@ -9291,7 +9300,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):
         raise SystemExit(f"[strata] config \"env_to_user\" must be true or false, not {etu!r}")
-    import serve.frontend as _frontend
+    import hydragen.server.frontend as _frontend
     _frontend.ENV_TO_USER = etu
     rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)   # #606: opt-out with 0
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
@@ -9436,7 +9445,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                     if getattr(engine, "proc", None):
                         engine.proc.kill()
                         try:
-                            from serve import cache_drop
+                            from hydragen.server import cache_drop
                             cache_drop.drop_after_exit(engine)       # opt-in (STRATA_DROP_CACHE_ON_EXIT=1), default unchanged
                         except Exception as e:  # noqa: BLE001 - never block the exit
                             print(f"[strata] could not release the model files' cache: {e}", flush=True)

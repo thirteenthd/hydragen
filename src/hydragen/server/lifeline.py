@@ -27,7 +27,7 @@ import time
 
 from pathlib import Path
 
-from serve import winjob
+from hydragen.server import winjob
 from strata_control import procs
 
 _REAL_POPEN = subprocess.Popen                  # tests replace subprocess.Popen; isinstance needs the class
