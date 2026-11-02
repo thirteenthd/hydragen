@@ -8,31 +8,16 @@ A standalone, modular Python inference package and server (`hydragen`) that comb
 
 ## 1. The Idea & Motivation
 
-Running large Mixture-of-Experts (MoE) models (such as `Qwen3.8-Flash-Next`, ~41 GiB in `GSQ-RCO-IQ3_XXS` quantization with 512 experts per layer across 48 layers, top-10 routing) on a single **12 GB VRAM GPU** presents a fundamental challenge between two worlds:
+Serving frontier Mixture-of-Experts (MoE) architectures—such as **Qwen3.8-Flash-Next** (176.9B parameters, 512 experts/layer across 48 layers, ~41 GiB in sub-4-bit `GSQ-RCO-IQ3_XXS`)—on a single consumer **12 GB VRAM GPU** (`NVIDIA RTX 3080 Ti`) presents a fundamental tension:
+- **Standard serving engines (vLLM / TensorRT-LLM)** excel at continuous multi-slot batching and PagedAttention prefix caching, but require all model weights to reside statically in GPU VRAM—making a 41 GiB model impossible to load.
+- **Naive CPU/PCIe offloading** creates a brutal memory bandwidth bottleneck, crawling at 2–6 tokens/second even across PCIe 4.0 x16 lanes.
 
-1. **Standard vLLM:**
-   - Excels at continuous batching, PagedAttention KV prefix caching, and high-throughput Triton GPU kernels.
-   - However, standard vLLM assumes all model weights reside statically in GPU VRAM and requires standard HF/SafeTensors formats—making a 41 GiB MoE model impossible to load on a 12 GB card without slow, uncoordinated PCIe thrashing.
-2. **Standard Single-Stream Tiered Engines:**
-   - Excels at tiered MoE weight management: locking the 41 GiB expert pack into pinned System RAM, caching the hottest ~2,265 expert slots (`3.7 GB`) in VRAM, streaming missing routed experts asynchronously over PCIe Gen4 DMA, and using 4-layer Multi-Token Prediction (MTP) draft heads.
-   - However, single-stream execution creates severe head-of-line blocking when autonomous agents (e.g., Letta, Hermes, Cursor, subagent teams) issue concurrent requests, and lacks dynamic multi-slot scheduling, expert-locality request reordering, agent loop guardrails for third-party system prompts, and real-time per-slot telemetry.
+**Hydragen** resolves this contradiction by bridging tiered MoE weight residency with high-concurrency serving:
+1. **Tiered MoE Residency:** Locks the complete 41 GiB model in pinned System RAM while keeping the top ~2,348 most frequently routed experts (3.86 GiB) resident directly in GPU VRAM for native INT8 Tensor Core execution.
+2. **Lock-Free C++ IPC (`libstrata_fast_ipc.so`):** Replaces pipe-based stdio text streaming with per-slot lock-free Single-Producer Single-Consumer (SPSC) circular ring buffers, eliminating string parsing jitter and GIL contention.
+3. **Speculative Multi-Token Prediction (MTP):** Employs coupled draft sampling (65%+ acceptance rate) to accelerate single-stream decode up to **78+ tok/s** and concurrent 2-slot decode to **58–72 tok/s aggregate**.
 
-### The Hydragen Architecture
-Hydragen bridges this gap as an independent, modular inference platform with a clean **PEP 621 Python package layout (`src/hydragen/`)** and one-click standalone installer:
-
-- **vLLM General & Quantization Plugin (`src/hydragen/vllm_plugin.py`):**
-  - Registered via `[project.entry-points."vllm.general_plugins"]` (`hydragen_gguf`).
-  - Registers `@register_quantization_config("hydragen_gguf")` and `@register_quantization_config("strata_gguf")` (`StrataPagedMoEMethod(FusedMoEMethodBase)`) automatically whenever `vllm` initializes—requiring **zero edits** to site-packages.
-- **Zero-Dequantization Dual-Kernel Architecture (`src/hydragen/expert_manager.py`, `src/hydragen/triton_moe.py`):**
-  - Stores raw compressed `[gate | up | down]` GGUF blocks (`~1.61 MB/expert` instead of `9.83 MB/expert` in BF16/FP16 — a **5.8x VRAM & PCIe bandwidth reduction**) directly in `PagedExpertManager.vram_blob_cache` (`[num_slots, max_blob_bytes] uint8`).
-  - **Native INT8 `dp4a` Grouped Engine (`native_gguf_paged_moe_forward`):** Automatically leveraged for high-speed production execution. Quantizes activation vectors once via `quantize_q8_1_rows` and executes Gate + Up + `SwiGLU` + Down directly in INT8 against the compressed `IQ2_XXS`/`IQ2_XS`/`IQ3_XXS`/`IQ3_S`/`IQ2_S`/`IQ4_NL`/`Q2_0_STRATA` expert slots on GPU Tensor Cores—with **zero intermediate BF16/FP16 weight buffer in VRAM**.
-  - **In-Kernel Triton JIT Register Unpacker (`@triton.jit def fused_moe_gguf_down_slot_kernel`):** Provides dynamic register-level unpacking for specialized non-linear blocks (`IQ4_NL`, 32 weights/18B and `Q2_0_STRATA`, 64 weights/18B) directly inside the compute `K` loop before `tl.dot`, completely eliminating weight allocations in GPU memory.
-- **Universal CUDA GSQ Dequantization & Routing Bridge (`src/hydragen/gguf_loader.py`, `src/hydragen/server/libstrata_iq_kernels.so`):**
-  - Links `iq_kernels.cu`, `dequant_bf16.cu`, `route_prior.cu`, and `router_top10.cu` into dynamically located runtime libraries (`sm_86`+).
-  - Supports **all 48 layers** of `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS`, including standard IQ quants (`IQ2_XXS=16`, `IQ2_XS=17`, `IQ3_XXS=18`, `IQ4_NL=20`, `IQ3_S=21`, `IQ2_S=22`) and custom `Q2_0_STRATA=42` (`ffn_down_exps` in odd layers 1..27), plus GPU-accelerated cache-aware top-10 routing (`route_prior_top10`).
-- **Live PagedExpertManager & Multi-Slot Scheduler (`src/hydragen/expert_manager.py`, `src/hydragen/engine.py`):**
-  - Manages dynamic 3-projection (`gate`, `up`, `down`) FP16 VRAM expert slots (`[num_slots, N, K]`), LRU eviction, async CUDA DMA stream transfers, and `ExpertLocalityPolicy` waiting-queue request reordering.
-  - Supports continuous batching across parallel slots (`--batch 2`, `4`), interactive prompt chunk yielding (`BYIELD`), small-cap reasoning budget guards, and dynamic solo MTP promotion.
+> 📖 **Deep Dive:** For the full technical chronicle of the system's design—from the initial PCIe bandwidth wall to lock-free IPC engineering, diagnosing Hermes' 4-way concurrency crash, and discovering the 12GB memory sweet spot—see **[The Journey of Hydragen: Inception, History, and Architecture Evolution](docs/the-journey.md)**.
 
 ---
 
