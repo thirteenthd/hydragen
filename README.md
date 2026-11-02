@@ -2,8 +2,6 @@
 
 A standalone, modular Python inference package and server (`hydragen`) that combines **TensorRT-LLM In-Flight Batching, native PagedKV virtual block management, multi-slot continuous scheduling, and Triton Fused MoE slot-indirection** with **tiered expert hot-swapping, pinned host-RAM expert arena offloading, GSQ sub-4-bit quantization (`IQ3_XXS` / `IQ2_XS` / `Q2_0_STRATA`), and 4-layer Multi-Token Prediction (MTP) speculative decoding**—purpose-built to serve massive Mixture-of-Experts (MoE) models (such as `Qwen3.8-Flash-Next`, 176.9B parameters, 512 experts/layer across 48 layers at `128k` context) on a single **12 GB–24 GB consumer GPU** (`NVIDIA RTX 3080 Ti`, `RTX 3090/4090`, `RTX 4070 Ti+`).
 
-![Hydragen Live Web Monitor](docs/assets/monitor-overview.png)
-
 ---
 
 ## 1. The Idea & Motivation
