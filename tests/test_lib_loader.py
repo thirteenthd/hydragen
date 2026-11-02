@@ -28,6 +28,14 @@ class TestLibLoader(unittest.TestCase):
         lib = load_native_library("nonexistent_test_lib_12345.so")
         self.assertIsNone(lib)
 
+    def test_paged_kv_native_load(self):
+        from hydragen.paged_kv import PagedKVManager
+        mgr = PagedKVManager(block_size=16, num_blocks=128)
+        # If running on Linux with built shared lib, handle should be active
+        if sys.platform.startswith("linux"):
+            self.assertIsNotNone(mgr._handle)
+
+
 
 if __name__ == "__main__":
     unittest.main()
