@@ -398,75 +398,19 @@ class MockEngine:
             yield t
 
 
-class EngineDied(RuntimeError):
-    """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
-
-
-class EngineStarting(RuntimeError):
-    """The engine is (re)starting and has not said READY yet (#344): no context size to plan a request with - a 503,
-    not a 400 about the prompt."""
-
-
-class ClientGone(Exception):
-    """#1999: the client hung up while its request was being prepared (an image URL downloading, a picture encoding or
-    waiting for its turn): nothing is left to answer."""
-
-
-class ModelBusy(RuntimeError):
-    """Explicit model controls must not interrupt active or queued requests."""
-
-
-class QueueWaitExpired(RuntimeError):
-    """An inference call waited too long for its first engine turn."""
-
-
-class QueueCancelled(RuntimeError):
-    """The client left before its first serial engine turn."""
-
-
-class EngineSilent(EngineDied):
-    """#481: the engine said nothing for too long during a request (or never acknowledged a STOP): the two sides lost
-    step - the engine waiting for its next command, the server for this request's end - and the server ended it.  An
-    EngineDied, so the request ends with an error and the next one starts the engine again."""
-
-
-class EngineNonFinite(ValueError):
-    """#879: the engine's DONE (or a slot's BDONE) said `nonfinite`: a window's logits held a NaN or an infinity.  The
-    engine wrote none of that window's tokens and drops every cached state that may carry the poison, so its next
-    request reads the prompt from token 0.  Service.run sends a request that had produced nothing yet once more, and
-    ends one that had started (as "length").  A ValueError, so a stream that has started reports it as an error event."""
-
-
-class SessionRefused(ValueError):
-    """Disk sessions: the engine refused or failed a SAVE / RESTORE and is still in step (`SERR <kind> <published>
-    <reason>`).  `kind` is the engine's category - invalid (400), storage (507), memory (503), io (500); `published`:
-    a save whose new file already replaced the old one before a later step (the folder flush) failed."""
-
-    STATUS = {"invalid": 400, "storage": 507, "memory": 503, "io": 500}
-
-    def __init__(self, kind: str, message: str, published: bool = False):
-        super().__init__(message)
-        self.kind = kind if kind in self.STATUS else "io"
-        self.published = published
-
-    @property
-    def status(self) -> int:
-        return self.STATUS[self.kind]
-
-
-class EngineStuck(RuntimeError):
-    """The engine process did not end after QUIT, terminate and kill: the server keeps it (and says so) rather than
-    reporting its GPU and RAM as given back."""
-
-
-class GpuBusy(RuntimeError):
-    """The model is unloaded and the GPU has less free VRAM than min_free_vram_mib: something else (a game, another
-    model server) is using it, so the engine is not started into the little that is left.  `retry_after`: seconds
-    for the Retry-After header of the 503."""
-
-    def __init__(self, message="", retry_after=None):
-        super().__init__(message)
-        self.retry_after = retry_after
+from hydragen.server.exceptions import (
+    ClientGone,
+    EngineDied,
+    EngineNonFinite,
+    EngineSilent,
+    EngineStarting,
+    EngineStuck,
+    GpuBusy,
+    ModelBusy,
+    QueueCancelled,
+    QueueWaitExpired,
+    SessionRefused,
+)
 
 
 # The page's only CSP directive: its preview frames (srcdoc) may not load any address. Other directives are left out
@@ -3910,74 +3854,10 @@ def vision_env(cfg: dict, env: dict, archs: dict[int, str] | None = None) -> dic
     return env
 
 
-class ByteTokenizer:
-    """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
-    SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
-
-    ALWAYS = ()                                     # specials matched without parse_special (type 4, as <think>)
-
-    @property
-    def max_special_len(self):
-        return max(len(s) for s in self.SPECIALS)
-
-    @property
-    def control_tokens(self):
-        return [s for s in self.SPECIALS if s not in self.ALWAYS]
-
-    def encode(self, text, parse_special=False, plain=()):
-        return self.encode_marked(text, parse_special, plain)[0]
-
-    def encode_marked(self, text, parse_special=False, plain=()):
-        """encode() and its resume points (after each special), as strata_tokenizer's for PromptEncoder."""
-        out, marks, i = [], [], 0
-        while i < len(text):
-            for k, s in enumerate(self.SPECIALS):
-                if (parse_special or s in self.ALWAYS) and text.startswith(s, i) and not any(
-                        a <= i < b for a, b in plain):
-                    out.append(256 + k)
-                    i += len(s)
-                    marks.append((i, len(out)))
-                    break
-            else:
-                out.extend(text[i].encode("utf-8"))
-                i += 1
-        return out, marks
-
-    def decode(self, ids, errors="replace"):
-        raw = bytearray()
-        for t in ids:
-            raw += self.SPECIALS[t - 256].encode() if t >= 256 else bytes([t])
-        return raw.decode("utf-8", errors=errors)
+from hydragen.server.tokenizer import ByteTokenizer, Detokenizer, StopMatcher
 
 
 # ------------------------------------------------------------------------------------------------ core
-class Detokenizer:
-    """Incremental decode: each token's bytes go through an incremental UTF-8 decoder, which emits the complete
-    characters and holds a multi-byte character split across tokens until it is complete (invalid bytes become
-    U+FFFD, as a whole decode with errors="replace" makes them).  Constant time per token - the old re-decode of
-    every generated id cost 2 ms per token after 8K tokens and 4 ms after 16K (perf-review F-1).  A tokenizer
-    without `token_bytes` (the tests' byte tokenizer) keeps the re-decode."""
-
-    def __init__(self, tok):
-        self.tok, self.ids, self.sent = tok, [], 0
-        self.inc = codecs.getincrementaldecoder("utf-8")(errors="replace") if hasattr(tok, "token_bytes") else None
-
-    def pending(self) -> bool:
-        """A character is split across the tokens so far: its first bytes are held."""
-        if self.inc is not None:
-            return bool(self.inc.getstate()[0])
-        return self.tok.decode(self.ids).endswith("\ufffd")
-
-    def push(self, t: int) -> str:
-        if self.inc is not None:
-            return self.inc.decode(self.tok.token_bytes(t))
-        self.ids.append(t)
-        text = self.tok.decode(self.ids)
-        if text.endswith("�"):
-            return ""
-        delta, self.sent = text[self.sent:], len(text)
-        return delta
-
 
 OPENAI_MAX_STOP = 4                                  # OpenAI's limit on `stop`
 
@@ -4036,38 +3916,7 @@ def stop_strings(req: dict) -> list[str]:
     return [x for x in stop if x]
 
 
-class StopMatcher:
-    """Cuts the answer's text at the first stop string.  Text that could still be the start of a stop string is held
-    back (only that tail, never more), so a stop string split across tokens or chunks is still found and never sent."""
 
-    def __init__(self, stops: list[str]):
-        self.stops, self.held, self.hit = stops, "", None
-
-    def push(self, text: str) -> str:
-        """-> the text that is safe to send now; after a match, self.hit is the stop string and nothing more comes."""
-        if self.hit is not None:
-            return ""
-        buf = self.held + text
-        first = None
-        for s in self.stops:
-            i = buf.find(s)
-            if i >= 0 and (first is None or i < first[0]):
-                first = (i, s)
-        if first is not None:
-            self.held, self.hit = "", first[1]
-            return buf[:first[0]]
-        keep = 0                                      # the longest end of buf that a stop string starts with
-        for s in self.stops:
-            for k in range(min(len(s) - 1, len(buf)), keep, -1):
-                if buf.endswith(s[:k]):
-                    keep = k
-                    break
-        self.held = buf[len(buf) - keep:] if keep else ""
-        return buf[:len(buf) - keep]
-
-    def flush(self) -> str:
-        held, self.held = self.held, ""
-        return held
 
 
 
