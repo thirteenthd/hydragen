@@ -67,7 +67,7 @@ What made vLLM desirable was not its heavyweight Python framework, but its **In-
 ### The Implementation
 We branched onto `feat/tensorrt-llm` and built a lean execution engine:
 1. **Iteration-Level Scheduler (`src/hydragen/trtllm_engine.py`):** Implemented request admission and token retirement at each forward iteration, supporting Copy-on-Write (CoW) prefix cache sharing.
-2. **C++ Virtual Block Manager (`csrc/paged_attention/paged_kv_manager.cpp`):** Created a native virtual block table allocating 16-token virtual pages, compiled into `lib/libpaged_kv.so`.
+2. **C++ Virtual Block Manager (`csrc/paged_attention/paged_kv_manager.cpp`):** Created a native virtual block table allocating 16-token virtual pages, compiled into `lib/libpaged_kv.so`. *(Note: The isolated C++/CUDA PagedAttention kernel and block manager were initially prototyped on branch `feat/paged-attention-cpp`, then graduated and merged directly into `feat/tensorrt-llm` for full runtime integration).*
 3. **Dynamic MoE TRT Plugin (`csrc/trtllm_plugin/strata_paged_moe_plugin.cpp`):** Implemented an `nvinfer1::IPluginV2DynamicExt` TensorRT plugin bridging dynamic MoE layer execution directly to the pinned host-RAM arena.
 4. **Reclaiming VRAM:** Cut the engine reserve down from 1,536 MiB to **256–384 MiB**, instantly freeing **1.17 GB of VRAM** for the expert cache.
 
