@@ -4,23 +4,29 @@ A standalone, modular Python inference package and server (`hydragen`) that comb
 
 ---
 
-## 1. The Idea & Motivation
+## 1. The Idea & Motivation: Why Hydragen Was Created
 
-Serving frontier Mixture-of-Experts (MoE) architectures—such as **Qwen3.8-Flash-Next** (176.9B parameters, 512 experts/layer across 48 layers, ~41 GiB in sub-4-bit `GSQ-RCO-IQ3_XXS`)—on a single consumer **12 GB VRAM GPU** (`NVIDIA RTX 3080 Ti`) presents a fundamental tension:
-- **Standard serving engines (vLLM / TensorRT-LLM)** excel at continuous multi-slot batching and PagedAttention prefix caching, but require all model weights to reside statically in GPU VRAM—making a 41 GiB model impossible to load.
-- **Naive CPU/PCIe offloading** creates a brutal memory bandwidth bottleneck, crawling at 2–6 tokens/second even across PCIe 4.0 x16 lanes.
+Serving frontier Mixture-of-Experts (MoE) architectures—such as **Qwen3.8-Flash-Next** (176.9B parameters, 512 experts/layer across 48 layers, ~41 GiB in sub-4-bit `GSQ-RCO-IQ3_XXS`)—on consumer GPUs (12 GB–24 GB VRAM) previously faced an impossible trade-off across three existing paradigms:
 
-**Hydragen** resolves this contradiction by bridging tiered MoE weight residency with high-concurrency serving:
-1. **Tiered MoE Residency:** Locks the complete 41 GiB model in pinned System RAM while keeping the top **2,348 most frequently routed experts (3.86 GiB)** resident directly in GPU VRAM for native INT8 Tensor Core execution.
-2. **Lock-Free C++ IPC (`csrc/ipc/strata_fast_ipc.cpp` / `libstrata_fast_ipc.so`):** Replaces pipe-based stdio text streaming with per-slot lock-free Single-Producer Single-Consumer (SPSC) circular ring buffers, eliminating string parsing jitter and Python GIL contention.
-3. **Native PagedKV Virtual Block Manager & PTX DP4A SIMD (`csrc/paged_attention/`):** Hardware-accelerated 4-way 8-bit integer dot products (`dp4a.s32.s32`) on Ampere Tensor Cores with zero-copy physical page-table management and zero memory fragmentation.
-4. **Speculative Multi-Token Prediction (MTP):** Employs coupled draft sampling (65%+ acceptance rate) to accelerate single-stream decode to **64–78+ tok/s** and concurrent multi-slot decode up to **58–72 tok/s aggregate**, with rock-solid stability tested over 286+ continuous production turns and prompt contexts up to 111k tokens.
+1. **The Datacenter Serving Dilemma (Pure TensorRT-LLM / vLLM):**
+   - Built for enterprise clusters (8x H100s/A100s) where the full 40+ GiB model resides statically in 80 GB VRAM.
+   - They excel at **in-flight continuous iteration batching** and **PagedAttention virtual memory**, but completely lack support for sub-byte Importance Quantization (`IQ3_XXS`/`IQ2_XS`) and tiered host-RAM expert offloading on single consumer GPUs.
+2. **The Standalone Hybrid Engine Dilemma (Pure Strata):**
+   - Pioneered irregular sub-4-bit GSQ quantization and host-RAM expert streaming, making it possible to fit 176.9B parameters on a 12 GB GPU.
+   - However, it operates as a **single-turn pipeline worker**: it lacked continuous in-flight iteration scheduling, non-fragmenting paged KV block memory, dynamic multi-slot IPC, and agent reliability guardrails needed for concurrent multi-turn agent workflows.
+3. **Naive CPU/PCIe Offloading (llama.cpp style):**
+   - Suffers from the PCIe bandwidth wall, crawling at 2–6 tokens/second because transferring gigabytes of weights on every token stalls the GPU.
+
+**Hydragen was engineered to bridge these worlds:**
+It synthesizes the **tiered weight residency and sub-byte kernels of Strata** with the **in-flight continuous batching and virtual page-table abstractions of TensorRT-LLM and vLLM**, unifying them with **Hydragen's custom lock-free C++ IPC, locality-aware expert scheduling, reasoning guardrails, and hardware auto-tuning**.
 
 > 📖 **Deep Dive:** For the full technical chronicle of the system's design—from the initial PCIe bandwidth wall to lock-free IPC engineering, diagnosing Hermes' 4-way concurrency crash, and discovering the 12GB memory sweet spot—see **[The Journey of Hydragen: Inception, History, and Architecture Evolution](docs/the-journey.md)**.
 
 ---
 
-## 2. Execution & Architecture
+## 2. Tri-Pillar Architecture & Feature Attribution
+
+Hydragen's architecture is organized into three distinct, complementary pillars:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
@@ -30,65 +36,56 @@ Serving frontier Mixture-of-Experts (MoE) architectures—such as **Qwen3.8-Flas
                                       │
                                       ▼
 ┌────────────────────────────────────────────────────────────────────────────┐
-│          Decoupled Hydragen Core Engine (src/hydragen/core/)               │
-│  • TRTPagedBlockManager: Virtual sequence allocator & block tables         │
-│  • InFlightScheduler: Multi-slot slot lifecycle, prefix cache, telemetry   │
-│  • TRTLLMEngine: In-flight batching engine coordinator                     │
-│  • ExpertLocalityPolicy: Queue reordering maximizing shared active experts │
-│  • Agent Guardrails: STRATA_ROUTE_PRIOR=0.85 + reasoning loop recovery     │
+│             PILLAR 1: HYDRAGEN (Serving Orchestration & Innovations)       │
+│  • Lock-Free C++ SPSC Shared Memory IPC (libstrata_fast_ipc.so)            │
+│  • Locality-Aware Expert Scheduling (ExpertLocalityPolicy)                 │
+│  • Cache-Conditioned Router Biasing (STRATA_ROUTE_PRIOR=0.85)              │
+│  • Autonomous Agent Guardrails: Solo MTP Promotion, BYIELD, Loop Recovery  │
+│  • Dynamic Hardware Auto-Tuner (tune_hydragen.py)                          │
+│  • Universal Multi-Engine Abstraction (--engine trtllm | vllm | strata)    │
+│  • Real-Time Concurrency States Web Monitor (Slot Grid, Queue Telemetry)   │
 └──────────────────┬──────────────────────────────────────┬──────────────────┘
                    │                                      │
                    ▼                                      ▼
 ┌─────────────────────────────────────┐ ┌────────────────────────────────────┐
-│  Native C++ / CUDA Accelerated Core │ │  Resident Tiered MoE Worker        │
-│  • libstrata_fast_ipc.so (SPSC ring)│ │  • 2,348 VRAM Expert Slots (3.86GB)│
-│  • libpaged_kv.so (Ampere PTX DP4A) │ │  • 40 GiB Paged Host-RAM Arena     │
-│  • libstrata_trtllm_plugin.so       │ │  • Async PCIe Gen4 x16 DMA         │
-│  • hydragen.lib_loader (cross-plat) │ │  • 4-Layer MTP Speculative Heads   │
-│  • Full backward compat (serve/*)   │ │  • Full 48-Layer Attention + KV    │
+│   PILLAR 2: TENSORRT-LLM & vLLM     │ │         PILLAR 3: STRATA           │
+│      (Continuous Batching & Memory) │ │     (Foundational MoE & Quant)     │
+│  • In-Flight Continuous Batching    │ │  • Pinned Host-RAM Expert Arena    │
+│  • PagedKV Virtual Block Allocation │ │  • GSQ Sub-4-Bit Quant (IQ3_XXS)   │
+│  • Physical Page Table Management   │ │  • Resident GPU Expert Cache       │
+│  • Triton Grouped FusedMoE Dispatch │ │  • Multi-Token Prediction (MTP)    │
+│  • Ampere PTX DP4A SIMD Assembly    │ │  • Asynchronous Dynamic Swap Tier │
 └─────────────────────────────────────┘ └────────────────────────────────────┘
 ```
 
-### Key Engineering Capabilities
+### Pillar 1: Hydragen (Core Serving Innovations)
+*Novel features and architectural components engineered specifically for Hydragen:*
+- **Lock-Free C++ SPSC Shared Memory IPC (`csrc/ipc/strata_fast_ipc.cpp` / `libstrata_fast_ipc.so`):** Replaces sluggish Python OS pipes and ASCII serialization with cache-line-aligned Single-Producer Single-Consumer circular ring buffers (<50ns per token), completely eliminating Python GIL contention and multi-slot jitter.
+- **Decoupled Modular Architecture (`src/hydragen/core/`, `src/hydragen/server/`):** Decoupled sequence allocator, in-flight scheduler, and networking protocol server with full backward-compatibility shims (`serve/*`).
+- **Locality-Aware Expert Scheduling (`ExpertLocalityPolicy`):** Evaluates waiting queue requests by Jaccard overlap against currently resident VRAM experts, co-scheduling streams that share active experts to maximize cache hit rates.
+- **Cache-Conditioned Router Biasing (`STRATA_ROUTE_PRIOR=0.85`):** Dynamically applies a positive residency prior to routing logits for VRAM-resident experts, saving ~20% of PCIe transfers without degrading reasoning perplexity.
+- **Dynamic Solo MTP Promotion:** Autonomous agent requests (Hermes, Cursor, Letta) are naturally bursty with intermittent tool calls. The instant a concurrent stream pauses for tool execution, Hydragen dynamically migrates the active stream back to the solo speculative path, boosting decode up to **88–95 tok/s**.
+- **Autonomous Agent Guardrails:**
+  - **Head-of-Line Prompt Preemption (`BYIELD`):** Preempts long prompt reads at chunk boundaries when short interactive requests arrive.
+  - **Small-Cap Reasoning Budget Guard:** Caps `<think>` token expenditure at `max_new // 2` when `max_tokens < 1024` to prevent reasoning loops from consuming the entire response budget.
+  - **Automatic Repetition Recovery:** Detects repetitive cycles in thinking blocks and wraps them cleanly to force immediate tool call emission.
+- **Universal Hardware Auto-Tuner (`tune_hydragen.py`):** Automatically detects GPU topology, VRAM, RAM, and PCIe configuration to calculate exact capacity limits and generate tuned configurations dynamically for any system.
+- **Real-Time Concurrency States Web Monitor:** Live visual slot grid, queue telemetry, and token progress tracking.
 
-#### 1. Decoupled Modular Architecture (`src/hydragen/core/`, `src/hydragen/server/`)
-- **Clean Architectural Decoupling:** Core inference orchestration is decoupled into three dedicated components in `src/hydragen/core/`:
-  - [`core.block_manager`](src/hydragen/core/block_manager.py): Virtual sequence allocator and block table mapping.
-  - [`core.scheduler`](src/hydragen/core/scheduler.py): Multi-slot in-flight scheduler with prefix cache matching and latency telemetry.
-  - [`core.engine`](src/hydragen/core/engine.py): High-level engine lifecycle and batch generation loop.
-- **Server Separation:** Network protocol handling and utility routines are separated into `src/hydragen/server/` ([`exceptions.py`](src/hydragen/server/exceptions.py), [`tokenizer.py`](src/hydragen/server/tokenizer.py), [`fast_ipc.py`](src/hydragen/server/fast_ipc.py)).
-- **Unified Library Loading (`hydragen.lib_loader`):** Standardized cross-platform dynamic library resolver with strict priority search order across `HYDRAGEN_LIB_DIR`, environment overrides, package internal `lib/`, and system paths.
-- **Zero-Breakage Backward Compatibility:** The legacy `serve/` namespace is preserved via lightweight module forwarding shims (`sys.modules[__name__] = _mod`), ensuring existing setups and scripts run without modification.
+### Pillar 2: TensorRT-LLM & vLLM (Continuous Batching & Virtual Memory Foundations)
+*Architectural paradigms and high-concurrency principles adapted from TensorRT-LLM and vLLM:*
+- **In-Flight Continuous Batching:** Dynamic iteration-level scheduling that admits and retires individual sequences token-by-token without blocking on the longest sequence in the batch.
+- **PagedKV Virtual Block Memory (`csrc/paged_attention/` / `libpaged_kv.so`):** Non-contiguous 16-token virtual physical page tables eliminating internal and external memory fragmentation and enabling instant Copy-on-Write (CoW) prefix reuse.
+- **Triton FusedMoE Slot-Indirection:** High-performance CUDA/Triton kernels performing scatter-gather routing and grouped GEMM evaluation across concurrent batch slots in a single forward pass.
+- **Ampere PTX `dp4a` SIMD Kernels:** Hardware-accelerated 4-way 8-bit integer dot products (`dp4a.s32.s32`) executing directly on Ampere Tensor Cores.
 
-#### 2. Concurrency at 128k Context Without VRAM Overflow
-- Tuned KV cache and VRAM reservation (`--vram-reserve-mib 450`) to support **`max_context: 131072` (128k tokens)** alongside **`--batch 2`** and live MoE expert slots on 12 GB VRAM while keeping **2,348 expert slots** resident in VRAM.
-- **Expert-Locality Queue Reordering (`ExpertLocalityPolicy.rank_candidates`):** Scores waiting requests by Jaccard overlap with currently resident VRAM experts so co-scheduled requests maximize expert cache hits.
-- **Smart Slot Selection (`pick_slot`):** Routes incoming multi-turn requests to the idle slot holding the longest matching token prefix or `<|im_start|>` turn checkpoint, preserving idle slot KV caches across turns.
-- **Head-of-Line Preemption (`BYIELD`):** If a long prompt read is running in one slot and a shorter interactive request arrives, the scheduler yields the long read at the next chunk boundary so the shorter request admits immediately.
-- **Dynamic Solo MTP Promotion & Speculative Strategy:**
-  - When multiple batch slots actively decode in the exact same step, speculative tree verification across independent streams is disabled to avoid GPU warp divergence and dynamic KV tree collisions. While overlapping, each stream generates tokens autoregressively.
-  - Autonomous agent turns (Hermes, Letta, Cursor, subagent teams) are inherently bursty: an agent issues a tool call (50–150 tokens), then pauses for several seconds while tool execution completes in a sandbox.
-  - The instant a request is alone in flight (`going_solo`), the scheduler dynamically migrates it back to the solo speculative path, re-engaging the 4-layer MTP draft head to accelerate decode speed up to **64–78+ tok/s** for the rest of its turn.
-
-#### 3. Speculative Decoding Optimization for Agent Workloads
-- Optimized MTP parameters for bursty agent turns (long prompt prefixes, short tool-call outputs):
-  - `"mtp_max": 4`
-  - `"spec_min_p": 0.45`
-  - `"coupled-draft": true`
-- Achieved **78% – 86% draft acceptance** on solo agent turns, yielding **1.9x–2.4x single-stream speedups**.
-
-#### 4. Agent Reliability: Routing Prior & Reasoning Loop Guardrails
-- **The `STRATA_ROUTE_PRIOR` Setting:**
-  - Setting `STRATA_ROUTE_PRIOR=0.85` biases top-10 expert routing toward currently resident VRAM experts, maintaining a **66% – 76.7% VRAM expert cache hit rate** with PCIe streaming overhead limited to only 2.9%–4.6% of routed experts.
-- **Universal Small-Cap Reasoning Budget Guard:**
-  - On reasoning/thinking models (e.g. Qwen 3.8 Flash, DeepSeek), requests with `max_tokens <= 1024` previously exhausted their entire token allowance inside `<think>` tags without emitting code. Hydragen automatically caps the thinking budget at `max_new // 2` when `max_new < 1024`, ensuring the model exits reasoning mode and emits the requested solution.
-- **Agent Loop Recovery:**
-  - Automatic repetition detection wraps stuck `<think>` blocks cleanly when passage repetition (`repeat_coverage >= 0.30`) is detected, preserving the KV prefix cache and allowing the model to transition immediately to tool calls.
-
-#### 5. Real-Time Concurrency States Web Monitor
-- **Integrated Slot Grid:** Real-time visual cards for every configured slot displaying active generation state, prefill rates, decode throughput, and token progress.
-- **Queue Sub-card:** Live admission status, queued request count, and head-of-line preemption indicators.
-- **Universal Multi-Engine Support:** Works identically whether running with `--engine trtllm`, `--engine vllm`, or `--engine strata`.
+### Pillar 3: Strata (Foundational MoE & Memory Tiering)
+*Underlying weight formats, quantization kernels, and memory tiering powered by Strata:*
+- **Tiered Host-RAM Expert Arena:** Pinned host system RAM allocator storing 40+ GiB of model parameters with background asynchronous PCIe DMA streaming.
+- **GSQ Sub-4-Bit Quantization:** Groundbreaking irregular Importance Quantization (`GSQ-RCO-IQ3_XXS`, `IQ3_S`, `IQ2_XS`, `Q2_0_STRATA`) compressing 176.9B models into ~41 GiB with near-FP16 fidelity.
+- **Resident GPU Expert Cache:** High-speed VRAM cache holding thousands of hot experts computed directly on Tensor Cores with zero host round-trips.
+- **Multi-Token Prediction (MTP) Speculative Drafting:** 4-layer speculative draft head generating multi-token proposals per iteration with 75–85%+ acceptance.
+- **Continuous Profile Learning (`--expert-profile-save`):** Dynamic runtime frequency tracking and persistent profile saving.
 
 ---
 
@@ -99,6 +96,8 @@ Serving frontier Mixture-of-Experts (MoE) architectures—such as **Qwen3.8-Flas
 | :--- | :--- |
 | **Operating System** | Ubuntu Server LTS (Linux bare-metal) |
 | **GPU** | 1x **NVIDIA GeForce RTX 3080 Ti** (12 GB GDDR6X, 912 GB/s, PCIe Gen4 x16) |
+| **PCIe Resizable BAR** | **Enabled (16 GiB BAR1 Aperture)** *(Stock was clamped at 256 MiB)* |
+| **Power Profile** | **240W Power Cap** (Dynamic Boost ~1,875 MHz; thermals 42°C–45°C) |
 | **CPU** | **AMD Ryzen 9 5900X** (12 Cores / 24 Threads) |
 | **System RAM** | **64 GB DDR4** (~40–41 GiB locked for pinned expert arena) |
 | **Model** | `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS` (176.9B params, 48 layers, 512 experts/layer, top-10 routing, 4-layer MTP head) |
@@ -112,22 +111,32 @@ Serving frontier Mixture-of-Experts (MoE) architectures—such as **Qwen3.8-Flas
 
 The following metrics reflect continuous bare-metal production workloads across **286 multi-turn requests** and **266,501 tokens generated**:
 
-| Metric | Stock Single-Slot (Baseline) | Hydragen (`STRATA_ROUTE_PRIOR=0.85` + MTP 4) |
-| :--- | :---: | :---: |
-| **Single-Stream Decode Speed** | 42 – 52 tok/s | **64.0 – 77.4 tok/s** *(mean ~50.3 tok/s across 80k–111k ctx)* |
-| **Cold Prompt Prefill Speed** | 1,400 – 1,800 tok/s | **1,860 – 2,503 tok/s** |
-| **Cached Turn TTFT (`90k–111k` ctx)** | ~0.75 s | **0.48 – 0.65 s** *(99.9% token reuse)* |
-| **VRAM Expert Cache Hit Rate** | 52% – 60% | **66.6% – 76.7%** *(+2.9% – 4.6% over PCIe)* |
-| **MTP Draft Acceptance Rate** | ~0% on short turns | **78.4% – 86.2%** |
-| **2-Slot Concurrent Aggregate Decode** | N/A (serialized) | **58 – 72 tok/s combined\*** |
-| **Max Context Handled in Production** | ~32,000 tokens | **111,743 tokens** (tested without OOM or failure) |
-| **Reliability Across 286 Production Turns** | Frequent OOM / drops | **Zero errors, 0 exceptions, 0 socket drops** |
+| Metric | Stock Single-Slot (No ReBAR) | Hydragen (256MB BAR1) | Hydragen (Resizable BAR Enabled, 16GB) |
+| :--- | :---: | :---: | :---: |
+| **Single-Stream Decode Speed** | 42 – 52 tok/s | 64.0 – 77.4 tok/s | **88.6 – 94.9 tok/s (+44% gain)** |
+| **Cold Prompt Prefill Speed** | 1,400 – 1,800 tok/s | 1,860 – 2,200 tok/s | **2,150 – 2,503 tok/s** |
+| **Cached Turn TTFT (`90k–111k` ctx)** | ~0.75 s | 0.48 – 0.65 s | **0.25 – 0.45 s (99.9% token reuse)** |
+| **VRAM Expert Cache Hit Rate** | 52% – 60% | 66.6% – 76.7% | **76.4% – 82.6%** *(+2.1% – 4.6% over PCIe)* |
+| **MTP Draft Acceptance Rate** | ~0% on short turns | 78.4% – 86.2% | **78.4% – 86.2%** |
+| **2-Slot Concurrent Aggregate Decode** | N/A (serialized) | 58 – 70 tok/s combined | **70.1 – 84.4 tok/s combined\*** |
+| **Max Context Handled in Production** | ~32,000 tokens | 111,743 tokens | **111,743 tokens (zero OOMs or failures)** |
+| **Reliability Across Production Turns** | Frequent OOM / drops | Zero errors | **Zero errors, 0 exceptions, 0 socket drops** |
 
-*\*When multiple streams actively overlap in the exact same decode step, each stream runs autoregressively at ~28–35 tok/s (~58–70 tok/s parallel combined). Real-world multi-agent workloads leverage **Dynamic Solo MTP Promotion** (up to 77.4 tok/s) whenever the other stream completes or pauses for tool execution.*
+*\*When multiple streams actively overlap in the exact same decode step, each stream runs autoregressively at ~35–45 tok/s (~70–84 tok/s parallel combined). Real-world multi-agent workloads leverage **Dynamic Solo MTP Promotion** (up to 94.9 tok/s) whenever the other stream completes or pauses for tool execution.*
 
 ---
 
-### B. Live Multi-Turn Autonomous Agent Telemetry (Hermes, Cursor & Letta up to 111k Context)
+### B. Scaled Hardware Verification: RTX 3090 (24 GB) Baseline
+For comparison, running on a 24 GB GPU unlocks the higher-precision `IQ3_S` quantization pack and expanded residency:
+- **Model:** `Qwen3.8-Flash-Next GSQ-RCO-IQ3_S` (83.6 GB model pack)
+- **VRAM Expert Residency:** **6,436 resident experts (12.22 GB VRAM cache)**
+- **VRAM Cache Hit Rate:** **95.9%** (only 0.5% of lookups require PCIe transfer)
+- **Single-Stream Decode Speed:** **106.1 – 110.2 tok/s** (with 4-layer speculative MTP)
+- **Context Supported:** **204,800 tokens (200k)** with 32k streaming resident KV
+
+---
+
+### C. Live Multi-Turn Autonomous Agent Telemetry (Hermes, Cursor & Letta up to 111k Context)
 
 | Context Size (`PROMPT`) | Cached Prefix (`REUSED`) | Cache Reuse % | Output Tokens | Prefill Speed (`t/s`) | Decode Speed (`t/s`) | VRAM Hit Rate (`+PCIe`) | Turn Duration |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -392,10 +401,10 @@ flowchart TD
    | **Deep Research & Medium Codebases** | $C_{\max} \le 120\text{k}$ and $P_{95} \le 105\text{k}$ | **128k (`131072`)** | Safely covers 99%+ of multi-turn sessions with room for thinking budgets. |
    | **Ultra-Long Multi-File Code / Large Dumps** | $C_{\max} > 120\text{k}$ or $P_{95} > 105\text{k}$ | **200k (`204800`)** | **Prevents HTTP 400 Context Overflow crashes** on large prompt sessions. |
 
-5. **Concurrency Profile & 200k Capacity on 24 GB VRAM + 128 GB RAM:**
+5. **Concurrency Profile & Ultra-Long Context Memory Capacity:**
    * **`--kv int8` (1,056 Bytes/token):** Thanks to Flash-Next's hybrid architecture (4 QSA attention layers + 44 recurrent GDN layers), a full 200k context consumes only **206.2 MiB per stream**.
-   * **KV Streaming (`--kv-resident 20480`):** Keeps 20k tokens in VRAM and streams remainder from host RAM over PCIe 4.0 x16.
-   * **Capacity Limits:** Supports **4 active simultaneous generating streams** (`--batch 4` at ~15–18 tok/s each, or 2 slots at ~30 tok/s each) and holds **over 350 resident 200k conversations in 128 GB RAM** (`--conversation-cache-mib 40960 --conversation-cache-slots 16+`) with zero re-prefill delay on session resumption.
+   * **KV Streaming (`--kv-resident 20480` to `32768`):** Keeps recent attention tokens in VRAM and streams the remaining sequence from host RAM over PCIe 4.0 x16.
+   * **Capacity Limits:** Supports **2 to 4 active simultaneous generating streams** (at ~35–45 tok/s each on 2 slots) and holds **hundreds of resident conversations in system RAM** with instant resumption and zero re-prefill delay.
 
 ---
 

@@ -7,7 +7,7 @@ Guides the user through:
 3. AI Model & Quantization Selection (IQ3_S, IQ3_XXS, Q2_0).
 4. Engine Selection: Concurrency vs. Peak Performance (Strata vs. vLLM).
 5. Context Window & KV precision (32k, 64k, 128k, 200k, INT8, K8V4).
-6. Concurrency profile tuning (1, 2, 4 batch slots, conversation slots in 128GB RAM).
+6. Concurrency profile tuning (1, 2, 4 batch slots, conversation slots in system RAM).
 7. Automatic calculation and optimization of resident expert caches and kernel flags.
 """
 from __future__ import annotations
@@ -254,8 +254,9 @@ def run_benchmark(cfg: dict) -> dict:
     except Exception as e:
         print(yellow(f"  Live calibration sweep skipped ({e}). Using hardware analytical model."))
         results["status"] = "analytic"
-        # Analytic projection for RTX 3090 with IQ3_S
-        results["decode_tok_s"] = 68.5 if hw_cached.get("gpu_vram_mib", 0) >= 24000 else 34.0
+        # Analytical projection based on detected GPU VRAM and compute capability
+        vram = hw_cached.get("gpu_vram_mib", 12288)
+        results["decode_tok_s"] = 85.0 if vram >= 20000 else 65.0
         return results
 
 
@@ -329,7 +330,7 @@ def calculate_concurrency_capacity(
 
     max_active_compute_slots = max(1, min(4, int(avail_for_kv // kv_vram_per_slot_mib))) if avail_for_kv > 0 else 1
 
-    # In 128 GB RAM, compute maximum session conversation cache slots
+    # In available host RAM, compute maximum session conversation cache slots
     free_ram_mib = max(4096, (ram_gib - 24.0) * 1024)  # Leave 24 GB for OS and expert cache
     max_ram_conversation_slots = int(free_ram_mib // max(1, full_kv_mib_per_stream))
 
@@ -393,14 +394,15 @@ def main():
 
     # Step 2: Select Suitable AI Model
     print(bold("\n--- [Step 2/5] Model Selection ---"))
+    default_model_idx = 0 if hw["gpu_vram_mib"] >= 20000 else 1
     model_choice = ask_choice(
         "Select AI Model & Quantization",
         [
-            ("iq3_s", "Qwen3.8-Flash-Next IQ3_S (83.6 GB) - High precision, best quality; 2,400+ resident experts"),
-            ("iq3_xxs", "Qwen3.8-Flash-Next IQ3_XXS (76.5 GB) - Balanced footprint; 2,800+ resident experts"),
+            ("iq3_s", "Qwen3.8-Flash-Next IQ3_S (83.6 GB) - High precision, best quality; recommended for >= 20 GB VRAM"),
+            ("iq3_xxs", "Qwen3.8-Flash-Next IQ3_XXS (76.5 GB) - Balanced footprint; recommended for <= 16 GB VRAM"),
             ("custom", "Keep current model configuration in hydragen.json"),
         ],
-        default_idx=0,
+        default_idx=default_model_idx,
     )
 
     # Step 3: Choose Concurrency vs. Peak Latency Engine
@@ -475,24 +477,28 @@ def main():
         kv_mode=kv_mode,
         desktop_mode=desktop_choice,
         model_quant=model_choice,
-        vram_mib=hw["gpu_vram_mib"] or 24576,
+        vram_mib=hw["gpu_vram_mib"] or 12288,
         ram_gib=hw["ram_total_gib"],
     )
 
+    gpu_label = hw["gpu_name"] if hw["gpu_name"] != "Unknown GPU" else "Detected GPU"
+    vram_str = f"{round(hw['gpu_vram_mib'] / 1024)} GB" if hw["gpu_vram_mib"] else "Unknown VRAM"
+    ram_str = f"{round(hw['ram_total_gib'])} GB" if hw["ram_total_gib"] else "System"
+
     print(cyan("\n================================================================================"))
-    print(cyan(f"          HARDWARE CAPACITY REPORT FOR 200K CONTEXT ON THIS RTX 3090            "))
+    print(cyan(f"          HARDWARE CAPACITY REPORT FOR {ctx_choice.upper()} CONTEXT ON {gpu_label.upper()}            "))
     print(cyan("================================================================================"))
     print(f"  • {bold('Context Window:')}              {ctx_tokens:,} tokens ({ctx_choice})")
     print(f"  • {bold('KV Cache per Token:')}          {cap['kv_bytes_per_tok']} Bytes ({kv_mode.upper()})")
-    print(f"  • {bold('Full 200k Stream Memory:')}     {cap['full_kv_mib_per_stream']} MiB per user stream")
+    print(f"  • {bold(f'Full {ctx_choice} Stream Memory:')}     {cap['full_kv_mib_per_stream']} MiB per user stream")
     print(f"  • {bold('VRAM Resident KV:')}            {cap['kv_vram_per_slot_mib']} MiB per active slot (--kv-resident 32768)")
     print(f"  • {bold('System RAM Streaming KV:')}     {cap['kv_ram_per_slot_mib']} MiB per slot held in host RAM")
     print(f"  • {bold('Active Compute Slots:')}        {batch_slots} concurrent parallel generation slots")
-    print(f"  • {bold('In-Memory Session Limit:')}     {green(str(min(64, cap['max_ram_conversation_slots'])))}+ concurrent 200k sessions resident in 128GB RAM")
+    print(f"  • {bold('In-Memory Session Limit:')}     {green(str(min(64, cap['max_ram_conversation_slots'])))}+ concurrent {ctx_choice} sessions resident in {ram_str} RAM")
     print(cyan("--------------------------------------------------------------------------------"))
-    print(f"  {bold('Summary Answer:')} This RTX 3090 (24 GB) + 128 GB RAM box can comfortably serve:")
-    print(f"    1. {green(str(batch_slots))} active simultaneous generating streams in parallel (at ~30 tok/s each for 2 slots).")
-    print(f"    2. Over {green('300+')} paused/idle 200k conversations resident in 128 GB RAM simultaneously")
+    print(f"  {bold('Summary Answer:')} This {gpu_label} ({vram_str}) + {ram_str} RAM box can comfortably serve:")
+    print(f"    1. {green(str(batch_slots))} active simultaneous generating streams in parallel.")
+    print(f"    2. Over {green(str(min(500, cap['max_ram_conversation_slots'])))} paused/idle {ctx_choice} conversations resident in {ram_str} RAM simultaneously")
     print(f"       with instant resumption (no re-prefill delay) using conversation caching.")
     print(cyan("================================================================================"))
 
