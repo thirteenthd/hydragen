@@ -294,8 +294,10 @@ Querying `GET /api/requests` confirmed zero false truncations and pristine telem
 | **4** | Lock-Free C++ SPSC IPC Engine | 2,115 | **89.1 tok/s** | 59.3 tok/s (C=2) | Eradicated stdio pipe serialization & GIL locking |
 | **5** | 4-Way Concurrency Scaling Stress | 1,112 | 28.7 tok/s | 51.8 tok/s (C=4) | Diagnosed Hermes SIGABRT crash & hit-rate collapse |
 | **6** | **The Modern 12GB Sweet Spot** | **2,348** | **78.6 tok/s** | **58–72 tok/s (C=2)** | Doubled VRAM experts, locked in rock-solid stability |
+| **7** | **Resizable BAR & Power Tuning** | **2,348** | **88.6–94.9 tok/s** | **70.1–84.4 tok/s (C=2)** | Unlocked 16 GiB BAR1 DMA aperture & 240W boost |
 
 ### Core Architectural Lessons
 1. **Power-Law Profiling Beats Dynamic Swapping:** Trying to move hundreds of gigabytes across PCIe dynamically on consumer hardware will always lose to offline static profiling. Staging the top ~2,300 power-law experts directly in VRAM is what enables interactive speeds.
 2. **Lock-Free Ring Buffers are Mandatory for Fast Serving:** Piping high-frequency token streams through OS stdio pipes and Python string parsing caps multi-stream performance. Direct SPSC circular ring buffers operating in nanoseconds are required to sustain GPU saturation.
-3. **Hardware Geometry Must Dictate Concurrency Limits:** On a 12GB card, slot sessions are not "free." Every batch slot consumes 0.58 GiB of VRAM that would otherwise hold ~340 expert blobs. Setting `--batch 2` preserves **2,348 resident experts**, delivering blazing **74–78 tok/s solo speed** and responsive **~60–72 tok/s dual-agent concurrency** with zero stability hazards.
+3. **Hardware Geometry Must Dictate Concurrency Limits:** On a 12GB card, slot sessions are not "free." Every batch slot consumes 0.58 GiB of VRAM that would otherwise hold ~340 expert blobs. Setting `--batch 2` preserves **2,348 resident experts**, delivering blazing **88–95 tok/s solo speed** and responsive **~70–84 tok/s dual-agent concurrency** with zero stability hazards.
+4. **Human-AI Co-Engineering:** Hydragen was engineered through continuous pair programming between **thirteenthd** and **Antigravity** (Google DeepMind). From diagnosing pipe deadlocks to discovering the 256MB ReBAR hardware clamp, this collaboration united frontier systems design with bare-metal assembly, PTX SIMD tuning, and automated telemetry.

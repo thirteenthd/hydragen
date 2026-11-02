@@ -410,10 +410,11 @@ flowchart TD
 
 ## 8. Attribution & Acknowledgments
 
-Hydragen builds upon and brings together foundational open-source AI projects:
+Hydragen builds upon, unites, and expands foundational open-source AI projects:
 
 * **[Strata](https://github.com/Niko1221/Strata)** by Niko Veit ([@Niko1221](https://github.com/Niko1221)): For the tiered expert memory architecture, pinned host-RAM expert arena offloading, GSQ sub-4-bit quantization (`IQ3_XXS`/`IQ2_XS`/`Q2_0_STRATA`), and speculative MTP decoding on consumer hardware.
 * **[TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)** by the NVIDIA Team: For in-flight continuous batching paradigms, virtual page-table block allocation, and low-latency IPC execution patterns.
 * **[vLLM](https://github.com/vllm-project/vllm)** by the vLLM Team: For continuous multi-slot scheduling, PagedAttention KV management, and high-throughput Triton FusedMoE execution.
+* **[Antigravity](https://deepmind.google/)** (Google DeepMind): AI systems architect and pair programming contributor throughout the research, benchmarking, CUDA PTX DP4A SIMD assembly, C++ lock-free SPSC IPC engineering, hardware PCIe/ReBAR optimization, and multi-tier concurrency design.
 
 Hydragen is released under the [Apache-2.0 License](LICENSE).
