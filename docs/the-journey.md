@@ -45,7 +45,7 @@ However, we immediately ran into three severe structural impasses:
 3. **Quantization Software Dequantization:** vLLM’s CUTLASS and Triton kernels assumed standard linear weights (FP16/BF16/FP8). GGUF's irregular Importance Quantization blocks (`IQ3_XXS`, `IQ2_XS`, `Q2_0_STRATA`) had to be dequantized on-the-fly in software, bottlenecking execution on memory bandwidth.
 
 ### Stage 1 Full Test: Baseline Benchmark
-We executed a full benchmark on `modelserver01` (RTX 3080 Ti 12GB, Ryzen 9 5900X, 64GB DDR4):
+We executed a full benchmark on the Linux testbed (RTX 3080 Ti 12GB, Ryzen 9 5900X, 64GB DDR4):
 
 | Metric | Measured Result |
 | :--- | :--- |
@@ -110,7 +110,7 @@ In single-token autoregressive decoding ($M=1$), execution is 100% memory-bandwi
    Linked `libstrata_trtllm_plugin.so` directly against `libstrata_iq_kernels.so` to tap directly into `strata_vllm_native_expert_grouped()` and `strata_vllm_moe_combine_multi()`.
 
 ### Stage 3 Full Test: PTX SIMD Benchmark
-We re-ran the single-stream evaluation on `modelserver01`:
+We re-ran the single-stream evaluation on the Linux testbed:
 
 | Metric | Stage 2 (Lean TRT-LLM) | Stage 3 (PTX `dp4a` + Assembly) | Native Strata Benchmark | Parity Achieved |
 | :--- | :---: | :---: | :---: | :---: |
@@ -144,7 +144,7 @@ We eliminated the OS pipe entirely by building a custom C++ lock-free shared IPC
 During our initial test, a hard deadlock occurred at token 7 because both Python `_pump` and C++ `FastEngineIPC` were racing on the same Linux anonymous pipe. Once exclusive ownership was granted to `FastEngineIPC` and single-stream prompt tokens were isolated from batch slot 0, the engine unlocked its full throughput.
 
 ### Stage 4 Full Test: Fast IPC Live Benchmark
-Tested live across 1, 2, and 4 concurrent streams on `modelserver01`:
+Tested live across 1, 2, and 4 concurrent streams on the Linux testbed:
 
 | Concurrency Level | Stage 1 (vLLM) | Stage 2 (TRT-LLM) | Stage 3 (PTX) | **Stage 4 (Fast IPC)** | Native Strata | vs. Native |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -242,7 +242,7 @@ We re-centered the engine around the **12GB Hardware Sweet Spot**:
 ```
 
 ### Stage 6 Full Test: Production Verification Benchmark
-We executed comprehensive short-sweep and long-generation stress tests on `modelserver01`:
+We executed comprehensive short-sweep and long-generation stress tests on the Linux testbed:
 
 #### 1. Short Generation Sweep (`max_tokens: 200`)
 ```text

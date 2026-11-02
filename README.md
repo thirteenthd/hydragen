@@ -97,7 +97,7 @@ Serving frontier Mixture-of-Experts (MoE) architectures—such as **Qwen3.8-Flas
 ### Testbed Hardware & Model Configuration
 | Component | Specification |
 | :--- | :--- |
-| **Host Machine** | `modelserver01` (Ubuntu Server LTS bare-metal) |
+| **Operating System** | Ubuntu Server LTS (Linux bare-metal) |
 | **GPU** | 1x **NVIDIA GeForce RTX 3080 Ti** (12 GB GDDR6X, 912 GB/s, PCIe Gen4 x16) |
 | **CPU** | **AMD Ryzen 9 5900X** (12 Cores / 24 Threads) |
 | **System RAM** | **64 GB DDR4** (~40–41 GiB locked for pinned expert arena) |
@@ -110,7 +110,7 @@ Serving frontier Mixture-of-Experts (MoE) architectures—such as **Qwen3.8-Flas
 
 ### A. End-to-End Inference Throughput & Production Stability
 
-The following metrics reflect continuous bare-metal production workloads running on `modelserver01` across **286 multi-turn requests** and **266,501 tokens generated**:
+The following metrics reflect continuous bare-metal production workloads across **286 multi-turn requests** and **266,501 tokens generated**:
 
 | Metric | Stock Single-Slot (Baseline) | Hydragen (`STRATA_ROUTE_PRIOR=0.85` + MTP 4) |
 | :--- | :---: | :---: |
