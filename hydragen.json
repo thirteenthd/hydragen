@@ -23,7 +23,7 @@
     "int8",
     "--vision",
     "--vram-reserve-mib",
-    "1200",
+    "450",
     "--pcie-frac",
     "0.20",
     "--spec-min-p",
@@ -45,7 +45,7 @@
     "8",
     "--prompt-cache-tail",
     "--batch",
-    "4",
+    "2",
     "--batch-mtp"
   ],
   "cwd": ".",
@@ -75,7 +75,7 @@
     "STRATA_PREFILL_EQUAL": "1",
     "STRATA_ROUTE_PRIOR": "0.85"
   },
-  "parallel": 4,
+  "parallel": 2,
   "reasoning_loop_recovery": "recover",
   "reasoning_close_retry": true,
   "repeat_stop_tokens": 64
