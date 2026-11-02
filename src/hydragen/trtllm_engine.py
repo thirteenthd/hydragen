@@ -218,29 +218,23 @@ class TRTLLMEngine:
             self.kv_manager = TRTPagedBlockManager(block_size=16, max_blocks=4096)
 
         # 4. Expert Manager & Locality
-        try:
-            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-            self.expert_manager = PagedExpertManager(
-                num_slots=self.num_slots,
-                expert_shape=(3, self.n_ff, self.n_embd),
-                total_experts=self.n_exp,
-                dtype=torch.float16,
-                device=self.device,
-                loader=self.loader,
-                default_layer_idx=0,
-            )
-        except Exception as e:
-            print(f"[hydragen:trtllm] PyTorch CUDA context notice ({e}); using CPU device for host bridge")
-            self.device = torch.device("cpu")
-            self.expert_manager = PagedExpertManager(
-                num_slots=self.num_slots,
-                expert_shape=(3, self.n_ff, self.n_embd),
-                total_experts=self.n_exp,
-                dtype=torch.float16,
-                device=self.device,
-                loader=self.loader,
-                default_layer_idx=0,
-            )
+        self.expert_manager = None
+        self.device = torch.device("cpu")
+        if self.trt_executor is not None:
+            try:
+                self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                self.expert_manager = PagedExpertManager(
+                    num_slots=self.num_slots,
+                    expert_shape=(3, self.n_ff, self.n_embd),
+                    total_experts=self.n_exp,
+                    dtype=torch.float16,
+                    device=self.device,
+                    loader=self.loader,
+                    default_layer_idx=0,
+                )
+            except Exception as e:
+                print(f"[hydragen:trtllm] PagedExpertManager note: {e}")
+                self.expert_manager = None
         self.locality_policy = ExpertLocalityPolicy(set())
 
         # 5. In-Flight Batching Slot Table & Queue
