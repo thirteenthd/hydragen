@@ -24,10 +24,12 @@ def main() -> int:
         if p and os.path.isdir(p) and p not in sys.path:
             sys.path.insert(0, p)
 
-    # Register vLLM quantization plugin
-    from hydragen.vllm_plugin import register_strata_vllm_plugin
-
-    register_strata_vllm_plugin()
+    # Register vLLM quantization plugin if available
+    try:
+        from hydragen.vllm_plugin import register_strata_vllm_plugin
+        register_strata_vllm_plugin()
+    except Exception:
+        pass
 
     try:
         from hydragen.server.server import main as server_main

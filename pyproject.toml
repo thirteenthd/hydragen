@@ -22,6 +22,7 @@ dependencies = [
     "psutil",
     "regex",
     "Pillow",
+    "jinja2",
 ]
 
 [project.optional-dependencies]

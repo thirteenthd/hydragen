@@ -12,13 +12,28 @@ import threading
 import time
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
-import torch
-
 from hydragen.core.block_manager import TRTPagedBlockManager, create_block_manager
 from hydragen.core.scheduler import InFlightScheduler
-from hydragen.expert_locality_policy import ExpertLocalityPolicy
-from hydragen.expert_manager import PagedExpertManager
-from hydragen.gguf_loader import StrataGGUFMoELoader, register_strata_gguf_types
+
+# Graceful optional imports for PyTorch and GGUF MoE components
+HAS_TORCH = False
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    torch = None  # type: ignore
+
+HAS_GGUF = False
+try:
+    from hydragen.expert_locality_policy import ExpertLocalityPolicy
+    from hydragen.expert_manager import PagedExpertManager
+    from hydragen.gguf_loader import StrataGGUFMoELoader, register_strata_gguf_types
+    HAS_GGUF = True
+except ImportError:
+    ExpertLocalityPolicy = None  # type: ignore
+    PagedExpertManager = None  # type: ignore
+    StrataGGUFMoELoader = None  # type: ignore
+    register_strata_gguf_types = None  # type: ignore
 
 # Check for tensorrt_llm if available
 HAS_TRTLLM = False
@@ -90,12 +105,19 @@ class TRTLLMEngine:
         print(f"[hydragen:trtllm] Concurrency slots: {self.batch}, In-Flight Batching: ENABLED")
 
         # 1. GGUF Loader & Bridge Metadata
-        register_strata_gguf_types()
-        self.loader = StrataGGUFMoELoader(shard)
-        meta = self.loader.get_layer_expert_metadata(0)
-        self.n_embd = meta["n_embd"]
-        self.n_ff = meta["n_ff"]
-        self.n_exp = meta["n_exp"]
+        if register_strata_gguf_types is not None:
+            register_strata_gguf_types()
+        if StrataGGUFMoELoader is not None:
+            self.loader = StrataGGUFMoELoader(shard)
+            meta = self.loader.get_layer_expert_metadata(0)
+            self.n_embd = meta["n_embd"]
+            self.n_ff = meta["n_ff"]
+            self.n_exp = meta["n_exp"]
+        else:
+            self.loader = None
+            self.n_embd = 4096
+            self.n_ff = 11008
+            self.n_exp = 64
 
         # 2. Check for TRT-LLM C++ Executor Runtime or Resident Backend
         self.backend = None
@@ -153,8 +175,8 @@ class TRTLLMEngine:
 
         # 5. Expert Manager & Locality
         self.expert_manager = None
-        self.device = torch.device("cpu")
-        if self.trt_executor is not None:
+        self.device = torch.device("cpu") if HAS_TORCH else "cpu"
+        if self.trt_executor is not None and HAS_TORCH and PagedExpertManager is not None:
             try:
                 self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
                 self.expert_manager = PagedExpertManager(
@@ -169,7 +191,7 @@ class TRTLLMEngine:
             except Exception as e:
                 print(f"[hydragen:trtllm] PagedExpertManager note: {e}")
                 self.expert_manager = None
-        self.locality_policy = ExpertLocalityPolicy(set())
+        self.locality_policy = ExpertLocalityPolicy(set()) if ExpertLocalityPolicy is not None else None
 
         # Telemetry & Info
         b_info = getattr(self.backend, "info", {}) if self.backend is not None else {}

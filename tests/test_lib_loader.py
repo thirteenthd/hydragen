@@ -19,9 +19,11 @@ class TestLibLoader(unittest.TestCase):
         self.assertTrue(any("server" in p for p in paths))
 
     def test_search_paths_honor_env_var(self):
-        os.environ["TEST_CUSTOM_LIB_SO"] = "/tmp/custom_lib.so"
+        from pathlib import Path
+        custom_path = str(Path("/tmp/custom_lib.so"))
+        os.environ["TEST_CUSTOM_LIB_SO"] = custom_path
         paths = [str(p) for p in get_search_paths("test_lib.so", env_var="TEST_CUSTOM_LIB_SO")]
-        self.assertEqual(paths[0], "/tmp/custom_lib.so")
+        self.assertEqual(paths[0], custom_path)
         del os.environ["TEST_CUSTOM_LIB_SO"]
 
     def test_load_nonexistent_library_returns_none(self):
