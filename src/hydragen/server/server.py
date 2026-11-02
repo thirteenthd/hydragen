@@ -76,32 +76,32 @@ for _cand in reversed(_paths):
         if _cand in sys.path:
             sys.path.remove(_cand)
         sys.path.insert(0, _cand)
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+from hydragen.server.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
                             tool_choice_of, unmark_think_literals)
-from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
-from serve import runconfig  # noqa: E402
-from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
+from hydragen.server.mcp import McpCancelled, hub_from_config  # noqa: E402
+from hydragen.server import runconfig  # noqa: E402
+from hydragen.server.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
 from strata_control import tls  # noqa: E402
 
 tls.install()       # #3722: image URLs and tool servers over HTTPS are checked against the operating system's certificates
 from strata_control import hipblaslt_tuning  # noqa: E402
 from strata_control import vision_reader  # noqa: E402
-from serve.ds_pictures import DsPictures  # noqa: E402
+from hydragen.server.ds_pictures import DsPictures  # noqa: E402
 from strata_control import draft_layer  # noqa: E402
 from strata_control import drafting  # noqa: E402
 from strata_control import user_args  # noqa: E402
 from strata_control import gpu_roles  # noqa: E402
-from serve import ready as ready_file  # noqa: E402
-from serve import owner_guard  # noqa: E402
-from serve import launch_identity  # noqa: E402
-from serve import logit_bias as bias_api  # noqa: E402
-from serve import lifeline  # noqa: E402
-from serve.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
-from serve import responses as responses_api  # noqa: E402
-from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
-from serve import images as images_api  # noqa: E402
+from hydragen.server import ready as ready_file  # noqa: E402
+from hydragen.server import owner_guard  # noqa: E402
+from hydragen.server import launch_identity  # noqa: E402
+from hydragen.server import logit_bias as bias_api  # noqa: E402
+from hydragen.server import lifeline  # noqa: E402
+from hydragen.server.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
+from hydragen.server import responses as responses_api  # noqa: E402
+from hydragen.server.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
+from hydragen.server import images as images_api  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -618,7 +618,7 @@ def start_exit_note(rc: int | None, exe=None) -> str:
         return ""
     note = f"\nthe engine process ended: {words}"
     try:                                            # 0xC0000135: say which DLL (the loader prints nothing)
-        from serve.loader_diag import missing_note
+        from hydragen.server.loader_diag import missing_note
         note += missing_note(rc, exe)
     except Exception:
         pass
@@ -3573,7 +3573,7 @@ def igpu_cards(indices: list[int], archs: dict[int, str] | None) -> set[int]:
 def gpu_vram_mib(indices: list[int], hip: bool = False) -> dict[int, int] | None:
     """Total VRAM of each card in MiB (NVML / amdgpu sysfs); None when any of them cannot be read."""
     try:
-        from serve.telemetry import gpu_reader
+        from hydragen.server.telemetry import gpu_reader
     except ImportError:
         return None
     out = {}
@@ -4185,7 +4185,7 @@ class Service:
         # /metrics/prometheus' two throughput gauges need the totals as they stood at the last scrape, because
         # llama.cpp averages them over the window between two scrapes (#2341).
         self.scrape_bucket = (0, 0.0, 0, 0.0)
-        from serve.prometheus import Latencies
+        from hydragen.server.prometheus import Latencies
         self.latencies = Latencies()                     # GET /metrics in Prometheus text: the latency histograms
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
@@ -4241,7 +4241,7 @@ class Service:
         token, DSML tool calls, reasoning-effort words).  The others keep the defaults."""
         self.family = family
         if family == "deepseek41":
-            from serve import dsml
+            from hydragen.server import dsml
             eos = (getattr(self.tok, "special_ids", None) or {}).get("eos", 1)
             self.stop_ids = {int(eos)}
             EOS_IDS.update(self.stop_ids)
@@ -4249,7 +4249,7 @@ class Service:
                 self.engine.eos_ids.update(self.stop_ids)
             self.parser_cls = dsml.DsmlOutputParser
             self._force_text = dsml.to_dsml_force
-        import serve.frontend as _frontend
+        import hydragen.server.frontend as _frontend
         _frontend.use_family(family)
 
     _force_text = None
@@ -4398,7 +4398,7 @@ class Service:
                                        prompt_tokens=None, generated=None, max_tokens=None)
                 try:
                     if action == 'save' and getattr(self.engine, 'session_save_reclaim', False):
-                        from serve.session_save_retry import session_file
+                        from hydragen.server.session_save_retry import session_file
                         r = session_file(self, action, path, SessionRefused)
                     else:
                         r = self.engine.session_file(action, path)
@@ -4558,7 +4558,7 @@ class Service:
         """Free VRAM on the engine's (first) GPU, from the backend's reader - NVML, the amdgpu sysfs files (#301) or
         IOKit on macOS (Metal backend); None when it can't be read (then nothing is refused)."""
         try:
-            from serve.telemetry import gpu_reader
+            from hydragen.server.telemetry import gpu_reader
             g = gpu_reader(int(getattr(self, "gpu_index", 0) or 0), amd=getattr(self, "backend", None) == "hip")
             if not g.ok():
                 return None
@@ -4847,7 +4847,7 @@ class Service:
     def start_telemetry(self):
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
         if getattr(self, "telemetry", None) is None:
-            from serve.telemetry import Telemetry
+            from hydragen.server.telemetry import Telemetry
             self.telemetry = Telemetry(extra=self._telemetry_extra,
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
@@ -7157,7 +7157,7 @@ def make_handler(svc: Service):
                     self.wfile.write(body)
                 return
             if path == "/metrics":
-                from serve import prometheus
+                from hydragen.server import prometheus
                 if prometheus.wants_prometheus(self.headers.get("Accept", ""), urlsplit(self.path).query):
                     if self._authorized():   # a scraper: the text format, vLLM's names (serve/prometheus.py)
                         body = prometheus.render(svc.metrics(), svc.latencies.snapshot()).encode()
@@ -8755,7 +8755,7 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
                    *, offline: bool = False):
     """Opt-in data-parallel replicas (serve/replicas.py): one StrataEngine per card group, each with its own cards, log
     and CPU cores, started together; the ReplicaEngine in front spreads the requests."""
-    from serve import replicas as rp
+    from hydragen.server import replicas as rp
     n = len(groups)
     cpus = rp.cpu_sets(n, cfg.get("replica_cpus") is not False)
     print(f"[strata] {n} replicas on the cards {' | '.join(','.join(map(str, g)) for g in groups)}"
@@ -8799,7 +8799,7 @@ def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bo
     """Opt-in split serving (serve/split.py): a prefill engine and a decode engine, one card each, the same model and the
     same session settings.  Started one after the other, so a shared expert arena is filled once; the SplitEngine in
     front hands a long prompt from the first to the second."""
-    from serve import split as sp
+    from hydragen.server import split as sp
     sp.check_cfg(cfg, spec)
     arena, arena_note = sp.arena_path(cfg, spec)
     work = sp.session_dir(spec)
@@ -9252,12 +9252,12 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             effort_end = effort_end_args(cfg, exe, tok)  # #458
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        from serve import replicas as rp
+        from hydragen.server import replicas as rp
         try:
             groups = rp.gpu_groups(cfg)
         except rp.ReplicaConfigError as e:
             raise SystemExit(f"[strata] config {e}")
-        from serve import split as split_mod
+        from hydragen.server import split as split_mod
         try:
             split = split_mod.split_spec(cfg)
             if split:
@@ -9279,7 +9279,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             print(note, flush=True)
     elif a.engine == "vllm":
         effort_end = None
-        from serve.vllm_engine import VLLMEngine
+        from hydragen.server.vllm_engine import VLLMEngine
         engine = VLLMEngine(cfg, tok, batch_slots=a.parallel or 4)
         vision = None
         if cfg.get("vision"):
@@ -9295,7 +9295,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         sampling_defaults = sampling_defaults_from_config(cfg)
     elif a.engine == "trtllm":
         effort_end = None
-        from serve.trtllm_engine import TRTLLMEngine
+        from hydragen.trtllm_engine import TRTLLMEngine
         engine = TRTLLMEngine(cfg, tok, batch_slots=a.parallel or 4)
         vision = None
         if cfg.get("vision"):
@@ -9318,7 +9318,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
     if (cfg.get("arch") or "") == "deepseek41":
-        from serve import dsml
+        from hydragen.server import dsml
         tpl, swapped = dsml.pick_template(tpl)
         if swapped:
             print("[strata] this pack's chat template spells the tool-call block differently from the V4.1 model's; "
@@ -9374,7 +9374,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
               f"{icfg.get('backend') or '?'} (POST /v1/images/generations; GPU policy {svc.images.policy})", flush=True)
     if cfg.get("prevent_sleep") is not None and not isinstance(cfg["prevent_sleep"], bool):
         raise SystemExit(f"[strata] config \"prevent_sleep\" must be true or false, not {cfg['prevent_sleep']!r}")
-    from serve.keepawake import KeepAwake
+    from hydragen.server.keepawake import KeepAwake
     svc.keep_awake = KeepAwake.create(cfg.get("prevent_sleep") is True)      # #1727: opt-in, Windows only
     if cfg.get("reasoning_effort") is not None:         # #1641: the thinking level of requests that name none
         try:
@@ -9451,7 +9451,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):
         raise SystemExit(f"[strata] config \"env_to_user\" must be true or false, not {etu!r}")
-    import serve.frontend as _frontend
+    import hydragen.server.frontend as _frontend
     _frontend.ENV_TO_USER = etu
     rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)   # #606: opt-out with 0
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
@@ -9596,7 +9596,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                     if getattr(engine, "proc", None):
                         engine.proc.kill()
                         try:
-                            from serve import cache_drop
+                            from hydragen.server import cache_drop
                             cache_drop.drop_after_exit(engine)       # opt-in (STRATA_DROP_CACHE_ON_EXIT=1), default unchanged
                         except Exception as e:  # noqa: BLE001 - never block the exit
                             print(f"[strata] could not release the model files' cache: {e}", flush=True)

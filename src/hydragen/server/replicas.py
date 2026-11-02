@@ -112,7 +112,7 @@ def cpu_sets(n: int, enabled: bool = True):
     if not enabled or n < 2 or not hasattr(os, "sched_getaffinity"):
         return None
     try:
-        from serve.cpu_affinity import partition_cpu_sets
+        from hydragen.server.cpu_affinity import partition_cpu_sets
         return partition_cpu_sets(n, set(os.sched_getaffinity(0)))
     except (ValueError, OSError, ImportError) as e:
         print(f"[strata] replicas: no separate CPU cores ({e})", flush=True)
@@ -382,7 +382,7 @@ class ReplicaEngine:
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         # imported here: serve.server imports this module
-        from serve.server import EngineDied, EngineNonFinite
+        from hydragen.server.server import EngineDied, EngineNonFinite
         k = self.route(ids)
         if k < 0:
             raise EngineDied("no replica is running; this request was not sent")

@@ -378,7 +378,7 @@ class SplitEngine:
     def _hand_over(self, ids, cancel, rec: dict):
         """Prefill engine reads the prompt, saves the session; the decode engine restores it.  Yields keep-alives.
         rec['ok'] is True when the decode engine now holds the prompt's first n-1 tokens."""
-        from serve.server import EngineDied, SessionRefused
+        from hydragen.server.server import EngineDied, SessionRefused
         P, D = self.prefill, self.decode
         n = len(ids)
         self.__dict__["seq"] += 1

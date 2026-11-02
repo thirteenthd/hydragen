@@ -163,7 +163,7 @@ class DsPictures:
         """Checks that a picture can be read and sized (the Service's pre-check of tool pictures); nothing is stored."""
         data = source if isinstance(source, bytes) else None
         if data is None:
-            from serve.server import Vision
+            from hydragen.server.server import Vision
             data = Vision.load(source)
         self.prepare(data)
 

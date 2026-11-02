@@ -34,7 +34,7 @@ import time
 import urllib.error
 import urllib.request
 
-from serve import lifeline
+from hydragen.server import lifeline
 
 PROTOCOL = "2025-06-18"               # the MCP revision Strata asks for; the server's answer is used as given
 DEFAULTS = {"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0, "image_results": False}
