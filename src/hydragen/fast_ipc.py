@@ -21,51 +21,43 @@ class FastEngineIPC:
         if cls._lib is not None:
             return cls._lib
 
-        search_paths = [
-            Path(__file__).resolve().parent / "libstrata_fast_ipc.so",
-            Path(__file__).resolve().parent / "server" / "libstrata_fast_ipc.so",
-            Path(__file__).resolve().parent.parent.parent / "lib" / "libstrata_fast_ipc.so",
-            Path.cwd() / "lib" / "libstrata_fast_ipc.so",
-            Path("/home/thirteenthd/hydragen/lib/libstrata_fast_ipc.so"),
-            Path("/home/thirteenthd/hydragen/serve/libstrata_fast_ipc.so"),
-        ]
+        from hydragen.lib_loader import load_native_library
 
-        for p in search_paths:
-            if p.exists():
-                try:
-                    lib = ctypes.CDLL(str(p))
-                    lib.strata_fast_ipc_create.argtypes = [ctypes.c_int, ctypes.c_int]
-                    lib.strata_fast_ipc_create.restype = ctypes.c_void_p
+        lib = load_native_library("libstrata_fast_ipc.so", env_var="LIBSTRATA_FAST_IPC_SO")
+        if lib is not None:
+            try:
+                lib.strata_fast_ipc_create.argtypes = [ctypes.c_int, ctypes.c_int]
+                lib.strata_fast_ipc_create.restype = ctypes.c_void_p
 
-                    lib.strata_fast_ipc_set_control_callback.argtypes = [
-                        ctypes.c_void_p,
-                        CONTROL_CB_TYPE,
-                        ctypes.c_void_p,
-                    ]
-                    lib.strata_fast_ipc_set_control_callback.restype = None
+                lib.strata_fast_ipc_set_control_callback.argtypes = [
+                    ctypes.c_void_p,
+                    CONTROL_CB_TYPE,
+                    ctypes.c_void_p,
+                ]
+                lib.strata_fast_ipc_set_control_callback.restype = None
 
-                    lib.strata_fast_ipc_read_token.argtypes = [
-                        ctypes.c_void_p,
-                        ctypes.c_int32,
-                        ctypes.POINTER(ctypes.c_int32),
-                        ctypes.c_int32,
-                    ]
-                    lib.strata_fast_ipc_read_token.restype = ctypes.c_int32
+                lib.strata_fast_ipc_read_token.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_int32,
+                    ctypes.POINTER(ctypes.c_int32),
+                    ctypes.c_int32,
+                ]
+                lib.strata_fast_ipc_read_token.restype = ctypes.c_int32
 
-                    if hasattr(lib, "strata_fast_ipc_clear_slot"):
-                        lib.strata_fast_ipc_clear_slot.argtypes = [ctypes.c_void_p, ctypes.c_int32]
-                        lib.strata_fast_ipc_clear_slot.restype = None
+                if hasattr(lib, "strata_fast_ipc_clear_slot"):
+                    lib.strata_fast_ipc_clear_slot.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+                    lib.strata_fast_ipc_clear_slot.restype = None
 
-                    lib.strata_fast_ipc_stop.argtypes = [ctypes.c_void_p]
-                    lib.strata_fast_ipc_stop.restype = None
+                lib.strata_fast_ipc_stop.argtypes = [ctypes.c_void_p]
+                lib.strata_fast_ipc_stop.restype = None
 
-                    lib.strata_fast_ipc_destroy.argtypes = [ctypes.c_void_p]
-                    lib.strata_fast_ipc_destroy.restype = None
+                lib.strata_fast_ipc_destroy.argtypes = [ctypes.c_void_p]
+                lib.strata_fast_ipc_destroy.restype = None
 
-                    cls._lib = lib
-                    return cls._lib
-                except Exception as e:
-                    print(f"[fast_ipc] Warning: Failed to load {p}: {e}")
+                cls._lib = lib
+                return cls._lib
+            except Exception as e:
+                print(f"[fast_ipc] Warning: Failed to initialize C API: {e}")
 
         return None
 

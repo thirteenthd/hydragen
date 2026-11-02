@@ -7,9 +7,11 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 BUILD_DIR="${REPO_ROOT}/build"
 LIB_DIR="${REPO_ROOT}/lib"
+PKG_LIB_DIR="${REPO_ROOT}/src/hydragen/lib"
 
 mkdir -p "${BUILD_DIR}"
 mkdir -p "${LIB_DIR}"
+mkdir -p "${PKG_LIB_DIR}"
 
 NVCC="/usr/local/cuda-13.1/bin/nvcc"
 if [ ! -f "${NVCC}" ]; then
@@ -83,6 +85,7 @@ g++ -O3 -fPIC -std=c++17 -pthread -shared \
     -o "${LIB_DIR}/libstrata_fast_ipc.so"
 
 echo "====================================================="
-echo "Build complete!"
+echo "Build complete! Staging to ${PKG_LIB_DIR}..."
+cp -f "${LIB_DIR}"/*.so "${PKG_LIB_DIR}/" || true
 ls -la "${LIB_DIR}"
 echo "====================================================="

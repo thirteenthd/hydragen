@@ -78,22 +78,15 @@ class PagedKVManager:
             self._seq_tokens: Dict[int, int] = {}
 
     def _load_native_lib(self) -> Optional[ctypes.CDLL]:
-        candidates = [
-            os.environ.get("LIBPAGED_KV_SO", ""),
-            os.path.join(os.path.dirname(__file__), "..", "..", "lib", "libpaged_kv.so"),
-            os.path.join(os.path.dirname(__file__), "libpaged_kv.so"),
-            os.path.join(os.path.dirname(__file__), "server", "libpaged_kv.so"),
-            os.path.join(os.path.dirname(__file__), "..", "..", "build", "libpaged_kv.so"),
-            os.path.join(os.path.dirname(__file__), "paged_kv.dll"),
-        ]
-        for p in candidates:
-            if os.path.exists(p):
-                try:
-                    lib = ctypes.CDLL(p)
-                    self._setup_c_api(lib)
-                    return lib
-                except Exception:
-                    pass
+        from hydragen.lib_loader import load_native_library
+
+        lib = load_native_library("libpaged_kv.so", env_var="LIBPAGED_KV_SO")
+        if lib is not None:
+            try:
+                self._setup_c_api(lib)
+                return lib
+            except Exception:
+                pass
         return None
 
     def _setup_c_api(self, lib: ctypes.CDLL):
