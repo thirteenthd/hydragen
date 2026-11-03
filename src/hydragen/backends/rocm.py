@@ -333,9 +333,16 @@ class ROCMHardwareBackend(HardwareBackend):
                 pass
 
     def allocate_pinned_host_tensor(self, shape: Tuple[int, ...], dtype: Any) -> Any:
-        pin = torch.cuda.is_available()
-        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=pin)
+        if torch.cuda.is_available():
+            try:
+                return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+            except Exception:
+                pass
+        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=False)
 
     def empty_tensor(self, shape: Tuple[int, ...], dtype: Any, device: Optional[Any] = None) -> Any:
         dev = device if device is not None else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-        return torch.empty(shape, dtype=dtype, device=dev)
+        try:
+            return torch.empty(shape, dtype=dtype, device=dev)
+        except Exception:
+            return torch.empty(shape, dtype=dtype, device="cpu")

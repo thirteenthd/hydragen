@@ -58,7 +58,11 @@ class PagedExpertManager:
             self.hw = hw_backend
         else:
             from hydragen.backends.registry import BackendRegistry
-            self.hw = BackendRegistry.get_hardware_backend()
+            from hydragen.backends.base import DeviceType
+            if hasattr(device, "type") and device.type == "cpu":
+                self.hw = BackendRegistry.get_hardware_backend(force_device=DeviceType.CPU)
+            else:
+                self.hw = BackendRegistry.get_hardware_backend()
 
         # Telemetry counters
         self.cache_hits: int = 0

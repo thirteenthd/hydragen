@@ -266,6 +266,8 @@ class CUDAHardwareBackend(HardwareBackend):
     def set_device(self, device: Any) -> None:
         if torch.cuda.is_available():
             try:
+                if device is not None and (device == "cpu" or getattr(device, "type", None) == "cpu"):
+                    return
                 torch.cuda.set_device(device)
             except Exception:
                 pass
@@ -273,6 +275,13 @@ class CUDAHardwareBackend(HardwareBackend):
     def get_mem_info(self, device: Optional[Any] = None) -> Tuple[int, int]:
         if torch.cuda.is_available():
             try:
+                if device is not None and (device == "cpu" or getattr(device, "type", None) == "cpu"):
+                    try:
+                        import psutil
+                        vm = psutil.virtual_memory()
+                        return (int(vm.available), int(vm.total))
+                    except Exception:
+                        return (16 * 1024 * 1024 * 1024, 64 * 1024 * 1024 * 1024)
                 return torch.cuda.mem_get_info(device)
             except Exception:
                 pass
@@ -281,6 +290,8 @@ class CUDAHardwareBackend(HardwareBackend):
     def create_stream(self, device: Optional[Any] = None) -> Any:
         if torch.cuda.is_available():
             try:
+                if device is not None and (device == "cpu" or getattr(device, "type", None) == "cpu"):
+                    return None
                 return torch.cuda.Stream(device=device)
             except Exception:
                 pass
@@ -289,6 +300,8 @@ class CUDAHardwareBackend(HardwareBackend):
     def current_stream(self, device: Optional[Any] = None) -> Any:
         if torch.cuda.is_available():
             try:
+                if device is not None and (device == "cpu" or getattr(device, "type", None) == "cpu"):
+                    return None
                 return torch.cuda.current_stream(device)
             except Exception:
                 pass
@@ -312,14 +325,23 @@ class CUDAHardwareBackend(HardwareBackend):
     def synchronize(self, stream_or_device: Optional[Any] = None) -> None:
         if torch.cuda.is_available():
             try:
+                if stream_or_device is not None and (stream_or_device == "cpu" or getattr(stream_or_device, "type", None) == "cpu"):
+                    return
                 torch.cuda.synchronize(stream_or_device)
             except Exception:
                 pass
 
     def allocate_pinned_host_tensor(self, shape: Tuple[int, ...], dtype: Any) -> Any:
-        pin = torch.cuda.is_available()
-        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=pin)
+        if torch.cuda.is_available():
+            try:
+                return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+            except Exception:
+                pass
+        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=False)
 
     def empty_tensor(self, shape: Tuple[int, ...], dtype: Any, device: Optional[Any] = None) -> Any:
         dev = device if device is not None else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-        return torch.empty(shape, dtype=dtype, device=dev)
+        try:
+            return torch.empty(shape, dtype=dtype, device=dev)
+        except Exception:
+            return torch.empty(shape, dtype=dtype, device="cpu")
