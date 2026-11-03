@@ -32,11 +32,21 @@ class DFlash2Drafter(SpeculativeDrafter):
         device: Optional[torch.device] = None,
         pack_dir: Optional[str] = None,
     ):
+        if device is None:
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.current_device()
+                    device = torch.device("cuda")
+                except Exception:
+                    device = torch.device("cpu")
+            else:
+                device = torch.device("cpu")
+
         self.n_embd = n_embd
         self.hc = hc
         self.hcn = hc * n_embd
         self.block_tokens = block_tokens
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
         self.pack_dir = pack_dir
 
         self._accepted_total = 0

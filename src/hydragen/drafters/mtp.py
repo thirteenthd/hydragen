@@ -32,6 +32,16 @@ class MtpDrafter(SpeculativeDrafter):
         device: Optional[torch.device] = None,
         mtp_dir: Optional[str] = None,
     ):
+        if device is None:
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.current_device()
+                    device = torch.device("cuda")
+                except Exception:
+                    device = torch.device("cpu")
+            else:
+                device = torch.device("cpu")
+
         self._preconditioner = MtpDraftPreconditioner(
             n_embd=n_embd,
             hc=hc,

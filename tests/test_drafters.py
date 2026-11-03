@@ -25,7 +25,7 @@ class TestSpeculativeDrafters(unittest.TestCase):
 
     def test_mtp_drafter_lifecycle(self):
         """Validates MTP drafter prefill pre-conditioning, drafting, and feedback."""
-        drafter = MtpDrafter(n_embd=256, hc=2, n_head_kv=2, head_dim=64, max_context=128)
+        drafter = MtpDrafter(n_embd=256, hc=2, n_head_kv=2, head_dim=64, max_context=128, device=torch.device("cpu"))
         self.assertEqual(drafter.mode, DraftingMode.MTP)
         self.assertEqual(drafter.name, "mtp_autoregressive_drafter")
         self.assertTrue(drafter.is_available())
@@ -47,7 +47,7 @@ class TestSpeculativeDrafters(unittest.TestCase):
 
     def test_dflash2_block_drafter(self):
         """Validates DFlash2 non-causal block drafting and metadata."""
-        drafter = DFlash2Drafter(n_embd=256, hc=2, block_tokens=7)
+        drafter = DFlash2Drafter(n_embd=256, hc=2, block_tokens=7, device=torch.device("cpu"))
         self.assertEqual(drafter.mode, DraftingMode.DFLASH2)
         self.assertEqual(drafter.name, "dflash2_block_drafter")
         self.assertTrue(drafter.is_available())
@@ -126,10 +126,10 @@ class TestSpeculativeDrafters(unittest.TestCase):
 
     def test_factory_instantiation(self):
         """Verifies get_speculative_drafter creates correct implementations."""
-        drafter_mtp = get_speculative_drafter(DraftingMode.MTP, n_embd=128, hc=1, n_head_kv=1, head_dim=32, max_context=64)
+        drafter_mtp = get_speculative_drafter(DraftingMode.MTP, n_embd=128, hc=1, n_head_kv=1, head_dim=32, max_context=64, device=torch.device("cpu"))
         self.assertIsInstance(drafter_mtp, MtpDrafter)
 
-        drafter_dflash = get_speculative_drafter(DraftingMode.DFLASH2, n_embd=128, hc=1)
+        drafter_dflash = get_speculative_drafter(DraftingMode.DFLASH2, n_embd=128, hc=1, device=torch.device("cpu"))
         self.assertIsInstance(drafter_dflash, DFlash2Drafter)
 
         drafter_off = get_speculative_drafter(DraftingMode.OFF)
