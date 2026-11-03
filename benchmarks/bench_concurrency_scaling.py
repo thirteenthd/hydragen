@@ -214,7 +214,8 @@ def run_concurrency_test(
     print("=" * 86)
 
     # Save to file
-    out_dir = Path("benchmarks/results")
+    repo_root = Path(__file__).resolve().parent.parent
+    out_dir = repo_root / "benchmarks" / "results"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"concurrency_scaling_{tag}_{int(time.time())}.json"
     with open(out_path, "w") as f:
