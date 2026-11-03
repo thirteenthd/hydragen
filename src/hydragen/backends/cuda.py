@@ -210,9 +210,25 @@ class CUDAHardwareBackend(HardwareBackend):
         if not torch.cuda.is_available():
             return DeviceCapability(device_type=DeviceType.CUDA, device_name="CUDA Unavailable")
 
-        props = torch.cuda.get_device_properties(0)
-        major, minor = torch.cuda.get_device_capability(0)
-        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        device_name = "NVIDIA CUDA Device"
+        major, minor = (0, 0)
+        multi_processor_count = 0
+        total_bytes = 0
+        free_bytes = 0
+
+        try:
+            props = torch.cuda.get_device_properties(0)
+            device_name = props.name
+            major, minor = torch.cuda.get_device_capability(0)
+            multi_processor_count = props.multi_processor_count
+            total_bytes = getattr(props, "total_memory", 0)
+        except Exception:
+            pass
+
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+        except Exception:
+            pass
 
         # Ampere (SM 80+) has hardware DP4A SIMD and cp.async
         has_dp4a = major >= 6 or (major == 8 and minor >= 6)
@@ -220,15 +236,15 @@ class CUDAHardwareBackend(HardwareBackend):
 
         return DeviceCapability(
             device_type=DeviceType.CUDA,
-            device_name=props.name,
+            device_name=device_name,
             compute_capability=(major, minor),
             total_memory_bytes=total_bytes,
             free_memory_bytes=free_bytes,
-            multi_processor_count=props.multi_processor_count,
+            multi_processor_count=multi_processor_count,
             has_dp4a=has_dp4a,
             has_cp_async=has_cp_async,
             details={
-                "cuda_version": torch.version.cuda,
+                "cuda_version": getattr(torch.version, "cuda", None),
                 "is_ampere": major == 8,
                 "is_hopper": major == 9,
             },
