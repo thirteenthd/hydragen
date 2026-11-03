@@ -1,0 +1,86 @@
+{
+  "metadata": {
+    "timestamp": "2026-11-03T22:03:52.293978+00:00",
+    "device_type": "cuda",
+    "device_name": "NVIDIA GeForce RTX 3080 Ti",
+    "total_memory_bytes": 12481855488,
+    "has_cp_async": true,
+    "has_dp4a": true
+  },
+  "mtp_sweep": [
+    {
+      "n_tokens": 1,
+      "avg_latency_ms": 0.449,
+      "p50_latency_ms": 0.444,
+      "p95_latency_ms": 0.481,
+      "draft_tok_s": 2227.6
+    },
+    {
+      "n_tokens": 2,
+      "avg_latency_ms": 0.88,
+      "p50_latency_ms": 0.871,
+      "p95_latency_ms": 0.976,
+      "draft_tok_s": 2271.5
+    },
+    {
+      "n_tokens": 4,
+      "avg_latency_ms": 1.74,
+      "p50_latency_ms": 1.718,
+      "p95_latency_ms": 1.829,
+      "draft_tok_s": 2297.9
+    },
+    {
+      "n_tokens": 7,
+      "avg_latency_ms": 3.085,
+      "p50_latency_ms": 2.998,
+      "p95_latency_ms": 3.114,
+      "draft_tok_s": 2269.0
+    }
+  ],
+  "dflash2_sweep": [
+    {
+      "n_tokens": 1,
+      "avg_latency_ms": 0.071,
+      "p50_latency_ms": 0.07,
+      "p95_latency_ms": 0.077,
+      "draft_tok_s": 13986.9
+    },
+    {
+      "n_tokens": 2,
+      "avg_latency_ms": 0.091,
+      "p50_latency_ms": 0.09,
+      "p95_latency_ms": 0.098,
+      "draft_tok_s": 22018.1
+    },
+    {
+      "n_tokens": 4,
+      "avg_latency_ms": 0.126,
+      "p50_latency_ms": 0.125,
+      "p95_latency_ms": 0.134,
+      "draft_tok_s": 31675.8
+    },
+    {
+      "n_tokens": 7,
+      "avg_latency_ms": 0.178,
+      "p50_latency_ms": 0.176,
+      "p95_latency_ms": 0.186,
+      "draft_tok_s": 39323.9
+    }
+  ],
+  "memory_profile": {
+    "mtp": {
+      "kv_buffer_mib": 64.0,
+      "weights_scratch_mib": 100.0,
+      "total_footprint_mib": 164.0,
+      "vram_freed_mib": 0.0,
+      "extra_experts_headroom": 0
+    },
+    "dflash2": {
+      "kv_buffer_mib": 0.0,
+      "weights_scratch_mib": 12.5,
+      "total_footprint_mib": 12.5,
+      "vram_freed_mib": 367.0,
+      "extra_experts_headroom": 219
+    }
+  }
+}
