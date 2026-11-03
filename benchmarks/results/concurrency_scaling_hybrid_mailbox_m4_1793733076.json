@@ -1,0 +1,48 @@
+{
+  "tag": "hybrid_mailbox_m4",
+  "records": [
+    {
+      "concurrency": 1,
+      "wall_time_s": 3.29,
+      "total_output_tokens": 96,
+      "aggregate_tok_s": 29.2,
+      "mean_ttft_s": 1.991,
+      "max_ttft_s": 1.991,
+      "vram_hit_rate": 0.0,
+      "per_stream": [
+        {
+          "stream_id": 0,
+          "output_tokens": 96,
+          "ttft_s": 1.991,
+          "wall_time_s": 3.288,
+          "decode_tok_s": 74.0
+        }
+      ]
+    },
+    {
+      "concurrency": 2,
+      "wall_time_s": 6.01,
+      "total_output_tokens": 193,
+      "aggregate_tok_s": 32.1,
+      "mean_ttft_s": 1.276,
+      "max_ttft_s": 2.32,
+      "vram_hit_rate": 0.0,
+      "per_stream": [
+        {
+          "stream_id": 1,
+          "output_tokens": 98,
+          "ttft_s": 2.32,
+          "wall_time_s": 5.943,
+          "decode_tok_s": 27.1
+        },
+        {
+          "stream_id": 0,
+          "output_tokens": 95,
+          "ttft_s": 0.232,
+          "wall_time_s": 6.006,
+          "decode_tok_s": 16.5
+        }
+      ]
+    }
+  ]
+}
