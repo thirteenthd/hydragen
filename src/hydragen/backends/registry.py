@@ -31,12 +31,40 @@ from hydragen.backends.cuda import CUDAHardwareBackend, CUDAPagedAttentionBacken
 from hydragen.backends.ipc import FallbackIPCBackend, NativeIPCBackend
 
 
+class _CDeviceCaps(ctypes.Structure):
+    _fields_ = [
+        ("device_type", ctypes.c_int32),
+        ("device_name", ctypes.c_char * 128),
+        ("compute_major", ctypes.c_int32),
+        ("compute_minor", ctypes.c_int32),
+        ("total_vram_bytes", ctypes.c_uint64),
+        ("free_vram_bytes", ctypes.c_uint64),
+        ("num_multiprocessors", ctypes.c_int32),
+        ("has_dp4a", ctypes.c_int32),
+        ("has_cp_async", ctypes.c_int32),
+        ("has_wmma", ctypes.c_int32),
+        ("has_avx512", ctypes.c_int32),
+    ]
+
+
+class _CPluginDescriptor(ctypes.Structure):
+    _fields_ = [
+        ("abi_version", ctypes.c_int32),
+        ("plugin_name", ctypes.c_char * 64),
+        ("target_architecture", ctypes.c_char * 32),
+        ("build_timestamp", ctypes.c_char * 32),
+        ("caps", _CDeviceCaps),
+        ("attention_ops", ctypes.c_void_p),
+    ]
+
+
 class BackendRegistry:
     """Singleton registry and factory for Hydragen dynamic hardware plugins."""
 
     _instance: Optional[BackendRegistry] = None
     _paged_kv_lib: Optional[ctypes.CDLL] = None
     _hardware_backend: Optional[HardwareBackend] = None
+    _plugin_desc: Optional[Dict[str, Any]] = None
 
     def __init__(self):
         self._custom_backends: Dict[str, HardwareBackend] = {}
@@ -79,6 +107,25 @@ class BackendRegistry:
             lib = load_native_library(cand, env_var="LIBPAGED_KV_SO")
             if lib is not None:
                 cls._paged_kv_lib = lib
+                # Check for standard cross-platform C-ABI plugin descriptor
+                if hasattr(lib, "hydragen_get_descriptor"):
+                    try:
+                        lib.hydragen_get_descriptor.restype = ctypes.POINTER(_CPluginDescriptor)
+                        desc_ptr = lib.hydragen_get_descriptor()
+                        if desc_ptr:
+                            raw = desc_ptr.contents
+                            name_str = raw.plugin_name.decode("utf-8", errors="replace")
+                            arch_str = raw.target_architecture.decode("utf-8", errors="replace")
+                            cls._plugin_desc = {
+                                "name": name_str,
+                                "arch": arch_str,
+                                "abi_version": raw.abi_version,
+                                "has_dp4a": bool(raw.caps.has_dp4a),
+                                "has_cp_async": bool(raw.caps.has_cp_async),
+                            }
+                            print(f"[hydragen] Loaded native C-ABI hardware plugin: {name_str} (arch={arch_str}, ABI=v{raw.abi_version})")
+                    except Exception:
+                        pass
                 return cls._paged_kv_lib
 
         return None

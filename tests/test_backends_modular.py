@@ -153,6 +153,32 @@ class TestHardwareBackendsModular(unittest.TestCase):
         npu_att.paged_attention_prefill(out, q, None, None, None)
         self.assertTrue((out == 3.0).all())
 
+    def test_c_abi_descriptor_structure(self):
+        """Verifies binary alignment and size of C-ABI Plugin Descriptor struct."""
+        from hydragen.backends.registry import _CDeviceCaps, _CPluginDescriptor
+        import ctypes
+
+        caps = _CDeviceCaps()
+        caps.device_type = 2 # CUDA
+        caps.compute_major = 8
+        caps.compute_minor = 6
+        caps.has_dp4a = 1
+        caps.has_cp_async = 1
+
+        desc = _CPluginDescriptor()
+        desc.abi_version = 1
+        desc.plugin_name = b"test_cuda_plugin"
+        desc.target_architecture = b"cuda_sm86"
+        desc.caps = caps
+
+        self.assertEqual(desc.abi_version, 1)
+        self.assertEqual(desc.plugin_name.decode("utf-8"), "test_cuda_plugin")
+        self.assertEqual(desc.target_architecture.decode("utf-8"), "cuda_sm86")
+        self.assertEqual(desc.caps.compute_major, 8)
+        self.assertEqual(desc.caps.compute_minor, 6)
+        self.assertEqual(desc.caps.has_dp4a, 1)
+        self.assertEqual(desc.caps.has_cp_async, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
