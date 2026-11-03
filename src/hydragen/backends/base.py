@@ -21,6 +21,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 class DeviceType(str, Enum):
     CUDA = "cuda"
     ROCM = "rocm"
+    INTEL = "intel"
+    XPU = "xpu"
     CPU = "cpu"
     HYBRID = "hybrid"
     UNKNOWN = "unknown"
@@ -38,6 +40,9 @@ class DeviceCapability:
     has_cp_async: bool = False
     has_wmma: bool = False
     has_avx512: bool = False
+    has_dpas: bool = False
+    has_amx: bool = False
+    has_vnni: bool = False
     details: Optional[Dict[str, Any]] = None
 
 

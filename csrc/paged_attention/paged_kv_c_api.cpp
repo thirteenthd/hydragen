@@ -181,7 +181,9 @@ static hydragen_plugin_descriptor_t g_cuda_plugin_descriptor = {
         1,                            // has_dp4a (Hardware PTX DP4A SIMD)
         1,                            // has_cp_async (SM_80+ Async Copy)
         1,                            // has_wmma (Tensor Cores)
-        0                             // has_avx512
+        0,                            // has_avx512
+        0,                            // has_dpas (Intel XMX / DPAS)
+        0                             // has_amx (Intel AMX)
     },
     &g_cuda_attention_ops
 };

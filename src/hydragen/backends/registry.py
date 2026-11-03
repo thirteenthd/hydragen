@@ -28,6 +28,11 @@ from hydragen.backends.base import (
 )
 from hydragen.backends.cpu import CPUHardwareBackend, CPUPagedAttentionBackend
 from hydragen.backends.cuda import CUDAHardwareBackend, CUDAPagedAttentionBackend
+from hydragen.backends.intel import (
+    IntelHardwareBackend,
+    IntelMoEBackend,
+    IntelPagedAttentionBackend,
+)
 from hydragen.backends.ipc import FallbackIPCBackend, NativeIPCBackend
 
 
@@ -44,6 +49,8 @@ class _CDeviceCaps(ctypes.Structure):
         ("has_cp_async", ctypes.c_int32),
         ("has_wmma", ctypes.c_int32),
         ("has_avx512", ctypes.c_int32),
+        ("has_dpas", ctypes.c_int32),
+        ("has_amx", ctypes.c_int32),
     ]
 
 
@@ -97,10 +104,20 @@ class BackendRegistry:
             except Exception:
                 pass
 
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            candidates.extend([
+                "libpaged_kv_intel.so",
+                "libpaged_kv_intel.dll",
+                "libpaged_kv_sycl.so",
+                "libpaged_kv_sycl.dll",
+            ])
+
         # Priority 2: Standard shared library names
         candidates.extend([
             "libpaged_kv.so",
             "libpaged_kv.dll",
+            "libpaged_kv_intel.so",
+            "libpaged_kv_intel.dll",
         ])
 
         for cand in candidates:
@@ -122,6 +139,8 @@ class BackendRegistry:
                                 "abi_version": raw.abi_version,
                                 "has_dp4a": bool(raw.caps.has_dp4a),
                                 "has_cp_async": bool(raw.caps.has_cp_async),
+                                "has_dpas": bool(raw.caps.has_dpas),
+                                "has_amx": bool(raw.caps.has_amx),
                             }
                             print(f"[hydragen] Loaded native C-ABI hardware plugin: {name_str} (arch={arch_str}, ABI=v{raw.abi_version})")
                     except Exception:
@@ -140,8 +159,13 @@ class BackendRegistry:
                 return DeviceType.CUDA
             elif forced_lower in ("rocm", "hip"):
                 return DeviceType.ROCM
+            elif forced_lower in ("intel", "xpu", "arc", "sycl"):
+                return DeviceType.INTEL
             elif forced_lower == "cpu":
                 return DeviceType.CPU
+
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return DeviceType.INTEL
 
         if torch.cuda.is_available():
             if hasattr(torch.version, "hip") and torch.version.hip is not None:
@@ -158,6 +182,10 @@ class BackendRegistry:
         if target_device == DeviceType.CUDA and torch.cuda.is_available():
             paged_lib = cls.discover_paged_attention_library()
             return CUDAHardwareBackend(paged_kv_lib=paged_lib)
+
+        if target_device in (DeviceType.INTEL, DeviceType.XPU):
+            paged_lib = cls.discover_paged_attention_library()
+            return IntelHardwareBackend(intel_lib=paged_lib)
 
         return CPUHardwareBackend()
 

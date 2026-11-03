@@ -16,7 +16,8 @@ typedef enum {
     HYDRAGEN_DEVICE_CPU     = 1,
     HYDRAGEN_DEVICE_CUDA    = 2,
     HYDRAGEN_DEVICE_ROCM    = 3,
-    HYDRAGEN_DEVICE_HYBRID  = 4
+    HYDRAGEN_DEVICE_HYBRID  = 4,
+    HYDRAGEN_DEVICE_INTEL   = 5
 } hydragen_device_type_t;
 
 // Fixed-size, binary-stable device capabilities structure
@@ -32,6 +33,8 @@ typedef struct {
     int32_t has_cp_async;           // 1 if SM_80+ async copy supported
     int32_t has_wmma;               // 1 if tensor cores supported
     int32_t has_avx512;             // 1 if AVX-512 supported
+    int32_t has_dpas;               // 1 if Intel XMX / DPAS supported
+    int32_t has_amx;                // 1 if Intel AMX matrix tiles supported
 } hydragen_device_caps_t;
 
 // Paged KV Block Manager & Attention Function Pointer Table

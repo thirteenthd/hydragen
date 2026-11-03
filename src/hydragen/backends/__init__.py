@@ -11,6 +11,11 @@ from hydragen.backends.base import (
 )
 from hydragen.backends.cpu import CPUHardwareBackend, CPUPagedAttentionBackend
 from hydragen.backends.cuda import CUDAHardwareBackend, CUDAPagedAttentionBackend
+from hydragen.backends.intel import (
+    IntelHardwareBackend,
+    IntelMoEBackend,
+    IntelPagedAttentionBackend,
+)
 from hydragen.backends.ipc import FallbackIPCBackend, NativeIPCBackend
 from hydragen.backends.registry import (
     BackendRegistry,
@@ -30,6 +35,9 @@ __all__ = [
     "CPUPagedAttentionBackend",
     "CUDAHardwareBackend",
     "CUDAPagedAttentionBackend",
+    "IntelHardwareBackend",
+    "IntelPagedAttentionBackend",
+    "IntelMoEBackend",
     "NativeIPCBackend",
     "FallbackIPCBackend",
     "BackendRegistry",
