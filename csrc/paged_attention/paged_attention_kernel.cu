@@ -69,6 +69,23 @@ __global__ void paged_attention_decode_kernel(
 
     __shared__ float s_logits[BLOCK_SIZE];
     __shared__ float s_warp_reduce[4]; // 128 threads = 4 warps
+    __shared__ uint4 s_k_vec[HEAD_DIM / 16]; // 8 uint4 = 128 bytes (128-bit vector loads)
+    __shared__ uint4 s_v_vec[HEAD_DIM / 16]; // 8 uint4 = 128 bytes (128-bit vector loads)
+
+    // Pre-quantize and pack 4 Q values once per query vector (saves 16x redundant ops in inner loop)
+    int32_t q_packed = 0;
+    if (is_int8_kv && (tid < 32)) {
+        int q4_offset = (seq_idx * num_heads + head_idx) * HEAD_DIM + tid * 4;
+        int8_t q0 = (int8_t)fminf(fmaxf(q[q4_offset + 0] * scale * 64.0f, -128.0f), 127.0f);
+        int8_t q1 = (int8_t)fminf(fmaxf(q[q4_offset + 1] * scale * 64.0f, -128.0f), 127.0f);
+        int8_t q2 = (int8_t)fminf(fmaxf(q[q4_offset + 2] * scale * 64.0f, -128.0f), 127.0f);
+        int8_t q3 = (int8_t)fminf(fmaxf(q[q4_offset + 3] * scale * 64.0f, -128.0f), 127.0f);
+
+        q_packed = (static_cast<uint32_t>(static_cast<uint8_t>(q0))) |
+                   (static_cast<uint32_t>(static_cast<uint8_t>(q1)) << 8) |
+                   (static_cast<uint32_t>(static_cast<uint8_t>(q2)) << 16) |
+                   (static_cast<uint32_t>(static_cast<uint8_t>(q3)) << 24);
+    }
 
     const int num_context_blocks = (context_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
@@ -77,45 +94,48 @@ __global__ void paged_attention_decode_kernel(
         int physical_block_id = block_tables[seq_idx * max_blocks + blk_idx];
         if (physical_block_id < 0) break;
 
-        int tokens_in_block = min(BLOCK_SIZE, context_len - blk_idx * BLOCK_SIZE);
+        const int tokens_in_block = min(BLOCK_SIZE, context_len - blk_idx * BLOCK_SIZE);
 
-        // Process each token inside this physical page
-        for (int t = 0; t < tokens_in_block; ++t) {
-            float dot = 0.0f;
+        // Milestone 7: Clamped Branchless Paged Attention KV Fetch
+        // 1. Fully unrolled compile-time loop over BLOCK_SIZE (16 iterations, 0 warp divergence).
+        // 2. Branchless clamp: t_clamped = min(t, tokens_in_block - 1) guarantees in-bounds memory addresses.
+        // 3. 128-bit vector loads (uint4 = 16 bytes) load K and V cache into shared memory at peak bus width.
+        // 4. Inactive token slots (t >= tokens_in_block) masked with -1e9f: expf(-1e9f) == 0.0f leaves accumulator intact.
+        #pragma unroll
+        for (int t = 0; t < BLOCK_SIZE; ++t) {
+            const int t_clamped = min(t, tokens_in_block - 1);
+            const float mask = (t < tokens_in_block) ? 0.0f : -1e9f;
 
-            if (is_int8_kv && (tid < 32)) {
-                // Specialized Warp 0: Computes entire 128-element dot product with 32 threads using PTX dp4a
-                // Each thread handles 4 elements: [tid*4 .. tid*4+3]
-                int q4_offset = (seq_idx * num_heads + head_idx) * HEAD_DIM + tid * 4;
-                // Quantize local 4 Q values to INT8 on the fly
-                int8_t q0 = (int8_t)fminf(fmaxf(q[q4_offset + 0] * scale * 64.0f, -128.0f), 127.0f);
-                int8_t q1 = (int8_t)fminf(fmaxf(q[q4_offset + 1] * scale * 64.0f, -128.0f), 127.0f);
-                int8_t q2 = (int8_t)fminf(fmaxf(q[q4_offset + 2] * scale * 64.0f, -128.0f), 127.0f);
-                int8_t q3 = (int8_t)fminf(fmaxf(q[q4_offset + 3] * scale * 64.0f, -128.0f), 127.0f);
-
-                int32_t q_packed = (static_cast<uint32_t>(static_cast<uint8_t>(q0))) |
-                                   (static_cast<uint32_t>(static_cast<uint8_t>(q1)) << 8) |
-                                   (static_cast<uint32_t>(static_cast<uint8_t>(q2)) << 16) |
-                                   (static_cast<uint32_t>(static_cast<uint8_t>(q3)) << 24);
-
+            // 128-bit Vector Load for K Cache: 8 threads load 16 bytes each = 128 bytes
+            if (tid < (HEAD_DIM / 16)) {
                 size_t k_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) +
-                                  (size_t)t * HEAD_DIM + tid * 4;
-                int32_t k_packed = *reinterpret_cast<const int32_t*>(&k_cache[k_offset]);
+                                  (size_t)t_clamped * HEAD_DIM;
+                const uint4* k_ptr_u4 = reinterpret_cast<const uint4*>(&k_cache[k_offset]);
+                s_k_vec[tid] = k_ptr_u4[tid];
+            }
+            __syncthreads();
 
-                // Hardware PTX DP4A instruction
-                int32_t dp_int = ptx_dp4a(q_packed, k_packed, 0);
-                float partial_dot = (float)dp_int * (kv_scale * 0.015625f);
+            if (is_int8_kv) {
+                // Specialized Warp 0: Computes entire 128-element dot product with 32 threads using PTX dp4a
+                if (tid < 32) {
+                    const int32_t* s_k_i32 = reinterpret_cast<const int32_t*>(s_k_vec);
+                    int32_t k_packed = s_k_i32[tid];
 
-                // Reduce across the 32 threads of Warp 0
-                dot = warp_reduce_sum(partial_dot);
-                if (tid == 0) {
-                    s_logits[t] = dot;
+                    // Hardware PTX DP4A instruction
+                    int32_t dp_int = ptx_dp4a(q_packed, k_packed, 0);
+                    float partial_dot = (float)dp_int * (kv_scale * 0.015625f);
+
+                    // Reduce across the 32 threads of Warp 0
+                    float dot = warp_reduce_sum(partial_dot);
+                    if (tid == 0) {
+                        s_logits[t] = dot + mask;
+                    }
                 }
             } else {
                 // Fallback / standard path for FP16 or remaining threads
-                size_t k_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) + (size_t)t * HEAD_DIM + lane;
-                float k_val = (lane < HEAD_DIM) ? (float)k_cache[k_offset] * kv_scale : 0.0f;
-                dot = q_val * k_val;
+                const int8_t* s_k = reinterpret_cast<const int8_t*>(s_k_vec);
+                float k_val = (lane < HEAD_DIM) ? (float)s_k[lane] * kv_scale : 0.0f;
+                float dot = q_val * k_val;
 
                 // Warp reduce dot product
                 dot = warp_reduce_sum(dot);
@@ -133,12 +153,21 @@ __global__ void paged_attention_decode_kernel(
                     for (int w = 0; w < (HEAD_DIM / 32); ++w) {
                         total_dot += s_warp_reduce[w];
                     }
-                    s_logits[t] = total_dot;
+                    s_logits[t] = total_dot + mask;
                 }
             }
             __syncthreads();
 
-            // Online Softmax update
+            // 128-bit Vector Load for V Cache: 8 threads load 16 bytes each = 128 bytes
+            if (tid < (HEAD_DIM / 16)) {
+                size_t v_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) +
+                                  (size_t)t_clamped * HEAD_DIM;
+                const uint4* v_ptr_u4 = reinterpret_cast<const uint4*>(&v_cache[v_offset]);
+                s_v_vec[tid] = v_ptr_u4[tid];
+            }
+            __syncthreads();
+
+            // Online Softmax update with branchless masked logit
             float logit = s_logits[t];
             float new_max = fmaxf(max_score, logit);
             float exp_diff = expf(max_score - new_max);
@@ -147,9 +176,8 @@ __global__ void paged_attention_decode_kernel(
             sum_exp = sum_exp * exp_diff + exp_new;
             acc_out = acc_out * exp_diff;
 
-            // Load Value vector from physical block and accumulate
-            size_t v_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) + (size_t)t * HEAD_DIM + lane;
-            float v_val = (lane < HEAD_DIM) ? (float)v_cache[v_offset] * kv_scale : 0.0f;
+            const int8_t* s_v = reinterpret_cast<const int8_t*>(s_v_vec);
+            float v_val = (lane < HEAD_DIM) ? (float)s_v[lane] * kv_scale : 0.0f;
 
             acc_out += exp_new * v_val;
             max_score = new_max;
@@ -246,6 +274,8 @@ __global__ void paged_attention_prefill_kernel(
 
     __shared__ float s_logits[BLOCK_SIZE];
     __shared__ float s_warp_reduce[4]; // 128 threads = 4 warps
+    __shared__ uint4 s_k_vec[HEAD_DIM / 16]; // 8 uint4 = 128 bytes (128-bit vector loads)
+    __shared__ uint4 s_v_vec[HEAD_DIM / 16]; // 8 uint4 = 128 bytes (128-bit vector loads)
 
     // Process each query token in this tile
     for (int q_tok = q_start; q_tok < q_end; ++q_tok) {
@@ -256,6 +286,21 @@ __global__ void paged_attention_prefill_kernel(
         // Load query vector element for (seq_idx, q_tok, head_idx)
         size_t q_offset = ((size_t)seq_idx * query_len + q_tok) * num_heads * HEAD_DIM + (size_t)head_idx * HEAD_DIM + lane;
         float q_val = (lane < HEAD_DIM) ? q[q_offset] * scale : 0.0f;
+
+        // Pre-quantize/pack q_packed once for this q_tok (eliminates redundant ops inside block loop)
+        int32_t q_packed = 0;
+        if (is_int8_kv && (tid < 32)) {
+            int q4_offset = ((size_t)seq_idx * query_len + q_tok) * num_heads * HEAD_DIM + (size_t)head_idx * HEAD_DIM + tid * 4;
+            int8_t q0 = (int8_t)fminf(fmaxf(q[q4_offset + 0] * scale * 64.0f, -128.0f), 127.0f);
+            int8_t q1 = (int8_t)fminf(fmaxf(q[q4_offset + 1] * scale * 64.0f, -128.0f), 127.0f);
+            int8_t q2 = (int8_t)fminf(fmaxf(q[q4_offset + 2] * scale * 64.0f, -128.0f), 127.0f);
+            int8_t q3 = (int8_t)fminf(fmaxf(q[q4_offset + 3] * scale * 64.0f, -128.0f), 127.0f);
+
+            q_packed = (static_cast<uint32_t>(static_cast<uint8_t>(q0))) |
+                       (static_cast<uint32_t>(static_cast<uint8_t>(q1)) << 8) |
+                       (static_cast<uint32_t>(static_cast<uint8_t>(q2)) << 16) |
+                       (static_cast<uint32_t>(static_cast<uint8_t>(q3)) << 24);
+        }
 
         // Running online softmax state
         float max_score = -FLT_MAX;
@@ -268,38 +313,41 @@ __global__ void paged_attention_prefill_kernel(
             int physical_block_id = block_tables[seq_idx * max_blocks + blk_idx];
             if (physical_block_id < 0) break;
 
-            int tokens_in_block = min(BLOCK_SIZE, context_len - blk_idx * BLOCK_SIZE);
+            const int tokens_in_block = min(BLOCK_SIZE, context_len - blk_idx * BLOCK_SIZE);
 
-            for (int t = 0; t < tokens_in_block; ++t) {
-                float dot = 0.0f;
+            // Milestone 7: Clamped Branchless Paged Attention KV Fetch
+            // Fixed BLOCK_SIZE compile-time unroll; branchless index clamping min(t, tokens_in_block - 1);
+            // 128-bit vector loads via uint4 into shared memory; invalid slots masked to -1e9f.
+            #pragma unroll
+            for (int t = 0; t < BLOCK_SIZE; ++t) {
+                const int t_clamped = min(t, tokens_in_block - 1);
+                const float mask = (t < tokens_in_block) ? 0.0f : -1e9f;
 
-                if (is_int8_kv && (tid < 32)) {
-                    // Warp 0 DP4A PTX instruction
-                    int q4_offset = ((size_t)seq_idx * query_len + q_tok) * num_heads * HEAD_DIM + (size_t)head_idx * HEAD_DIM + tid * 4;
-                    int8_t q0 = (int8_t)fminf(fmaxf(q[q4_offset + 0] * scale * 64.0f, -128.0f), 127.0f);
-                    int8_t q1 = (int8_t)fminf(fmaxf(q[q4_offset + 1] * scale * 64.0f, -128.0f), 127.0f);
-                    int8_t q2 = (int8_t)fminf(fmaxf(q[q4_offset + 2] * scale * 64.0f, -128.0f), 127.0f);
-                    int8_t q3 = (int8_t)fminf(fmaxf(q[q4_offset + 3] * scale * 64.0f, -128.0f), 127.0f);
-
-                    int32_t q_packed = (static_cast<uint32_t>(static_cast<uint8_t>(q0))) |
-                                       (static_cast<uint32_t>(static_cast<uint8_t>(q1)) << 8) |
-                                       (static_cast<uint32_t>(static_cast<uint8_t>(q2)) << 16) |
-                                       (static_cast<uint32_t>(static_cast<uint8_t>(q3)) << 24);
-
+                // 128-bit Vector Load for K Cache
+                if (tid < (HEAD_DIM / 16)) {
                     size_t k_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) +
-                                      (size_t)t * HEAD_DIM + tid * 4;
-                    int32_t k_packed = *reinterpret_cast<const int32_t*>(&k_cache[k_offset]);
+                                      (size_t)t_clamped * HEAD_DIM;
+                    const uint4* k_ptr_u4 = reinterpret_cast<const uint4*>(&k_cache[k_offset]);
+                    s_k_vec[tid] = k_ptr_u4[tid];
+                }
+                __syncthreads();
 
-                    int32_t dp_int = ptx_dp4a(q_packed, k_packed, 0);
-                    float partial_dot = (float)dp_int * (kv_scale * 0.015625f);
-                    dot = warp_reduce_sum(partial_dot);
-                    if (tid == 0) {
-                        s_logits[t] = dot;
+                if (is_int8_kv) {
+                    if (tid < 32) {
+                        const int32_t* s_k_i32 = reinterpret_cast<const int32_t*>(s_k_vec);
+                        int32_t k_packed = s_k_i32[tid];
+
+                        int32_t dp_int = ptx_dp4a(q_packed, k_packed, 0);
+                        float partial_dot = (float)dp_int * (kv_scale * 0.015625f);
+                        float dot = warp_reduce_sum(partial_dot);
+                        if (tid == 0) {
+                            s_logits[t] = dot + mask;
+                        }
                     }
                 } else {
-                    size_t k_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) + (size_t)t * HEAD_DIM + lane;
-                    float k_val = (lane < HEAD_DIM) ? (float)k_cache[k_offset] * kv_scale : 0.0f;
-                    dot = q_val * k_val;
+                    const int8_t* s_k = reinterpret_cast<const int8_t*>(s_k_vec);
+                    float k_val = (lane < HEAD_DIM) ? (float)s_k[lane] * kv_scale : 0.0f;
+                    float dot = q_val * k_val;
                     dot = warp_reduce_sum(dot);
 
                     int warp_id = tid / 32;
@@ -315,12 +363,21 @@ __global__ void paged_attention_prefill_kernel(
                         for (int w = 0; w < (HEAD_DIM / 32); ++w) {
                             total_dot += s_warp_reduce[w];
                         }
-                        s_logits[t] = total_dot;
+                        s_logits[t] = total_dot + mask;
                     }
                 }
                 __syncthreads();
 
-                // Online Softmax update
+                // 128-bit Vector Load for V Cache
+                if (tid < (HEAD_DIM / 16)) {
+                    size_t v_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) +
+                                      (size_t)t_clamped * HEAD_DIM;
+                    const uint4* v_ptr_u4 = reinterpret_cast<const uint4*>(&v_cache[v_offset]);
+                    s_v_vec[tid] = v_ptr_u4[tid];
+                }
+                __syncthreads();
+
+                // Online Softmax update with branchless masked logit
                 float logit = s_logits[t];
                 float new_max = fmaxf(max_score, logit);
                 float exp_diff = expf(max_score - new_max);
@@ -329,8 +386,8 @@ __global__ void paged_attention_prefill_kernel(
                 sum_exp = sum_exp * exp_diff + exp_new;
                 acc_out = acc_out * exp_diff;
 
-                size_t v_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) + (size_t)t * HEAD_DIM + lane;
-                float v_val = (lane < HEAD_DIM) ? (float)v_cache[v_offset] * kv_scale : 0.0f;
+                const int8_t* s_v = reinterpret_cast<const int8_t*>(s_v_vec);
+                float v_val = (lane < HEAD_DIM) ? (float)s_v[lane] * kv_scale : 0.0f;
 
                 acc_out += exp_new * v_val;
                 max_score = new_max;

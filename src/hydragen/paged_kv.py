@@ -312,7 +312,7 @@ class PagedKVManager:
             )
             return out
 
-        # Torch / CPU fallback
+        # Torch / CPU fallback with vectorized block gather & clamped indexing
         import torch
         group_size = num_heads // num_kv_heads
         for s in range(num_seqs):
@@ -320,15 +320,20 @@ class PagedKVManager:
             if ctx_len <= 0:
                 continue
             bt = block_tables[s]
-            k_list, v_list = [], []
-            for t_idx in range(ctx_len):
-                b_idx = t_idx // self.block_size
-                b_off = t_idx % self.block_size
-                p_blk = int(bt[b_idx].item() if hasattr(bt[b_idx], "item") else bt[b_idx])
-                k_list.append(k_cache[p_blk, :, b_off, :])
-                v_list.append(v_cache[p_blk, :, b_off, :])
-            k_seq = torch.stack(k_list, dim=0).permute(1, 0, 2).float()
-            v_seq = torch.stack(v_list, dim=0).permute(1, 0, 2).float()
+            num_blocks = (ctx_len + self.block_size - 1) // self.block_size
+            phys_blocks = bt[:num_blocks]
+            if not isinstance(phys_blocks, torch.Tensor):
+                phys_blocks = torch.tensor(phys_blocks, dtype=torch.long, device=k_cache.device)
+            else:
+                phys_blocks = phys_blocks.long()
+
+            # Vectorized multi-block gather: [num_blocks, num_kv_heads, block_size, head_dim]
+            k_blks = k_cache[phys_blocks]
+            v_blks = v_cache[phys_blocks]
+
+            # Flatten to [num_blocks * block_size, num_kv_heads, head_dim], then slice ctx_len
+            k_seq = k_blks.permute(0, 2, 1, 3).reshape(-1, num_kv_heads, head_dim)[:ctx_len].permute(1, 0, 2).float()
+            v_seq = v_blks.permute(0, 2, 1, 3).reshape(-1, num_kv_heads, head_dim)[:ctx_len].permute(1, 0, 2).float()
             if is_int8_kv:
                 k_seq = k_seq * 0.015625
                 v_seq = v_seq * 0.015625
@@ -382,23 +387,24 @@ class PagedKVManager:
             )
             return out
 
-        # Torch / CPU fallback with causal masking
+        # Torch / CPU fallback with vectorized block gather & causal masking
         import torch
         group_size = num_heads // num_kv_heads
         for s in range(num_seqs):
             past_len = int(context_lens[s].item() if (context_lens is not None and hasattr(context_lens[s], "item")) else (context_lens[s] if context_lens is not None else 0))
             bt = block_tables[s]
             total_tokens = past_len + query_len
+            num_blocks = (total_tokens + self.block_size - 1) // self.block_size
+            phys_blocks = bt[:num_blocks]
+            if not isinstance(phys_blocks, torch.Tensor):
+                phys_blocks = torch.tensor(phys_blocks, dtype=torch.long, device=k_cache.device)
+            else:
+                phys_blocks = phys_blocks.long()
 
-            k_list, v_list = [], []
-            for t_idx in range(total_tokens):
-                b_idx = t_idx // self.block_size
-                b_off = t_idx % self.block_size
-                p_blk = int(bt[b_idx].item() if hasattr(bt[b_idx], "item") else bt[b_idx])
-                k_list.append(k_cache[p_blk, :, b_off, :])
-                v_list.append(v_cache[p_blk, :, b_off, :])
-            k_all = torch.stack(k_list, dim=0).permute(1, 0, 2).float()
-            v_all = torch.stack(v_list, dim=0).permute(1, 0, 2).float()
+            k_blks = k_cache[phys_blocks]
+            v_blks = v_cache[phys_blocks]
+            k_all = k_blks.permute(0, 2, 1, 3).reshape(-1, num_kv_heads, head_dim)[:total_tokens].permute(1, 0, 2).float()
+            v_all = v_blks.permute(0, 2, 1, 3).reshape(-1, num_kv_heads, head_dim)[:total_tokens].permute(1, 0, 2).float()
             if is_int8_kv:
                 k_all = k_all * 0.015625
                 v_all = v_all * 0.015625
