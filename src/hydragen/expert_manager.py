@@ -118,11 +118,15 @@ class PagedExpertManager:
                 self.staging_up_u8 = None
                 self.staging_down_u8 = None
 
-                # Milestone 4: Concurrent CPU+GPU Hybrid Expert Mailbox
-                try:
-                    from hydragen.expert_mailbox import HybridExpertMailbox
-                    self.mailbox = HybridExpertMailbox(device=device)
-                except Exception:
+                # Milestone 4: Concurrent CPU+GPU Hybrid Expert Mailbox (opt-in via HYDRAGEN_ENABLE_MAILBOX=1)
+                enable_box = (os.environ.get("HYDRAGEN_ENABLE_MAILBOX", "0").lower() in ("1", "true", "yes"))
+                if enable_box:
+                    try:
+                        from hydragen.expert_mailbox import HybridExpertMailbox
+                        self.mailbox = HybridExpertMailbox(device=device)
+                    except Exception:
+                        self.mailbox = None
+                else:
                     self.mailbox = None
             else:
                 self.host_pool = None
