@@ -4928,7 +4928,10 @@ class Service:
             or (getattr(self.engine, "info", {}) or {}).get("engine_type")
         )
         is_vllm = getattr(self.engine, "expert_manager", None) is not None
-        if engine_type == "trtllm":
+        if engine_type == "hydragen":
+            eng_backend = "hydragen"
+            eng_label = (getattr(self.engine, "info", {}) or {}).get("engine_label", "Hydragen Unified (In-Flight Batching + Paged KV)")
+        elif engine_type == "trtllm":
             eng_backend = "trtllm"
             eng_label = "TensorRT-LLM (In-Flight Batching + Paged KV)"
         elif is_vllm:
@@ -7252,7 +7255,10 @@ def make_handler(svc: Service):
                     or (getattr(svc.engine, "info", {}) or {}).get("engine_type")
                 )
                 is_vllm = getattr(svc.engine, "expert_manager", None) is not None
-                if engine_type == "trtllm":
+                if engine_type == "hydragen":
+                    eng_backend = "hydragen"
+                    eng_label = (getattr(svc.engine, "info", {}) or {}).get("engine_label", "Hydragen Unified (In-Flight Batching + Paged KV)")
+                elif engine_type == "trtllm":
                     eng_backend = "trtllm"
                     eng_label = "TensorRT-LLM (In-Flight Batching + Paged KV)"
                 elif is_vllm:
