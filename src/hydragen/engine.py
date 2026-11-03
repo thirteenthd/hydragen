@@ -144,6 +144,23 @@ class VLLMEngine:
         # Warm up Triton Fused MoE kernels on real Layer 0 & Layer 1 (type 42 Q2_0_STRATA) experts
         self._warmup_triton_pipeline()
 
+        # Milestone 5: MTP Draft Head Prompt Pre-Conditioning (Draft KV Warm-Up)
+        mtp_path = os.path.join(self.cfg.get("cwd") or ".", "models/mtp/rt")
+        try:
+            from hydragen.mtp_preconditioner import MtpDraftPreconditioner
+            self.mtp_preconditioner: Optional[MtpDraftPreconditioner] = MtpDraftPreconditioner(
+                n_embd=self.n_embd,
+                hc=4,
+                n_head_kv=2,
+                head_dim=128,
+                max_context=self.max_context,
+                device=self.device,
+                mtp_dir=mtp_path if os.path.exists(mtp_path) else None,
+            )
+        except Exception as e:
+            print(f"[hydragen] Notice: MtpDraftPreconditioner disabled ({e})")
+            self.mtp_preconditioner = None
+
         # 4. Continuous Batching Slots & Locality-Aware Wait Queue
         self.slot_live: List[Optional[Dict[str, Any]]] = [None] * self.batch
         self.slot_held: List[List[int]] = [[] for _ in range(self.batch)]
@@ -627,6 +644,15 @@ class VLLMEngine:
                 for k in self.expert_manager.residency_map.keys()
             }
             self.locality_policy.update_resident_experts(resident_eids)
+
+        # Milestone 5: MTP Draft Head Prompt Pre-Conditioning (Draft KV Warm-Up)
+        if self.mtp_preconditioner is not None and prompt_len > 1:
+            try:
+                prompt_tensor = torch.tensor(ids, dtype=torch.int32, device=self.device)
+                prompt_embs = self.loader.dequantize_token_embedding(prompt_tensor, device=self.device)
+                self.mtp_preconditioner.warmup_prompt(prompt_embs, hidden_states=None, pos_offset=0)
+            except Exception:
+                pass
 
         slot_idx = self._acquire_slot(prompt_len, prompt_read, req_experts, cancel)
         if slot_idx < 0 or cancel.is_set():

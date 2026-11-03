@@ -40,6 +40,7 @@ class PagedExpertManager:
         loader: Optional[Any] = None,
         default_layer_idx: int = 0,
         compressed_cache: Optional[bool] = None,
+        enable_mailbox: Optional[bool] = None,
     ):
         self.num_slots = int(num_slots)
         self.expert_shape = tuple(expert_shape)
@@ -49,6 +50,7 @@ class PagedExpertManager:
         self.loader = loader
         self.default_layer_idx = int(default_layer_idx)
         self.compressed_cache = (loader is not None) if compressed_cache is None else bool(compressed_cache)
+        self._enable_mailbox = enable_mailbox
 
         # Telemetry counters
         self.cache_hits: int = 0
@@ -119,8 +121,11 @@ class PagedExpertManager:
                 self.staging_up_u8 = None
                 self.staging_down_u8 = None
 
-                # Milestone 4: Concurrent CPU+GPU Hybrid Expert Mailbox (opt-in via HYDRAGEN_ENABLE_MAILBOX=1)
-                enable_box = (os.environ.get("HYDRAGEN_ENABLE_MAILBOX", "0").lower() in ("1", "true", "yes"))
+                # Milestone 4: Concurrent CPU+GPU Hybrid Expert Mailbox (opt-in via HYDRAGEN_ENABLE_MAILBOX=1 or enable_mailbox=True)
+                if self._enable_mailbox is not None:
+                    enable_box = bool(self._enable_mailbox)
+                else:
+                    enable_box = (os.environ.get("HYDRAGEN_ENABLE_MAILBOX", "0").lower() in ("1", "true", "yes"))
                 if enable_box:
                     try:
                         from hydragen.expert_mailbox import HybridExpertMailbox

@@ -98,6 +98,7 @@ class TestExpertMailbox(unittest.TestCase):
             dtype=torch.float16,
             device=self.device,
             compressed_cache=False,
+            enable_mailbox=True,
         )
         # Pre-fill weights in host pool
         torch.manual_seed(42)
