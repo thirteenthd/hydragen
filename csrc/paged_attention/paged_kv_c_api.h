@@ -74,4 +74,24 @@ PAGED_KV_API void paged_attention_decode(
     void* stream
 );
 
+PAGED_KV_API void paged_attention_prefill(
+    float* out,
+    const float* q,
+    const void* k_cache,
+    const void* v_cache,
+    const int32_t* block_tables,
+    const int32_t* context_lens,
+    int32_t num_seqs,
+    int32_t query_len,
+    int32_t num_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t block_size,
+    int32_t max_blocks,
+    float scale,
+    int32_t is_int8_kv,
+    int32_t reverse_lpt,
+    void* stream
+);
+
 }

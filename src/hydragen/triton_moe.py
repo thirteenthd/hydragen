@@ -547,66 +547,71 @@ def triton_paged_moe_forward(
     down_out = torch.empty((num_active, M, K), dtype=torch.float16, device=x.device)
     tile_slots = max(1, int(getattr(expert_manager, "num_slots", num_active)))
 
-    for start in range(0, num_active, tile_slots):
-        end = min(num_active, start + tile_slots)
-        chunk_len = end - start
-        chunk_list = unique_expert_list[start:end]
-        chunk_experts_t = unique_experts_t[start:end].contiguous()
+    mailbox = getattr(expert_manager, "mailbox", None)
+    host_pool = getattr(expert_manager, "host_pool", None)
+    use_mailbox = (
+        mailbox is not None
+        and host_pool is not None
+        and hasattr(expert_manager, "is_resident")
+    )
 
-        if hasattr(expert_manager, "request_layer_experts"):
-            expert_manager.request_layer_experts(layer_idx, chunk_list)
-            slot_table = expert_manager.get_gpu_slot_table(layer_idx)
-        else:
-            expert_manager.request_experts(chunk_list)
-            slot_table = expert_manager.gpu_slot_table
+    if use_mailbox:
+        resident_items: List[Tuple[int, int]] = []  # (compact_idx, expert_id)
+        missed_items: List[Tuple[int, int]] = []    # (compact_idx, expert_id)
 
-        expert_manager.synchronize()
+        for idx, eid in enumerate(unique_expert_list):
+            if expert_manager.is_resident(eid, layer_idx):
+                resident_items.append((idx, eid))
+            else:
+                missed_items.append((idx, eid))
 
-        gate_out = torch.empty((chunk_len, M_pad, N_ff), dtype=torch.float16, device=x.device)
-        grid_gu = (
-            triton.cdiv(M_pad, block_size_m),
-            triton.cdiv(N_ff, block_size_n),
-            chunk_len,
-        )
+        # Asynchronously dispatch missed experts to CPU worker pool
+        cpu_futures = []
+        if missed_items:
+            x_cpu = x[:M].cpu()
+            cpu_futures = mailbox.dispatch_missed_experts(
+                x_cpu=x_cpu,
+                missed_items=missed_items,
+                host_pool=host_pool,
+                has_up=has_up,
+                N_ff=N_ff,
+                K=K,
+            )
+            mailbox.total_cpu_experts += len(missed_items)
 
-        fused_moe_indexed_slot_kernel[grid_gu](
-            x_pad,
-            w_gate,
-            gate_out,
-            chunk_experts_t,
-            slot_table,
-            0,
-            x_pad.stride(0),
-            x_pad.stride(1),
-            w_gate.stride(0),
-            w_gate.stride(1),
-            w_gate.stride(2),
-            gate_out.stride(1),
-            gate_out.stride(2),
-            M_pad,
-            N_ff,
-            K,
-            BLOCK_SIZE_M=block_size_m,
-            BLOCK_SIZE_N=block_size_n,
-            BLOCK_SIZE_K=block_size_k,
-        )
+        # Execute resident experts on GPU
+        if resident_items:
+            res_eids = [eid for _, eid in resident_items]
+            res_compact_indices = [idx for idx, _ in resident_items]
+            res_chunk_len = len(resident_items)
+            res_experts_t = torch.tensor(res_eids, dtype=torch.int32, device=x.device)
 
-        if w_up is not None:
-            up_out = torch.empty((chunk_len, M_pad, N_ff), dtype=torch.float16, device=x.device)
+            if hasattr(expert_manager, "get_gpu_slot_table"):
+                slot_table = expert_manager.get_gpu_slot_table(layer_idx)
+            else:
+                slot_table = expert_manager.gpu_slot_table
+
+            gate_out = torch.empty((res_chunk_len, M_pad, N_ff), dtype=torch.float16, device=x.device)
+            grid_gu = (
+                triton.cdiv(M_pad, block_size_m),
+                triton.cdiv(N_ff, block_size_n),
+                res_chunk_len,
+            )
+
             fused_moe_indexed_slot_kernel[grid_gu](
                 x_pad,
-                w_up,
-                up_out,
-                chunk_experts_t,
+                w_gate,
+                gate_out,
+                res_experts_t,
                 slot_table,
                 0,
                 x_pad.stride(0),
                 x_pad.stride(1),
-                w_up.stride(0),
-                w_up.stride(1),
-                w_up.stride(2),
-                up_out.stride(1),
-                up_out.stride(2),
+                w_gate.stride(0),
+                w_gate.stride(1),
+                w_gate.stride(2),
+                gate_out.stride(1),
+                gate_out.stride(2),
                 M_pad,
                 N_ff,
                 K,
@@ -614,38 +619,179 @@ def triton_paged_moe_forward(
                 BLOCK_SIZE_N=block_size_n,
                 BLOCK_SIZE_K=block_size_k,
             )
-            inter_pad = F.silu(gate_out) * up_out
-        else:
-            inter_pad = F.silu(gate_out)
 
-        down_pad = torch.empty((chunk_len, M_pad, K), dtype=torch.float16, device=x.device)
-        grid_down = (
-            triton.cdiv(M_pad, block_size_m),
-            triton.cdiv(K, block_size_n),
-            chunk_len,
-        )
-        fused_moe_indexed_slot_kernel[grid_down](
-            inter_pad,
-            w_down,
-            down_pad,
-            chunk_experts_t,
-            slot_table,
-            inter_pad.stride(0),
-            inter_pad.stride(1),
-            inter_pad.stride(2),
-            w_down.stride(0),
-            w_down.stride(1),
-            w_down.stride(2),
-            down_pad.stride(1),
-            down_pad.stride(2),
-            M_pad,
-            K,
-            N_ff,
-            BLOCK_SIZE_M=block_size_m,
-            BLOCK_SIZE_N=block_size_n,
-            BLOCK_SIZE_K=block_size_k,
-        )
-        down_out[start:end] = down_pad[:, :M, :]
+            if w_up is not None:
+                up_out = torch.empty((res_chunk_len, M_pad, N_ff), dtype=torch.float16, device=x.device)
+                fused_moe_indexed_slot_kernel[grid_gu](
+                    x_pad,
+                    w_up,
+                    up_out,
+                    res_experts_t,
+                    slot_table,
+                    0,
+                    x_pad.stride(0),
+                    x_pad.stride(1),
+                    w_up.stride(0),
+                    w_up.stride(1),
+                    w_up.stride(2),
+                    up_out.stride(1),
+                    up_out.stride(2),
+                    M_pad,
+                    N_ff,
+                    K,
+                    BLOCK_SIZE_M=block_size_m,
+                    BLOCK_SIZE_N=block_size_n,
+                    BLOCK_SIZE_K=block_size_k,
+                )
+                inter_pad = F.silu(gate_out) * up_out
+            else:
+                inter_pad = F.silu(gate_out)
+
+            down_pad = torch.empty((res_chunk_len, M_pad, K), dtype=torch.float16, device=x.device)
+            grid_down = (
+                triton.cdiv(M_pad, block_size_m),
+                triton.cdiv(K, block_size_n),
+                res_chunk_len,
+            )
+            fused_moe_indexed_slot_kernel[grid_down](
+                inter_pad,
+                w_down,
+                down_pad,
+                res_experts_t,
+                slot_table,
+                inter_pad.stride(0),
+                inter_pad.stride(1),
+                inter_pad.stride(2),
+                w_down.stride(0),
+                w_down.stride(1),
+                w_down.stride(2),
+                down_pad.stride(1),
+                down_pad.stride(2),
+                M_pad,
+                K,
+                N_ff,
+                BLOCK_SIZE_M=block_size_m,
+                BLOCK_SIZE_N=block_size_n,
+                BLOCK_SIZE_K=block_size_k,
+            )
+            for local_i, target_compact_idx in enumerate(res_compact_indices):
+                down_out[target_compact_idx] = down_pad[local_i, :M, :]
+
+            mailbox.total_gpu_experts += len(resident_items)
+
+        # Collect CPU results from mailbox and merge into down_out
+        if cpu_futures:
+            mailbox.gather_and_merge(
+                down_out_gpu=down_out,
+                cpu_futures=cpu_futures,
+                cuda_stream=torch.cuda.current_stream(x.device) if x.device.type == "cuda" else None,
+            )
+
+        if hasattr(expert_manager, "get_gpu_slot_table"):
+            slot_table = expert_manager.get_gpu_slot_table(layer_idx)
+        else:
+            slot_table = expert_manager.gpu_slot_table
+
+    else:
+        for start in range(0, num_active, tile_slots):
+            end = min(num_active, start + tile_slots)
+            chunk_len = end - start
+            chunk_list = unique_expert_list[start:end]
+            chunk_experts_t = unique_experts_t[start:end].contiguous()
+
+            if hasattr(expert_manager, "request_layer_experts"):
+                expert_manager.request_layer_experts(layer_idx, chunk_list)
+                slot_table = expert_manager.get_gpu_slot_table(layer_idx)
+            else:
+                expert_manager.request_experts(chunk_list)
+                slot_table = expert_manager.gpu_slot_table
+
+            expert_manager.synchronize()
+
+            gate_out = torch.empty((chunk_len, M_pad, N_ff), dtype=torch.float16, device=x.device)
+            grid_gu = (
+                triton.cdiv(M_pad, block_size_m),
+                triton.cdiv(N_ff, block_size_n),
+                chunk_len,
+            )
+
+            fused_moe_indexed_slot_kernel[grid_gu](
+                x_pad,
+                w_gate,
+                gate_out,
+                chunk_experts_t,
+                slot_table,
+                0,
+                x_pad.stride(0),
+                x_pad.stride(1),
+                w_gate.stride(0),
+                w_gate.stride(1),
+                w_gate.stride(2),
+                gate_out.stride(1),
+                gate_out.stride(2),
+                M_pad,
+                N_ff,
+                K,
+                BLOCK_SIZE_M=block_size_m,
+                BLOCK_SIZE_N=block_size_n,
+                BLOCK_SIZE_K=block_size_k,
+            )
+
+            if w_up is not None:
+                up_out = torch.empty((chunk_len, M_pad, N_ff), dtype=torch.float16, device=x.device)
+                fused_moe_indexed_slot_kernel[grid_gu](
+                    x_pad,
+                    w_up,
+                    up_out,
+                    chunk_experts_t,
+                    slot_table,
+                    0,
+                    x_pad.stride(0),
+                    x_pad.stride(1),
+                    w_up.stride(0),
+                    w_up.stride(1),
+                    w_up.stride(2),
+                    up_out.stride(1),
+                    up_out.stride(2),
+                    M_pad,
+                    N_ff,
+                    K,
+                    BLOCK_SIZE_M=block_size_m,
+                    BLOCK_SIZE_N=block_size_n,
+                    BLOCK_SIZE_K=block_size_k,
+                )
+                inter_pad = F.silu(gate_out) * up_out
+            else:
+                inter_pad = F.silu(gate_out)
+
+            down_pad = torch.empty((chunk_len, M_pad, K), dtype=torch.float16, device=x.device)
+            grid_down = (
+                triton.cdiv(M_pad, block_size_m),
+                triton.cdiv(K, block_size_n),
+                chunk_len,
+            )
+            fused_moe_indexed_slot_kernel[grid_down](
+                inter_pad,
+                w_down,
+                down_pad,
+                chunk_experts_t,
+                slot_table,
+                inter_pad.stride(0),
+                inter_pad.stride(1),
+                inter_pad.stride(2),
+                w_down.stride(0),
+                w_down.stride(1),
+                w_down.stride(2),
+                down_pad.stride(1),
+                down_pad.stride(2),
+                M_pad,
+                K,
+                N_ff,
+                BLOCK_SIZE_M=block_size_m,
+                BLOCK_SIZE_N=block_size_n,
+                BLOCK_SIZE_K=block_size_k,
+            )
+            down_out[start:end] = down_pad[:, :M, :]
 
     expert_to_compact = torch.full(
         (slot_table.shape[0],), 0, dtype=torch.long, device=x.device

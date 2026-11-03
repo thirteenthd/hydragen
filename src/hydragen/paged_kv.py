@@ -50,6 +50,7 @@ class PagedKVManager:
         num_kv_heads: int = 8,
         head_dim: int = 128,
         dtype_bytes: int = 1,
+        backend: Optional[Any] = None,
     ):
         self.block_size = int(block_size)
         self.num_blocks = int(num_blocks)
@@ -58,7 +59,9 @@ class PagedKVManager:
         self.head_dim = int(head_dim)
         self.dtype_bytes = int(dtype_bytes)
 
-        self._native_lib = self._load_native_lib()
+        from hydragen.backends.registry import BackendRegistry
+        self._backend = backend or BackendRegistry.get_paged_attention_backend()
+        self._native_lib = getattr(self._backend, "_native_lib", None) or self._load_native_lib()
         self._handle = None
 
         if self._native_lib is not None:
@@ -109,6 +112,22 @@ class PagedKVManager:
         lib.paged_kv_get_num_blocks.restype = ctypes.c_int32
         lib.paged_kv_get_num_blocks.argtypes = [ctypes.c_void_p, ctypes.c_int32]
         lib.paged_kv_get_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(_CPagedKVStats)]
+        if hasattr(lib, "paged_attention_decode"):
+            lib.paged_attention_decode.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+                ctypes.c_int32, ctypes.c_int32,
+                ctypes.c_float, ctypes.c_int32, ctypes.c_void_p,
+            ]
+        if hasattr(lib, "paged_attention_prefill"):
+            lib.paged_attention_prefill.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+                ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+                ctypes.c_float, ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p,
+            ]
 
     def allocate_sequence(self, seq_id: int, initial_tokens: int) -> bool:
         """Allocate physical 16-token pages for a sequence."""
@@ -257,6 +276,65 @@ class PagedKVManager:
             "utilization": round(s.allocated_blocks / max(1, s.total_blocks), 3),
             "block_size": self.block_size,
         }
+
+    @property
+    def backend(self):
+        """Active PagedAttentionBackend executing hardware attention operations."""
+        return self._backend
+
+    def paged_attention_decode(
+        self,
+        out,
+        q,
+        k_cache,
+        v_cache,
+        block_tables,
+        context_lens,
+        scale: Optional[float] = None,
+        is_int8_kv: bool = False,
+        stream: Optional[Any] = None,
+    ):
+        """Single-token decode attention across paged KV blocks (delegated to active hardware plugin)."""
+        return self._backend.paged_attention_decode(
+            out=out,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            scale=scale,
+            is_int8_kv=is_int8_kv,
+            stream=stream,
+            block_size=self.block_size,
+        )
+
+    def paged_attention_prefill(
+        self,
+        out,
+        q,
+        k_cache,
+        v_cache,
+        block_tables,
+        context_lens=None,
+        scale: Optional[float] = None,
+        is_int8_kv: bool = False,
+        reverse_lpt: bool = True,
+        stream: Optional[Any] = None,
+    ):
+        """Causal prefill attention across paged KV blocks with Reverse Query-Tile Attention Scheduling (LPT)."""
+        return self._backend.paged_attention_prefill(
+            out=out,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            scale=scale,
+            is_int8_kv=is_int8_kv,
+            reverse_lpt=reverse_lpt,
+            stream=stream,
+            block_size=self.block_size,
+        )
 
     def __del__(self):
         if self._handle is not None and self._native_lib is not None:

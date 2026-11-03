@@ -5,7 +5,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.expanduser("~/vllm"))
-from vllm.v1.core.expert_manager import PagedExpertManager
+from hydragen.expert_manager import PagedExpertManager
 
 @triton.jit
 def paged_moe_kernel(

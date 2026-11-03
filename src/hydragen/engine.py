@@ -144,6 +144,30 @@ class VLLMEngine:
         # Warm up Triton Fused MoE kernels on real Layer 0 & Layer 1 (type 42 Q2_0_STRATA) experts
         self._warmup_triton_pipeline()
 
+        # Milestone 5 & Speculative Drafter Architecture & Hardware Plugin Binding
+        from hydragen.backends.registry import BackendRegistry
+        from hydragen.drafters import DisabledDrafter, get_speculative_drafter, resolve_drafting_mode
+
+        self.hw_backend = BackendRegistry.get_hardware_backend()
+        mtp_path = os.path.join(self.cfg.get("cwd") or ".", "models/mtp/rt")
+        try:
+            self.drafter = get_speculative_drafter(
+                hardware_backend=self.hw_backend,
+                device=self.device,
+                n_embd=self.n_embd,
+                hc=4,
+                n_head_kv=2,
+                head_dim=128,
+                max_context=self.max_context,
+                mtp_dir=mtp_path if os.path.exists(mtp_path) else None,
+            )
+        except Exception as e:
+            print(f"[hydragen] Notice: Speculative drafter disabled ({e})")
+            self.drafter = DisabledDrafter()
+
+        # Backward compatibility for existing code paths
+        self.mtp_preconditioner = getattr(self.drafter, "_preconditioner", None)
+
         # 4. Continuous Batching Slots & Locality-Aware Wait Queue
         self.slot_live: List[Optional[Dict[str, Any]]] = [None] * self.batch
         self.slot_held: List[List[int]] = [[] for _ in range(self.batch)]
@@ -164,6 +188,8 @@ class VLLMEngine:
             or int(slots * 1868800 / (1024 * 1024))
             or 3740
         )
+        cap = self.hw_backend.capability
+        plugin_desc = getattr(BackendRegistry, "_plugin_desc", None) or {}
         self.info = {
             **b_info,
             "version": "0.34.0-hydragen-triton",
@@ -180,6 +206,15 @@ class VLLMEngine:
             "spec": b_info.get("spec", 4),
             "mtp_max": b_info.get("mtp_max", 4),
             "cvec": b_info.get("cvec"),
+            "hardware_backend": cap.device_type.value,
+            "hardware_device": cap.device_name,
+            "hardware_plugin": plugin_desc.get("name", "hydragen_native"),
+            "plugin_abi": plugin_desc.get("abi_version", 1),
+            "has_dp4a": cap.has_dp4a,
+            "has_cp_async": cap.has_cp_async,
+            "has_wmma": cap.has_wmma,
+            "drafter": self.drafter.name,
+            "drafting_mode": self.drafter.mode.value,
         }
         self._last_prefill_tok_s: float = 100.0
         self._active_prefill_tok_s: Optional[float] = None
@@ -294,6 +329,9 @@ class VLLMEngine:
                 topk_weights = (
                     topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp(min=1e-6)
                 ).contiguous()
+
+            # Record routing occurrences in PagedExpertManager for adaptive realignment
+            self.expert_manager.record_routing(topk_ids, layer_idx=layer_idx)
 
             # 3. Execute Triton Fused MoE with PagedExpertManager slot indirection
             moe_out, step_metrics = triton_paged_moe_forward(
@@ -611,10 +649,28 @@ class VLLMEngine:
 
         # 1. Execute Triton Fused MoE + PagedExpertManager on active decode token window
         # to warm VRAM expert slots and compute real expert locality affinity.
-        tail_ids = ids[-min(2, len(ids)) :] if ids else [1]
+        tail_ids = ids[-min(16, len(ids)) :] if ids else [1]
         tail_tensor = torch.tensor(tail_ids, dtype=torch.int32, device=self.device)
         _, triton_prefill_metrics = self.execute_triton_moe_step(tail_tensor, layer_idx=0)
         req_experts: Set[int] = triton_prefill_metrics.get("routed_experts", set())
+
+        # Milestone 3: Immediate Post-Prefill Bulk Expert Realignment
+        adapt_res = self.expert_manager.adapt_post_prefill()
+        if adapt_res.get("swaps_performed", 0) > 0:
+            resident_eids = {
+                k[1] if isinstance(k, tuple) else int(k)
+                for k in self.expert_manager.residency_map.keys()
+            }
+            self.locality_policy.update_resident_experts(resident_eids)
+
+        # Speculative Drafter Prompt Pre-Conditioning (Draft KV Warm-Up)
+        if self.drafter is not None and self.drafter.is_available() and prompt_len > 1:
+            try:
+                prompt_tensor = torch.tensor(ids, dtype=torch.int32, device=self.device)
+                prompt_embs = self.loader.dequantize_token_embedding(prompt_tensor, device=self.device)
+                self.drafter.prefill_step(prompt_embs, hidden_states=prompt_embs)
+            except Exception:
+                pass
 
         slot_idx = self._acquire_slot(prompt_len, prompt_read, req_experts, cancel)
         if slot_idx < 0 or cancel.is_set():
@@ -697,6 +753,14 @@ class VLLMEngine:
                         if 0 <= slot_idx < len(self.slot_live) and self.slot_live[slot_idx]:
                             self.slot_live[slot_idx]["state"] = "decoding"
                             self.slot_live[slot_idx]["first_token"] = time.time()
+                    # Milestone 3: Realignment immediately upon completing prompt prefill
+                    adapt_res = self.expert_manager.adapt_post_prefill()
+                    if adapt_res.get("swaps_performed", 0) > 0:
+                        resident_eids = {
+                            k[1] if isinstance(k, tuple) else int(k)
+                            for k in self.expert_manager.residency_map.keys()
+                        }
+                        self.locality_policy.update_resident_experts(resident_eids)
                     first_token_marked = True
 
                 generated_count += 1

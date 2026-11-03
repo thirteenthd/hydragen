@@ -1,0 +1,154 @@
+{
+  "tag": "gpu_only_batch4",
+  "records": [
+    {
+      "concurrency": 1,
+      "wall_time_s": 3.21,
+      "total_output_tokens": 47,
+      "aggregate_tok_s": 14.6,
+      "mean_ttft_s": 2.09,
+      "max_ttft_s": 2.09,
+      "vram_hit_rate": 0.0,
+      "per_stream": [
+        {
+          "stream_id": 0,
+          "output_tokens": 47,
+          "ttft_s": 2.09,
+          "wall_time_s": 3.208,
+          "decode_tok_s": 42.0
+        }
+      ]
+    },
+    {
+      "concurrency": 2,
+      "wall_time_s": 4.63,
+      "total_output_tokens": 96,
+      "aggregate_tok_s": 20.7,
+      "mean_ttft_s": 1.287,
+      "max_ttft_s": 2.36,
+      "vram_hit_rate": 0.0,
+      "per_stream": [
+        {
+          "stream_id": 0,
+          "output_tokens": 48,
+          "ttft_s": 0.214,
+          "wall_time_s": 4.452,
+          "decode_tok_s": 11.3
+        },
+        {
+          "stream_id": 1,
+          "output_tokens": 48,
+          "ttft_s": 2.36,
+          "wall_time_s": 4.629,
+          "decode_tok_s": 21.2
+        }
+      ]
+    },
+    {
+      "concurrency": 4,
+      "wall_time_s": 9.44,
+      "total_output_tokens": 191,
+      "aggregate_tok_s": 20.2,
+      "mean_ttft_s": 2.226,
+      "max_ttft_s": 5.165,
+      "vram_hit_rate": 0.0,
+      "per_stream": [
+        {
+          "stream_id": 2,
+          "output_tokens": 48,
+          "ttft_s": 2.905,
+          "wall_time_s": 9.228,
+          "decode_tok_s": 7.6
+        },
+        {
+          "stream_id": 1,
+          "output_tokens": 48,
+          "ttft_s": 0.201,
+          "wall_time_s": 9.317,
+          "decode_tok_s": 5.3
+        },
+        {
+          "stream_id": 3,
+          "output_tokens": 48,
+          "ttft_s": 5.165,
+          "wall_time_s": 9.436,
+          "decode_tok_s": 11.2
+        },
+        {
+          "stream_id": 0,
+          "output_tokens": 47,
+          "ttft_s": 0.634,
+          "wall_time_s": 9.437,
+          "decode_tok_s": 5.3
+        }
+      ]
+    },
+    {
+      "concurrency": 8,
+      "wall_time_s": 19.03,
+      "total_output_tokens": 383,
+      "aggregate_tok_s": 20.1,
+      "mean_ttft_s": 5.335,
+      "max_ttft_s": 15.764,
+      "vram_hit_rate": 0.0,
+      "per_stream": [
+        {
+          "stream_id": 1,
+          "output_tokens": 48,
+          "ttft_s": 1.822,
+          "wall_time_s": 10.602,
+          "decode_tok_s": 5.5
+        },
+        {
+          "stream_id": 3,
+          "output_tokens": 48,
+          "ttft_s": 1.291,
+          "wall_time_s": 11.653,
+          "decode_tok_s": 4.6
+        },
+        {
+          "stream_id": 0,
+          "output_tokens": 48,
+          "ttft_s": 0.214,
+          "wall_time_s": 12.889,
+          "decode_tok_s": 3.8
+        },
+        {
+          "stream_id": 2,
+          "output_tokens": 48,
+          "ttft_s": 0.762,
+          "wall_time_s": 17.224,
+          "decode_tok_s": 2.9
+        },
+        {
+          "stream_id": 4,
+          "output_tokens": 48,
+          "ttft_s": 5.111,
+          "wall_time_s": 17.284,
+          "decode_tok_s": 3.9
+        },
+        {
+          "stream_id": 6,
+          "output_tokens": 48,
+          "ttft_s": 10.352,
+          "wall_time_s": 17.882,
+          "decode_tok_s": 6.4
+        },
+        {
+          "stream_id": 7,
+          "output_tokens": 47,
+          "ttft_s": 7.368,
+          "wall_time_s": 18.021,
+          "decode_tok_s": 4.4
+        },
+        {
+          "stream_id": 5,
+          "output_tokens": 48,
+          "ttft_s": 15.764,
+          "wall_time_s": 19.026,
+          "decode_tok_s": 14.7
+        }
+      ]
+    }
+  ]
+}

@@ -39,6 +39,7 @@ echo "[1/5] Compiling paged_attention_kernel.cu with NVCC (PTX DP4A SIMD)..."
 "${NVCC}" -c -O3 -Xcompiler -fPIC \
     -gencode arch=compute_86,code=sm_86 \
     -I"${CUDA_HOME}/include" \
+    -I"${SCRIPT_DIR}/include" \
     -I"${SCRIPT_DIR}/paged_attention" \
     "${SCRIPT_DIR}/paged_attention/paged_attention_kernel.cu" \
     -o "${BUILD_DIR}/paged_attention_kernel.o"
@@ -46,12 +47,14 @@ echo "[1/5] Compiling paged_attention_kernel.cu with NVCC (PTX DP4A SIMD)..."
 echo "[2/5] Compiling paged_kv_manager.cpp & c_api.cpp with g++..."
 g++ -c -O3 -fPIC -std=c++17 \
     -I"${CUDA_HOME}/include" \
+    -I"${SCRIPT_DIR}/include" \
     -I"${SCRIPT_DIR}/paged_attention" \
     "${SCRIPT_DIR}/paged_attention/paged_kv_manager.cpp" \
     -o "${BUILD_DIR}/paged_kv_manager.o"
 
 g++ -c -O3 -fPIC -std=c++17 \
     -I"${CUDA_HOME}/include" \
+    -I"${SCRIPT_DIR}/include" \
     -I"${SCRIPT_DIR}/paged_attention" \
     "${SCRIPT_DIR}/paged_attention/paged_kv_c_api.cpp" \
     -o "${BUILD_DIR}/paged_kv_c_api.o"
@@ -86,6 +89,6 @@ g++ -O3 -fPIC -std=c++17 -pthread -shared \
 
 echo "====================================================="
 echo "Build complete! Staging to ${PKG_LIB_DIR}..."
-cp -f "${LIB_DIR}"/*.so "${PKG_LIB_DIR}/" || true
+cp --remove-destination "${LIB_DIR}"/*.so "${PKG_LIB_DIR}/" || cp -f "${LIB_DIR}"/*.so "${PKG_LIB_DIR}/" || true
 ls -la "${LIB_DIR}"
 echo "====================================================="

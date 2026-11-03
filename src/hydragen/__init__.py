@@ -7,6 +7,7 @@ __version__ = "0.35.0"
 # work instantly across Windows and Linux even before heavyweight frameworks (torch, triton) are loaded.
 _EXPORT_MAP = {
     "CPUExpertFallbackExecutor": "hydragen.cpu_fallback",
+    "HybridExpertMailbox": "hydragen.expert_mailbox",
     "VLLMEngine": "hydragen.engine",
     "ExpertLocalityPolicy": "hydragen.expert_locality_policy",
     "PagedExpertManager": "hydragen.expert_manager",

@@ -1101,6 +1101,24 @@ class StrataEngine:
             self.info.update(drafting.engine_info(args, start_log_text(log, log_start), drafting.take_note()))
         except Exception:                               # noqa: BLE001 - a note must never stop a start
             pass
+        try:
+            from hydragen.backends.registry import BackendRegistry
+            from hydragen.drafters.factory import resolve_drafting_mode
+            hw = BackendRegistry.get_hardware_backend()
+            cap = hw.capability
+            plugin_desc = getattr(BackendRegistry, "_plugin_desc", None) or {}
+            self.info.setdefault("hardware_backend", cap.device_type.value)
+            self.info.setdefault("hardware_device", cap.device_name)
+            self.info.setdefault("hardware_plugin", plugin_desc.get("name", "hydragen_native"))
+            self.info.setdefault("plugin_abi", plugin_desc.get("abi_version", 1))
+            self.info.setdefault("has_dp4a", cap.has_dp4a)
+            self.info.setdefault("has_cp_async", cap.has_cp_async)
+            self.info.setdefault("has_wmma", cap.has_wmma)
+            mode = resolve_drafting_mode(hw)
+            self.info.setdefault("drafter", f"{mode.value}_autoregressive_drafter" if mode.value == "mtp" else f"{mode.value}_drafter")
+            self.info.setdefault("drafting_mode", mode.value)
+        except Exception:
+            pass
         self.ended = False                              # READY: alive from here (restart() set it True, #344)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
@@ -7243,11 +7261,36 @@ def make_handler(svc: Service):
                 else:
                     eng_backend = "strata"
                     eng_label = "Strata (Native C++/CUDA)"
-                self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
-                                 "images": svc.vision is not None, "api_key": bool(svc.api_key),
-                                 "image_generation": svc.images is not None,
-                                 "loaded": svc.loaded(), "service": "hydragen",
-                                 "engine": eng_backend, "engine_label": eng_label})
+                health_payload = {
+                    "status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
+                    "images": svc.vision is not None, "api_key": bool(svc.api_key),
+                    "image_generation": svc.images is not None,
+                    "loaded": svc.loaded(), "service": "hydragen",
+                    "engine": eng_backend, "engine_label": eng_label,
+                }
+                eng_info = getattr(svc.engine, "info", {}) or {}
+                if "hardware_backend" in eng_info:
+                    health_payload["hardware_backend"] = eng_info["hardware_backend"]
+                    health_payload["hardware_device"] = eng_info["hardware_device"]
+                    health_payload["hardware_plugin"] = eng_info.get("hardware_plugin")
+                    health_payload["drafter"] = eng_info.get("drafter")
+                    health_payload["drafting_mode"] = eng_info.get("drafting_mode")
+                else:
+                    try:
+                        from hydragen.backends.registry import BackendRegistry
+                        from hydragen.drafters.factory import resolve_drafting_mode
+                        hw = BackendRegistry.get_hardware_backend()
+                        cap = hw.capability
+                        plugin_desc = getattr(BackendRegistry, "_plugin_desc", None) or {}
+                        mode = resolve_drafting_mode(hw)
+                        health_payload["hardware_backend"] = cap.device_type.value
+                        health_payload["hardware_device"] = cap.device_name
+                        health_payload["hardware_plugin"] = plugin_desc.get("name", "hydragen_native")
+                        health_payload["drafter"] = f"{mode.value}_autoregressive_drafter" if mode.value == "mtp" else f"{mode.value}_drafter"
+                        health_payload["drafting_mode"] = mode.value
+                    except Exception:
+                        pass
+                self._json(200, health_payload)
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
                 f = svc.images.file(path[len("/v1/images/files/"):]) if svc.images is not None else None

@@ -16,6 +16,7 @@ Supports two VRAM caching modes:
 
 from __future__ import annotations
 
+import os
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Set, Tuple
 import torch
@@ -39,6 +40,7 @@ class PagedExpertManager:
         loader: Optional[Any] = None,
         default_layer_idx: int = 0,
         compressed_cache: Optional[bool] = None,
+        enable_mailbox: Optional[bool] = None,
     ):
         self.num_slots = int(num_slots)
         self.expert_shape = tuple(expert_shape)
@@ -48,11 +50,14 @@ class PagedExpertManager:
         self.loader = loader
         self.default_layer_idx = int(default_layer_idx)
         self.compressed_cache = (loader is not None) if compressed_cache is None else bool(compressed_cache)
+        self._enable_mailbox = enable_mailbox
 
         # Telemetry counters
         self.cache_hits: int = 0
         self.cache_misses: int = 0
         self.pcie_bytes_transferred: int = 0
+        self.routing_counts: Dict[Any, float] = {}
+        self.total_swaps: int = 0
 
         # Create dedicated CUDA stream first so CUDA context & stream memory are accounted for
         self.dma_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
@@ -104,18 +109,34 @@ class PagedExpertManager:
             )
 
             # 2. Allocate L2 Host Pool (when not backed by GGUF mmap loader) or staging buffers
+            is_cuda = (device.type == "cuda" and torch.cuda.is_available())
             if self.loader is None:
                 self.host_pool = torch.empty(
                     (self.total_experts, *self.expert_shape),
                     dtype=dtype,
                     device="cpu",
-                    pin_memory=True,
+                    pin_memory=is_cuda,
                 )
                 self.staging_gate_u8 = None
                 self.staging_up_u8 = None
                 self.staging_down_u8 = None
+
+                # Milestone 4: Concurrent CPU+GPU Hybrid Expert Mailbox (opt-in via HYDRAGEN_ENABLE_MAILBOX=1 or enable_mailbox=True)
+                if self._enable_mailbox is not None:
+                    enable_box = bool(self._enable_mailbox)
+                else:
+                    enable_box = (os.environ.get("HYDRAGEN_ENABLE_MAILBOX", "0").lower() in ("1", "true", "yes"))
+                if enable_box:
+                    try:
+                        from hydragen.expert_mailbox import HybridExpertMailbox
+                        self.mailbox = HybridExpertMailbox(device=device)
+                    except Exception:
+                        self.mailbox = None
+                else:
+                    self.mailbox = None
             else:
                 self.host_pool = None
+                self.mailbox = None
                 max_proj_bytes = 1536 * 1024
                 self.staging_gate_u8 = torch.empty(
                     (max_proj_bytes,), dtype=torch.uint8, device=device
@@ -129,6 +150,7 @@ class PagedExpertManager:
 
         # 3. GPU-resident Indirection Table for Triton / CUDA kernels
         # gpu_slot_table[expert_id] == slot_idx (or -1 if not resident)
+        is_cuda_device = (self.device.type == "cuda" and torch.cuda.is_available())
         self.gpu_slot_table = torch.full(
             (self.total_experts,),
             -1,
@@ -140,7 +162,7 @@ class PagedExpertManager:
             -1,
             dtype=torch.int32,
             device="cpu",
-            pin_memory=True,
+            pin_memory=is_cuda_device,
         )
 
         # Multi-layer indirection tables when multiplexing slots across layers
@@ -160,11 +182,12 @@ class PagedExpertManager:
 
     def _ensure_layer_tables(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         if layer_idx not in self._layer_gpu_tables:
+            is_cuda = (self.device.type == "cuda" and torch.cuda.is_available())
             self._layer_gpu_tables[layer_idx] = torch.full(
                 (self.total_experts,), -1, dtype=torch.int32, device=self.device
             )
             self._layer_cpu_tables[layer_idx] = torch.full(
-                (self.total_experts,), -1, dtype=torch.int32, device="cpu", pin_memory=True
+                (self.total_experts,), -1, dtype=torch.int32, device="cpu", pin_memory=is_cuda
             )
         return self._layer_gpu_tables[layer_idx], self._layer_cpu_tables[layer_idx]
 
@@ -176,6 +199,19 @@ class PagedExpertManager:
         if layer_idx is not None and (layer_idx, expert_id) in self.residency_map:
             return True
         return expert_id in self.residency_map
+
+    def partition_experts(
+        self, expert_ids: List[int], layer_idx: Optional[int] = None
+    ) -> Tuple[List[int], List[int]]:
+        """Partition expert IDs into resident (in VRAM) and missed (in host RAM)."""
+        resident = []
+        missed = []
+        for eid in expert_ids:
+            if self.is_resident(eid, layer_idx):
+                resident.append(eid)
+            else:
+                missed.append(eid)
+        return resident, missed
 
     def get_slot(self, expert_id: int) -> int:
         """Retrieve slot for resident expert and refresh its LRU timestamp."""
@@ -349,6 +385,213 @@ class PagedExpertManager:
                 self.lru_tracker.move_to_end(key)
 
         return {eid: self.residency_map[(layer_idx, eid)] for eid in required_expert_ids}
+
+    def record_routing(
+        self,
+        expert_ids: Any,
+        layer_idx: Optional[int] = None,
+        weight: float = 1.0,
+    ) -> None:
+        """Record expert routing occurrences during prefill or decode."""
+        if isinstance(expert_ids, torch.Tensor):
+            expert_ids = expert_ids.detach().cpu().flatten().tolist()
+        for eid in expert_ids:
+            key = (layer_idx, int(eid)) if layer_idx is not None else int(eid)
+            self.routing_counts[key] = self.routing_counts.get(key, 0.0) + float(weight)
+
+    def adapt_post_prefill(
+        self,
+        routing_histogram: Optional[Dict[Any, float]] = None,
+        max_swaps: Optional[int] = None,
+        decay_factor: float = 0.95,
+        threshold_ratio: float = 1.2,
+    ) -> Dict[str, Any]:
+        """Immediate Post-Prefill Bulk Expert Realignment (RustingStrata-inspired LPT-MoE).
+
+        Immediately upon completing prompt prefill, inspects the cumulative gating routing
+        histogram. Identifies candidate hotter experts whose prefill frequency outstrips
+        currently resident cold experts, and executes an all-at-once bulk DMA transfer
+        into VRAM slots before token 1 generation begins.
+
+        Args:
+            routing_histogram: Optional explicit routing counts dict. If None, uses `self.routing_counts`.
+            max_swaps: Max expert slots to realign in this pass (None or 0 = unlimited / up to all slots).
+            decay_factor: Factor to multiply counts by after adaptation to maintain recency bias.
+            threshold_ratio: Minimum ratio (hot_count / cold_count) required to justify a swap.
+
+        Returns:
+            Dict containing `swaps_performed`, `dirty_layers`, and `elapsed_ms`.
+        """
+        import time
+        t0 = time.perf_counter()
+
+        counts = dict(routing_histogram) if routing_histogram is not None else dict(self.routing_counts)
+        if not counts:
+            return {"swaps_performed": 0, "elapsed_ms": 0.0, "dirty_layers": 0}
+
+        # Apply decay to existing counts
+        for k in self.routing_counts:
+            self.routing_counts[k] *= decay_factor
+
+        # Determine if we're operating with multi-layer keys (tuple) or single-layer keys (int)
+        is_multilayer = any(isinstance(k, tuple) for k in self.residency_map.keys()) or any(isinstance(k, tuple) for k in counts.keys())
+
+        # Collect candidate hot non-resident experts
+        hot_candidates: List[Tuple[float, Any]] = []
+        for key, cnt in counts.items():
+            if cnt <= 0:
+                continue
+            if is_multilayer:
+                if not isinstance(key, tuple):
+                    norm_key = (self.default_layer_idx, int(key))
+                else:
+                    norm_key = (int(key[0]), int(key[1]))
+                if norm_key not in self.residency_map:
+                    hot_candidates.append((cnt, norm_key))
+            else:
+                eid = key[1] if isinstance(key, tuple) else int(key)
+                if eid not in self.residency_map:
+                    hot_candidates.append((cnt, eid))
+
+        # Sort hot candidates descending by routing count
+        hot_candidates.sort(key=lambda x: x[0], reverse=True)
+
+        if not hot_candidates:
+            return {"swaps_performed": 0, "elapsed_ms": (time.perf_counter() - t0) * 1000.0, "dirty_layers": 0}
+
+        swaps_limit = self.num_slots if max_swaps is None or max_swaps <= 0 else min(self.num_slots, int(max_swaps))
+
+        swaps_performed = 0
+        dirty_layers: Set[int] = set()
+
+        # Step 1: Use any remaining free slots first
+        hot_idx = 0
+        while self.free_slots and hot_idx < len(hot_candidates) and swaps_performed < swaps_limit:
+            hot_cnt, hot_key = hot_candidates[hot_idx]
+            hot_idx += 1
+            slot = self.free_slots.pop()
+
+            if is_multilayer:
+                hot_layer, hot_eid = hot_key
+                if self.dma_stream is not None:
+                    with torch.cuda.stream(self.dma_stream):
+                        self._dma_expert_into_slot(hot_layer, hot_eid, slot)
+                else:
+                    self._dma_expert_into_slot(hot_layer, hot_eid, slot)
+
+                _, hot_cpu_tbl = self._ensure_layer_tables(hot_layer)
+                hot_cpu_tbl[hot_eid] = slot
+                dirty_layers.add(hot_layer)
+                self.residency_map[hot_key] = slot
+                self.slot_to_expert[slot] = hot_key
+                self.lru_tracker[hot_key] = None
+            else:
+                hot_eid = hot_key
+                if self.dma_stream is not None:
+                    with torch.cuda.stream(self.dma_stream):
+                        self._dma_expert_into_slot(self.default_layer_idx, hot_eid, slot)
+                else:
+                    self._dma_expert_into_slot(self.default_layer_idx, hot_eid, slot)
+
+                self.cpu_slot_table[hot_eid] = slot
+                self.residency_map[hot_eid] = slot
+                self.slot_to_expert[slot] = hot_eid
+                self.lru_tracker[hot_eid] = None
+
+            swaps_performed += 1
+
+        # Step 2: Swap remaining hot candidates with cold resident candidates
+        if hot_idx < len(hot_candidates) and swaps_performed < swaps_limit:
+            # Collect resident candidates and their routing counts
+            cold_candidates: List[Tuple[float, Any, int]] = []
+            for key, slot in list(self.residency_map.items()):
+                cnt = counts.get(key, 0.0)
+                cold_candidates.append((cnt, key, slot))
+
+            # Sort cold candidates ascending by count (lowest first)
+            cold_candidates.sort(key=lambda x: x[0])
+
+            cold_idx = 0
+            while hot_idx < len(hot_candidates) and cold_idx < len(cold_candidates) and swaps_performed < swaps_limit:
+                hot_cnt, hot_key = hot_candidates[hot_idx]
+                cold_cnt, cold_key, slot = cold_candidates[cold_idx]
+
+                # Require hot_cnt >= threshold_ratio * cold_cnt + 1.0 to prevent churning equal/low-frequency experts
+                if hot_cnt < (threshold_ratio * cold_cnt + 1.0):
+                    break
+
+                # Evict cold resident
+                del self.residency_map[cold_key]
+                if cold_key in self.lru_tracker:
+                    del self.lru_tracker[cold_key]
+
+                if is_multilayer:
+                    cold_layer, cold_eid = cold_key
+                    _, cold_cpu_tbl = self._ensure_layer_tables(cold_layer)
+                    cold_cpu_tbl[cold_eid] = -1
+                    dirty_layers.add(cold_layer)
+
+                    hot_layer, hot_eid = hot_key
+                    if self.dma_stream is not None:
+                        with torch.cuda.stream(self.dma_stream):
+                            self._dma_expert_into_slot(hot_layer, hot_eid, slot)
+                    else:
+                        self._dma_expert_into_slot(hot_layer, hot_eid, slot)
+
+                    _, hot_cpu_tbl = self._ensure_layer_tables(hot_layer)
+                    hot_cpu_tbl[hot_eid] = slot
+                    dirty_layers.add(hot_layer)
+                    self.residency_map[hot_key] = slot
+                    self.slot_to_expert[slot] = hot_key
+                    self.lru_tracker[hot_key] = None
+                else:
+                    cold_eid = cold_key
+                    self.cpu_slot_table[cold_eid] = -1
+
+                    hot_eid = hot_key
+                    if self.dma_stream is not None:
+                        with torch.cuda.stream(self.dma_stream):
+                            self._dma_expert_into_slot(self.default_layer_idx, hot_eid, slot)
+                    else:
+                        self._dma_expert_into_slot(self.default_layer_idx, hot_eid, slot)
+
+                    self.cpu_slot_table[hot_eid] = slot
+                    self.residency_map[hot_eid] = slot
+                    self.slot_to_expert[slot] = hot_eid
+                    self.lru_tracker[hot_eid] = None
+
+                swaps_performed += 1
+                hot_idx += 1
+                cold_idx += 1
+
+        # Synchronize GPU indirection tables
+        if swaps_performed > 0:
+            if is_multilayer and dirty_layers:
+                if self.dma_stream is not None:
+                    with torch.cuda.stream(self.dma_stream):
+                        for l_idx in dirty_layers:
+                            g_tbl, c_tbl = self._ensure_layer_tables(l_idx)
+                            g_tbl.copy_(c_tbl, non_blocking=True)
+                        self.dma_stream.synchronize()
+                else:
+                    for l_idx in dirty_layers:
+                        g_tbl, c_tbl = self._ensure_layer_tables(l_idx)
+                        g_tbl.copy_(c_tbl)
+            else:
+                if self.dma_stream is not None:
+                    with torch.cuda.stream(self.dma_stream):
+                        self.gpu_slot_table.copy_(self.cpu_slot_table, non_blocking=True)
+                        self.dma_stream.synchronize()
+                else:
+                    self.gpu_slot_table.copy_(self.cpu_slot_table)
+
+        self.total_swaps += swaps_performed
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        return {
+            "swaps_performed": swaps_performed,
+            "elapsed_ms": round(dt_ms, 2),
+            "dirty_layers": len(dirty_layers),
+        }
 
     def route_tokens(
         self,
