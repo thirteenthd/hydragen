@@ -26,6 +26,28 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     return val;
 }
 
+// Milestone 6: Ampere SM_80+ Asynchronous Global-to-Shared Copy Pipeline (cp.async)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+__device__ __forceinline__ void ptx_cp_async_16(void* smem_ptr, const void* gmem_ptr) {
+    uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+                 :
+                 : "r"(smem), "l"(gmem_ptr));
+}
+
+__device__ __forceinline__ void ptx_cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+__device__ __forceinline__ void ptx_cp_async_wait_all() {
+    asm volatile("cp.async.wait_all;\n" ::);
+}
+
+__device__ __forceinline__ void ptx_cp_async_wait_group_0() {
+    asm volatile("cp.async.wait_group 0;\n" ::);
+}
+#endif
+
 // CUDA block: 1 thread block handles 1 (sequence, head) pair
 // Block size: 128 threads for head_dim=128
 template<int BLOCK_SIZE = 16, int HEAD_DIM = 128>
@@ -69,8 +91,8 @@ __global__ void paged_attention_decode_kernel(
 
     __shared__ float s_logits[BLOCK_SIZE];
     __shared__ float s_warp_reduce[4]; // 128 threads = 4 warps
-    __shared__ uint4 s_k_vec[HEAD_DIM / 16]; // 8 uint4 = 128 bytes (128-bit vector loads)
-    __shared__ uint4 s_v_vec[HEAD_DIM / 16]; // 8 uint4 = 128 bytes (128-bit vector loads)
+    __shared__ uint4 s_k_vec[2][HEAD_DIM / 16]; // Double-buffered: 2 x 128 bytes
+    __shared__ uint4 s_v_vec[2][HEAD_DIM / 16]; // Double-buffered: 2 x 128 bytes
 
     // Pre-quantize and pack 4 Q values once per query vector (saves 16x redundant ops in inner loop)
     int32_t q_packed = 0;
@@ -96,29 +118,54 @@ __global__ void paged_attention_decode_kernel(
 
         const int tokens_in_block = min(BLOCK_SIZE, context_len - blk_idx * BLOCK_SIZE);
 
-        // Milestone 7: Clamped Branchless Paged Attention KV Fetch
-        // 1. Fully unrolled compile-time loop over BLOCK_SIZE (16 iterations, 0 warp divergence).
-        // 2. Branchless clamp: t_clamped = min(t, tokens_in_block - 1) guarantees in-bounds memory addresses.
-        // 3. 128-bit vector loads (uint4 = 16 bytes) load K and V cache into shared memory at peak bus width.
-        // 4. Inactive token slots (t >= tokens_in_block) masked with -1e9f: expf(-1e9f) == 0.0f leaves accumulator intact.
+        // Milestone 6: Preload token t=0 into stage 0 via cp.async / 128-bit load
+        if (tid < (HEAD_DIM / 16)) {
+            size_t k_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) +
+                              (size_t)0 * HEAD_DIM + tid * 16;
+            size_t v_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) +
+                              (size_t)0 * HEAD_DIM + tid * 16;
+            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+            ptx_cp_async_16(&s_k_vec[0][tid], &k_cache[k_offset]);
+            ptx_cp_async_16(&s_v_vec[0][tid], &v_cache[v_offset]);
+            ptx_cp_async_commit();
+            ptx_cp_async_wait_all();
+            #else
+            s_k_vec[0][tid] = *reinterpret_cast<const uint4*>(&k_cache[k_offset]);
+            s_v_vec[0][tid] = *reinterpret_cast<const uint4*>(&v_cache[v_offset]);
+            #endif
+        }
+        __syncthreads();
+
+        // Milestone 7 & Milestone 6: Clamped Branchless Paged Attention KV Fetch with Double-Buffered cp.async
         #pragma unroll
         for (int t = 0; t < BLOCK_SIZE; ++t) {
-            const int t_clamped = min(t, tokens_in_block - 1);
+            const int curr_stage = t & 1;
+            const int next_stage = curr_stage ^ 1;
             const float mask = (t < tokens_in_block) ? 0.0f : -1e9f;
 
-            // 128-bit Vector Load for K Cache: 8 threads load 16 bytes each = 128 bytes
-            if (tid < (HEAD_DIM / 16)) {
-                size_t k_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) +
-                                  (size_t)t_clamped * HEAD_DIM;
-                const uint4* k_ptr_u4 = reinterpret_cast<const uint4*>(&k_cache[k_offset]);
-                s_k_vec[tid] = k_ptr_u4[tid];
+            // Milestone 6: Asynchronously prefetch token t + 1 into next_stage while compute is active
+            if (t + 1 < BLOCK_SIZE) {
+                const int next_t_clamped = min(t + 1, tokens_in_block - 1);
+                if (tid < (HEAD_DIM / 16)) {
+                    size_t k_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) +
+                                      (size_t)next_t_clamped * HEAD_DIM + tid * 16;
+                    size_t v_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) +
+                                      (size_t)next_t_clamped * HEAD_DIM + tid * 16;
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+                    ptx_cp_async_16(&s_k_vec[next_stage][tid], &k_cache[k_offset]);
+                    ptx_cp_async_16(&s_v_vec[next_stage][tid], &v_cache[v_offset]);
+                    ptx_cp_async_commit();
+                    #else
+                    s_k_vec[next_stage][tid] = *reinterpret_cast<const uint4*>(&k_cache[k_offset]);
+                    s_v_vec[next_stage][tid] = *reinterpret_cast<const uint4*>(&v_cache[v_offset]);
+                    #endif
+                }
             }
-            __syncthreads();
 
             if (is_int8_kv) {
                 // Specialized Warp 0: Computes entire 128-element dot product with 32 threads using PTX dp4a
                 if (tid < 32) {
-                    const int32_t* s_k_i32 = reinterpret_cast<const int32_t*>(s_k_vec);
+                    const int32_t* s_k_i32 = reinterpret_cast<const int32_t*>(&s_k_vec[curr_stage][0]);
                     int32_t k_packed = s_k_i32[tid];
 
                     // Hardware PTX DP4A instruction
@@ -133,7 +180,7 @@ __global__ void paged_attention_decode_kernel(
                 }
             } else {
                 // Fallback / standard path for FP16 or remaining threads
-                const int8_t* s_k = reinterpret_cast<const int8_t*>(s_k_vec);
+                const int8_t* s_k = reinterpret_cast<const int8_t*>(&s_k_vec[curr_stage][0]);
                 float k_val = (lane < HEAD_DIM) ? (float)s_k[lane] * kv_scale : 0.0f;
                 float dot = q_val * k_val;
 
@@ -158,15 +205,6 @@ __global__ void paged_attention_decode_kernel(
             }
             __syncthreads();
 
-            // 128-bit Vector Load for V Cache: 8 threads load 16 bytes each = 128 bytes
-            if (tid < (HEAD_DIM / 16)) {
-                size_t v_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) +
-                                  (size_t)t_clamped * HEAD_DIM;
-                const uint4* v_ptr_u4 = reinterpret_cast<const uint4*>(&v_cache[v_offset]);
-                s_v_vec[tid] = v_ptr_u4[tid];
-            }
-            __syncthreads();
-
             // Online Softmax update with branchless masked logit
             float logit = s_logits[t];
             float new_max = fmaxf(max_score, logit);
@@ -176,11 +214,18 @@ __global__ void paged_attention_decode_kernel(
             sum_exp = sum_exp * exp_diff + exp_new;
             acc_out = acc_out * exp_diff;
 
-            const int8_t* s_v = reinterpret_cast<const int8_t*>(s_v_vec);
+            const int8_t* s_v = reinterpret_cast<const int8_t*>(&s_v_vec[curr_stage][0]);
             float v_val = (lane < HEAD_DIM) ? (float)s_v[lane] * kv_scale : 0.0f;
 
             acc_out += exp_new * v_val;
             max_score = new_max;
+
+            // Await arrival of prefetched next_stage buffer
+            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+            if (t + 1 < BLOCK_SIZE) {
+                ptx_cp_async_wait_group_0();
+            }
+            #endif
             __syncthreads();
         }
     }
@@ -274,8 +319,8 @@ __global__ void paged_attention_prefill_kernel(
 
     __shared__ float s_logits[BLOCK_SIZE];
     __shared__ float s_warp_reduce[4]; // 128 threads = 4 warps
-    __shared__ uint4 s_k_vec[HEAD_DIM / 16]; // 8 uint4 = 128 bytes (128-bit vector loads)
-    __shared__ uint4 s_v_vec[HEAD_DIM / 16]; // 8 uint4 = 128 bytes (128-bit vector loads)
+    __shared__ uint4 s_k_vec[2][HEAD_DIM / 16]; // Double-buffered: 2 x 128 bytes
+    __shared__ uint4 s_v_vec[2][HEAD_DIM / 16]; // Double-buffered: 2 x 128 bytes
 
     // Process each query token in this tile
     for (int q_tok = q_start; q_tok < q_end; ++q_tok) {
@@ -315,26 +360,53 @@ __global__ void paged_attention_prefill_kernel(
 
             const int tokens_in_block = min(BLOCK_SIZE, context_len - blk_idx * BLOCK_SIZE);
 
-            // Milestone 7: Clamped Branchless Paged Attention KV Fetch
-            // Fixed BLOCK_SIZE compile-time unroll; branchless index clamping min(t, tokens_in_block - 1);
-            // 128-bit vector loads via uint4 into shared memory; invalid slots masked to -1e9f.
+            // Milestone 6: Preload token t=0 into stage 0 via cp.async / 128-bit load
+            if (tid < (HEAD_DIM / 16)) {
+                size_t k_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) +
+                                  (size_t)0 * HEAD_DIM + tid * 16;
+                size_t v_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) +
+                                  (size_t)0 * HEAD_DIM + tid * 16;
+                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+                ptx_cp_async_16(&s_k_vec[0][tid], &k_cache[k_offset]);
+                ptx_cp_async_16(&s_v_vec[0][tid], &v_cache[v_offset]);
+                ptx_cp_async_commit();
+                ptx_cp_async_wait_all();
+                #else
+                s_k_vec[0][tid] = *reinterpret_cast<const uint4*>(&k_cache[k_offset]);
+                s_v_vec[0][tid] = *reinterpret_cast<const uint4*>(&v_cache[v_offset]);
+                #endif
+            }
+            __syncthreads();
+
+            // Milestone 7 & Milestone 6: Clamped Branchless Prefill Attention with Double-Buffered cp.async
             #pragma unroll
             for (int t = 0; t < BLOCK_SIZE; ++t) {
-                const int t_clamped = min(t, tokens_in_block - 1);
+                const int curr_stage = t & 1;
+                const int next_stage = curr_stage ^ 1;
                 const float mask = (t < tokens_in_block) ? 0.0f : -1e9f;
 
-                // 128-bit Vector Load for K Cache
-                if (tid < (HEAD_DIM / 16)) {
-                    size_t k_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) +
-                                      (size_t)t_clamped * HEAD_DIM;
-                    const uint4* k_ptr_u4 = reinterpret_cast<const uint4*>(&k_cache[k_offset]);
-                    s_k_vec[tid] = k_ptr_u4[tid];
+                // Milestone 6: Asynchronously prefetch token t + 1 into next_stage while compute is active
+                if (t + 1 < BLOCK_SIZE) {
+                    const int next_t_clamped = min(t + 1, tokens_in_block - 1);
+                    if (tid < (HEAD_DIM / 16)) {
+                        size_t k_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) +
+                                          (size_t)next_t_clamped * HEAD_DIM + tid * 16;
+                        size_t v_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) +
+                                          (size_t)next_t_clamped * HEAD_DIM + tid * 16;
+                        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+                        ptx_cp_async_16(&s_k_vec[next_stage][tid], &k_cache[k_offset]);
+                        ptx_cp_async_16(&s_v_vec[next_stage][tid], &v_cache[v_offset]);
+                        ptx_cp_async_commit();
+                        #else
+                        s_k_vec[next_stage][tid] = *reinterpret_cast<const uint4*>(&k_cache[k_offset]);
+                        s_v_vec[next_stage][tid] = *reinterpret_cast<const uint4*>(&v_cache[v_offset]);
+                        #endif
+                    }
                 }
-                __syncthreads();
 
                 if (is_int8_kv) {
                     if (tid < 32) {
-                        const int32_t* s_k_i32 = reinterpret_cast<const int32_t*>(s_k_vec);
+                        const int32_t* s_k_i32 = reinterpret_cast<const int32_t*>(&s_k_vec[curr_stage][0]);
                         int32_t k_packed = s_k_i32[tid];
 
                         int32_t dp_int = ptx_dp4a(q_packed, k_packed, 0);
@@ -345,7 +417,7 @@ __global__ void paged_attention_prefill_kernel(
                         }
                     }
                 } else {
-                    const int8_t* s_k = reinterpret_cast<const int8_t*>(s_k_vec);
+                    const int8_t* s_k = reinterpret_cast<const int8_t*>(&s_k_vec[curr_stage][0]);
                     float k_val = (lane < HEAD_DIM) ? (float)s_k[lane] * kv_scale : 0.0f;
                     float dot = q_val * k_val;
                     dot = warp_reduce_sum(dot);
@@ -368,15 +440,6 @@ __global__ void paged_attention_prefill_kernel(
                 }
                 __syncthreads();
 
-                // 128-bit Vector Load for V Cache
-                if (tid < (HEAD_DIM / 16)) {
-                    size_t v_offset = ((size_t)physical_block_id * num_kv_heads + kv_head_idx) * (BLOCK_SIZE * HEAD_DIM) +
-                                      (size_t)t_clamped * HEAD_DIM;
-                    const uint4* v_ptr_u4 = reinterpret_cast<const uint4*>(&v_cache[v_offset]);
-                    s_v_vec[tid] = v_ptr_u4[tid];
-                }
-                __syncthreads();
-
                 // Online Softmax update with branchless masked logit
                 float logit = s_logits[t];
                 float new_max = fmaxf(max_score, logit);
@@ -386,11 +449,18 @@ __global__ void paged_attention_prefill_kernel(
                 sum_exp = sum_exp * exp_diff + exp_new;
                 acc_out = acc_out * exp_diff;
 
-                const int8_t* s_v = reinterpret_cast<const int8_t*>(s_v_vec);
+                const int8_t* s_v = reinterpret_cast<const int8_t*>(&s_v_vec[curr_stage][0]);
                 float v_val = (lane < HEAD_DIM) ? (float)s_v[lane] * kv_scale : 0.0f;
 
                 acc_out += exp_new * v_val;
                 max_score = new_max;
+
+                // Await arrival of prefetched next_stage buffer
+                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+                if (t + 1 < BLOCK_SIZE) {
+                    ptx_cp_async_wait_group_0();
+                }
+                #endif
                 __syncthreads();
             }
         }
