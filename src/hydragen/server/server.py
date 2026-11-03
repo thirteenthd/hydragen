@@ -7243,11 +7243,21 @@ def make_handler(svc: Service):
                 else:
                     eng_backend = "strata"
                     eng_label = "Strata (Native C++/CUDA)"
-                self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
-                                 "images": svc.vision is not None, "api_key": bool(svc.api_key),
-                                 "image_generation": svc.images is not None,
-                                 "loaded": svc.loaded(), "service": "hydragen",
-                                 "engine": eng_backend, "engine_label": eng_label})
+                health_payload = {
+                    "status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
+                    "images": svc.vision is not None, "api_key": bool(svc.api_key),
+                    "image_generation": svc.images is not None,
+                    "loaded": svc.loaded(), "service": "hydragen",
+                    "engine": eng_backend, "engine_label": eng_label,
+                }
+                eng_info = getattr(svc.engine, "info", {}) or {}
+                if "hardware_backend" in eng_info:
+                    health_payload["hardware_backend"] = eng_info["hardware_backend"]
+                    health_payload["hardware_device"] = eng_info["hardware_device"]
+                    health_payload["hardware_plugin"] = eng_info.get("hardware_plugin")
+                    health_payload["drafter"] = eng_info.get("drafter")
+                    health_payload["drafting_mode"] = eng_info.get("drafting_mode")
+                self._json(200, health_payload)
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
                 f = svc.images.file(path[len("/v1/images/files/"):]) if svc.images is not None else None

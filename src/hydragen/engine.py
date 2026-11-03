@@ -144,22 +144,29 @@ class VLLMEngine:
         # Warm up Triton Fused MoE kernels on real Layer 0 & Layer 1 (type 42 Q2_0_STRATA) experts
         self._warmup_triton_pipeline()
 
-        # Milestone 5: MTP Draft Head Prompt Pre-Conditioning (Draft KV Warm-Up)
+        # Milestone 5 & Speculative Drafter Architecture & Hardware Plugin Binding
+        from hydragen.backends.registry import BackendRegistry
+        from hydragen.drafters import DisabledDrafter, get_speculative_drafter, resolve_drafting_mode
+
+        self.hw_backend = BackendRegistry.get_hardware_backend()
         mtp_path = os.path.join(self.cfg.get("cwd") or ".", "models/mtp/rt")
         try:
-            from hydragen.mtp_preconditioner import MtpDraftPreconditioner
-            self.mtp_preconditioner: Optional[MtpDraftPreconditioner] = MtpDraftPreconditioner(
+            self.drafter = get_speculative_drafter(
+                hardware_backend=self.hw_backend,
+                device=self.device,
                 n_embd=self.n_embd,
                 hc=4,
                 n_head_kv=2,
                 head_dim=128,
                 max_context=self.max_context,
-                device=self.device,
                 mtp_dir=mtp_path if os.path.exists(mtp_path) else None,
             )
         except Exception as e:
-            print(f"[hydragen] Notice: MtpDraftPreconditioner disabled ({e})")
-            self.mtp_preconditioner = None
+            print(f"[hydragen] Notice: Speculative drafter disabled ({e})")
+            self.drafter = DisabledDrafter()
+
+        # Backward compatibility for existing code paths
+        self.mtp_preconditioner = getattr(self.drafter, "_preconditioner", None)
 
         # 4. Continuous Batching Slots & Locality-Aware Wait Queue
         self.slot_live: List[Optional[Dict[str, Any]]] = [None] * self.batch
@@ -181,6 +188,8 @@ class VLLMEngine:
             or int(slots * 1868800 / (1024 * 1024))
             or 3740
         )
+        cap = self.hw_backend.capability
+        plugin_desc = getattr(BackendRegistry, "_plugin_desc", None) or {}
         self.info = {
             **b_info,
             "version": "0.34.0-hydragen-triton",
@@ -197,6 +206,15 @@ class VLLMEngine:
             "spec": b_info.get("spec", 4),
             "mtp_max": b_info.get("mtp_max", 4),
             "cvec": b_info.get("cvec"),
+            "hardware_backend": cap.device_type.value,
+            "hardware_device": cap.device_name,
+            "hardware_plugin": plugin_desc.get("name", "hydragen_native"),
+            "plugin_abi": plugin_desc.get("abi_version", 1),
+            "has_dp4a": cap.has_dp4a,
+            "has_cp_async": cap.has_cp_async,
+            "has_wmma": cap.has_wmma,
+            "drafter": self.drafter.name,
+            "drafting_mode": self.drafter.mode.value,
         }
         self._last_prefill_tok_s: float = 100.0
         self._active_prefill_tok_s: Optional[float] = None
@@ -645,12 +663,12 @@ class VLLMEngine:
             }
             self.locality_policy.update_resident_experts(resident_eids)
 
-        # Milestone 5: MTP Draft Head Prompt Pre-Conditioning (Draft KV Warm-Up)
-        if self.mtp_preconditioner is not None and prompt_len > 1:
+        # Speculative Drafter Prompt Pre-Conditioning (Draft KV Warm-Up)
+        if self.drafter is not None and self.drafter.is_available() and prompt_len > 1:
             try:
                 prompt_tensor = torch.tensor(ids, dtype=torch.int32, device=self.device)
                 prompt_embs = self.loader.dequantize_token_embedding(prompt_tensor, device=self.device)
-                self.mtp_preconditioner.warmup_prompt(prompt_embs, hidden_states=None, pos_offset=0)
+                self.drafter.prefill_step(prompt_embs, hidden_states=prompt_embs)
             except Exception:
                 pass
 
