@@ -295,6 +295,9 @@ class VLLMEngine:
                     topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp(min=1e-6)
                 ).contiguous()
 
+            # Record routing occurrences in PagedExpertManager for adaptive realignment
+            self.expert_manager.record_routing(topk_ids, layer_idx=layer_idx)
+
             # 3. Execute Triton Fused MoE with PagedExpertManager slot indirection
             moe_out, step_metrics = triton_paged_moe_forward(
                 hidden_states=hidden,
@@ -611,10 +614,19 @@ class VLLMEngine:
 
         # 1. Execute Triton Fused MoE + PagedExpertManager on active decode token window
         # to warm VRAM expert slots and compute real expert locality affinity.
-        tail_ids = ids[-min(2, len(ids)) :] if ids else [1]
+        tail_ids = ids[-min(16, len(ids)) :] if ids else [1]
         tail_tensor = torch.tensor(tail_ids, dtype=torch.int32, device=self.device)
         _, triton_prefill_metrics = self.execute_triton_moe_step(tail_tensor, layer_idx=0)
         req_experts: Set[int] = triton_prefill_metrics.get("routed_experts", set())
+
+        # Milestone 3: Immediate Post-Prefill Bulk Expert Realignment
+        adapt_res = self.expert_manager.adapt_post_prefill()
+        if adapt_res.get("swaps_performed", 0) > 0:
+            resident_eids = {
+                k[1] if isinstance(k, tuple) else int(k)
+                for k in self.expert_manager.residency_map.keys()
+            }
+            self.locality_policy.update_resident_experts(resident_eids)
 
         slot_idx = self._acquire_slot(prompt_len, prompt_read, req_experts, cancel)
         if slot_idx < 0 or cancel.is_set():
@@ -697,6 +709,14 @@ class VLLMEngine:
                         if 0 <= slot_idx < len(self.slot_live) and self.slot_live[slot_idx]:
                             self.slot_live[slot_idx]["state"] = "decoding"
                             self.slot_live[slot_idx]["first_token"] = time.time()
+                    # Milestone 3: Realignment immediately upon completing prompt prefill
+                    adapt_res = self.expert_manager.adapt_post_prefill()
+                    if adapt_res.get("swaps_performed", 0) > 0:
+                        resident_eids = {
+                            k[1] if isinstance(k, tuple) else int(k)
+                            for k in self.expert_manager.residency_map.keys()
+                        }
+                        self.locality_policy.update_resident_experts(resident_eids)
                     first_token_marked = True
 
                 generated_count += 1
