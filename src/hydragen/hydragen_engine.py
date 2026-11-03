@@ -184,7 +184,7 @@ class HydragenEngine:
                 )
                 self.max_context = getattr(self.backend, "max_context", max_context)
                 self.batch = int(getattr(self.backend, "batch", self.batch) or self.batch)
-                self.backend.vram(reserve_mib=256, timeout=30.0)
+                self.backend.vram(reserve_mib=960, timeout=30.0)
             except Exception as e:
                 print(f"[hydragen] Pipeline worker notice: {e}")
 

@@ -723,6 +723,8 @@ def main():
 
     # Build updated arguments
     vram_reserve = cap["desktop_reserve_mib"]
+    if engine_choice in ("hydragen", "vllm", "trtllm"):
+        vram_reserve = max(vram_reserve, 960)
     expert_cache = "auto"
     kv_resident = "32768" if ctx_tokens > 32768 else "0"
     conv_cache_mib = "40960" if cap["max_ram_conversation_slots"] >= 16 else "16384"
