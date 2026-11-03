@@ -4,7 +4,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.expanduser("~/vllm"))
-from vllm.v1.core.expert_manager import PagedExpertManager
+from hydragen.expert_manager import PagedExpertManager
 
 def run_realistic_simulation():
     print("=== Realistic MoE Step Benchmark (90% Cache Hit Rate, Full VRAM Memory Read) ===")

@@ -3,7 +3,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.expanduser("~/vllm"))
-from vllm.v1.core.expert_manager import PagedExpertManager
+from hydragen.expert_manager import PagedExpertManager
 
 def test_paged_expert_manager():
     print("Running PagedExpertManager Unit Test...")

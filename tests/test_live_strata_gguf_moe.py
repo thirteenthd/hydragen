@@ -39,17 +39,20 @@ for val, (name, elems, bytes_per_blk) in custom_types.items():
     GGML_QUANT_SIZES[val] = (elems, bytes_per_blk)
 
 # 2. Bind C dequantizer
-lib = ctypes.CDLL("/home/thirteenthd/libstrata_iq_kernels.so")
-dequant_f16 = lib._ZN6strata7kernels14iq_dequant_f16EiPKvlPtPvPKf
-dequant_f16.argtypes = [
-    ctypes.c_int,
-    ctypes.c_void_p,
-    ctypes.c_int64,
-    ctypes.c_void_p,
-    ctypes.c_void_p,
-    ctypes.c_void_p,
-]
-dequant_f16.restype = None
+try:
+    lib = ctypes.CDLL("/home/thirteenthd/libstrata_iq_kernels.so")
+    dequant_f16 = lib._ZN6strata7kernels14iq_dequant_f16EiPKvlPtPvPKf
+    dequant_f16.argtypes = [
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int64,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    dequant_f16.restype = None
+except Exception:
+    dequant_f16 = None
 
 # 3. Triton Fused MoE with Slot Indirection
 @triton.jit
