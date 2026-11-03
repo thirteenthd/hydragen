@@ -22,13 +22,18 @@ def run_bench(device="cuda", dtype=torch.float32, is_int8_kv=False):
     block_size = 16
     scale = 1.0 / math.sqrt(head_dim)
 
-    # Test context lengths across prefill spectrum
-    test_lengths = [2048, 8192, 16384, 32768]
+    # Test context lengths within available free VRAM
     if device == "cuda":
-        gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        print(f"Running on GPU: {torch.cuda.get_device_name(0)} ({gpu_mem:.1f} GB VRAM)")
-        if gpu_mem >= 10:
-            test_lengths.append(64000)
+        free_bytes, total_bytes = torch.cuda.mem_get_info(0)
+        free_mb = free_bytes / (1024 ** 2)
+        print(f"Running on GPU: {torch.cuda.get_device_name(0)} (Free VRAM: {free_mb:.1f} MiB / {total_bytes / (1024**3):.1f} GiB)")
+        test_lengths = [1024, 2048, 4096]
+        if free_mb > 150:
+            test_lengths.append(8192)
+        if free_mb > 300:
+            test_lengths.append(12288)
+    else:
+        test_lengths = [512, 1024, 2048]
 
     results = []
 
@@ -115,7 +120,11 @@ def run_bench(device="cuda", dtype=torch.float32, is_int8_kv=False):
                 rev_times.append((time.perf_counter() - t0) * 1000.0)
 
         # Check numerical equality
-        max_diff = torch.max(torch.abs(out_fwd - out_rev)).item()
+        max_diff = torch.max(torch.abs(out_fwd.cpu() - out_rev.cpu())).item()
+
+        del q, k_cache, v_cache, out_fwd, out_rev, block_tables, context_lens, mgr
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
         fwd_median = sorted(fwd_times)[len(fwd_times) // 2]
         rev_median = sorted(rev_times)[len(rev_times) // 2]
