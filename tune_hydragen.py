@@ -510,6 +510,7 @@ def calculate_concurrency_capacity(
 def main():
     parser = argparse.ArgumentParser(description="Hydragen AI Engine Performance & Concurrency Tuner")
     parser.add_argument("--server", type=str, default=None, help="Remote or local Hydragen server URL to probe/benchmark (e.g. http://modelserver01:8080 or http://127.0.0.1:8080)")
+    parser.add_argument("--engine", choices=["auto", "strata", "vllm", "trtllm"], default="auto", help="Engine architecture: strata, vllm, or trtllm (default: auto)")
     parser.add_argument("--backend", choices=["auto", "cuda", "rocm", "intel", "cpu"], default="auto", help="Hardware acceleration backend (default: auto)")
     parser.add_argument("--drafter", choices=["auto", "dflash2", "mtp", "off"], default="auto", help="Speculative drafter engine (default: auto-resolve)")
     parser.add_argument("--benchmark", action="store_true", help="Run live latency benchmark before tuning")
@@ -548,7 +549,7 @@ def main():
         run_benchmark(cfg, server_url=args.server)
 
     # Step 1: Headless vs. Normal Desktop
-    print(bold("\n--- [Step 1/6] Display Environment (VRAM Headroom) ---"))
+    print(bold("\n--- [Step 1/7] Display Environment (VRAM Headroom) ---"))
     desktop_choice = args.mode or ask_choice(
         "Select your display environment",
         [
@@ -559,7 +560,7 @@ def main():
     )
 
     # Step 2: Hardware Acceleration Backend
-    print(bold("\n--- [Step 2/6] Hardware Acceleration Backend ---"))
+    print(bold("\n--- [Step 2/7] Hardware Acceleration Backend ---"))
     backend_options = [
         ("auto", f"Auto-Detect ({hw['gpu_name']} - {backend_label}{arch_label})"),
         ("cuda", "NVIDIA CUDA - Native C-ABI plugin, cp.async pipeline, Tensor Cores (sm_70 through sm_120)"),
@@ -576,7 +577,7 @@ def main():
         backend_choice = hw["device_type"]
 
     # Step 3: Speculative Drafter Architecture
-    print(bold("\n--- [Step 3/6] Speculative Drafter Architecture ---"))
+    print(bold("\n--- [Step 3/7] Speculative Drafter Architecture ---"))
     auto_drafter_mode = "mtp"
     try:
         from hydragen.drafters import DraftingMode, resolve_drafting_mode
@@ -602,8 +603,21 @@ def main():
     if drafter_choice == "auto":
         drafter_choice = auto_drafter_mode
 
-    # Step 4: Select Suitable AI Model
-    print(bold("\n--- [Step 4/6] Model Selection ---"))
+    # Step 4: Engine Architecture
+    print(bold("\n--- [Step 4/7] Engine Architecture (Serving Runtime) ---"))
+    engine_options = [
+        ("strata", "Strata Hybrid MoE Engine - High-throughput PCIe streaming + RAM caching + MTP/DFlash2 (Recommended for 1x GPU)"),
+        ("vllm", "Hydragen vLLM Bridge - Continuous batching with locality-aware expert admission and Triton fused MoE kernels"),
+        ("trtllm", "TensorRT-LLM Bridge - In-Flight Batching scheduler with custom TRT-LLM plugins and virtual Paged KV"),
+    ]
+    engine_choice = args.engine if args.engine != "auto" else ask_choice(
+        "Select Engine Architecture",
+        engine_options,
+        default_idx=0,
+    )
+
+    # Step 5: Select Suitable AI Model
+    print(bold("\n--- [Step 5/7] Model Selection ---"))
     default_model_idx = 0 if hw["gpu_vram_mib"] >= 20000 else 1
     model_choice = ask_choice(
         "Select AI Model & Quantization",
@@ -615,8 +629,8 @@ def main():
         default_idx=default_model_idx,
     )
 
-    # Step 5: Choose Context Window
-    print(bold("\n--- [Step 5/6] Context Window Capacity & Historical Log Analysis ---"))
+    # Step 6: Choose Context Window
+    print(bold("\n--- [Step 6/7] Context Window Capacity & Historical Log Analysis ---"))
     log_stats = analyze_context_logs()
     if log_stats["has_data"]:
         print(cyan(f"  [Log Analysis] Extracted {log_stats['count']:,} historical inference requests across log files:"))
@@ -657,8 +671,8 @@ def main():
         default_idx=0,
     )
 
-    # Step 6: Concurrency Target
-    print(bold("\n--- [Step 6/6] Concurrency Profile ---"))
+    # Step 7: Concurrency Target
+    print(bold("\n--- [Step 7/7] Concurrency Profile ---"))
     concurrency_choice = args.preset or ask_choice(
         "Select Concurrency Profile",
         [
@@ -772,6 +786,7 @@ def main():
 
     tuned_cfg = {
         "exe": "bin/strata.exe" if hw["is_windows"] else "bin/strata",
+        "engine": engine_choice,
         "args": args_list,
         "cwd": ".",
         "native": m_info["native"],

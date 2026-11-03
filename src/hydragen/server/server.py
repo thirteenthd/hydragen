@@ -8967,6 +8967,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     config_bytes = Path(a.config).read_bytes() if a.config else b""
     cfg = parse_config_text(config_bytes.decode("utf-8-sig"), a.config) if a.config else {}   # Notepad adds a BOM
     split_joined_args(cfg)
+    if a.config:
+        cfg_engine = cfg.get("engine")
+        if cfg_engine and a.engine == "mock":
+            a.engine = str(cfg_engine).lower()
     if a.config and a.engine == "strata":
         cfg = apply_saved_tuning(cfg)
     attestation_key = os.environ.pop("STRATA_OWNER_ATTEST_KEY", None)
