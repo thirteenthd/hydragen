@@ -441,40 +441,47 @@ powershell -ExecutionPolicy Bypass -File .\tune.ps1
 .\tune.bat --preset max-concurrency --ctx auto --apply
 ```
 
-### The 5-Step Tuning Workflow
+### The 6-Step Tuning Workflow
 
 ```mermaid
 flowchart TD
-    HW["Hardware Detection & Baseline Benchmark"] --> Mode["Environment: Normal Desktop vs. Headless Server"]
-    Mode --> Model["Model Selection: IQ3_S vs. IQ3_XXS"]
-    Model --> Engine["Engine Architecture: TRT-LLM (In-Flight Batching) vs. Strata vs. vLLM"]
-    Engine --> CTX["Log-Driven Context Demand Analysis (32k / 64k / 128k / 200k)"]
+    HW["Hardware Quad & Remote Server Telemetry"] --> Mode["Environment: Normal Desktop vs. Headless Server"]
+    Mode --> Backend["Hardware Acceleration Backend: CUDA / ROCm / Intel / CPU"]
+    Backend --> Drafter["Speculative Drafter: DFlash2 (Block Non-Causal) vs. MTP vs. Off"]
+    Drafter --> Model["Model Selection: IQ3_S vs. IQ3_XXS"]
+    Model --> CTX["Log-Driven Context Demand Analysis (32k / 64k / 128k / 200k)"]
     CTX --> Concurrency["Concurrency Target: 1 Solo / 2 Balanced / 4 Max Slots"]
-    Concurrency --> AutoTune["Auto-Calculate Resident Experts, PCIe Frac & Cache Slots"]
+    Concurrency --> AutoTune["Auto-Calculate Resident Experts, PCIe Frac & Drafter Savings"]
     AutoTune --> Apply["Write to hydragen.json & Option to Restart Service"]
 ```
 
-1. **Hardware Detection & Baseline Benchmark:** Automatically detects GPU VRAM, free memory, CPU topology, system RAM, and optionally runs a live hardware calibration sweep measuring decode speed and PCIe round-trip latency.
+1. **Hardware Quad & Remote Server Telemetry:** Automatically introspects hardware capabilities across NVIDIA CUDA, AMD ROCm, Intel XPU, or Host CPU via [`BackendRegistry`](src/hydragen/backends/registry.py). Can also probe and benchmark a remote server via `--server http://modelserver01:8080`.
 2. **Environment Mode (VRAM Headroom):**
    * **Normal Desktop PC:** Windows 11 DWM, GPU monitors, and desktop apps reserve **1,024 MiB** VRAM (`--vram-reserve-mib 1024`) to eliminate display stuttering and TDR driver resets.
    * **Headless Server / Dedicated GPU:** Reduces reservation to **450 MiB** (`--vram-reserve-mib 450`), unlocking ~600 MiB of VRAM to host **350+ extra resident experts** (up to **2,348 resident experts** on 12 GB VRAM).
-3. **Model Selection:** Recommends models based on available VRAM and RAM:
+3. **Hardware Acceleration Backend:** Selects native execution target (`auto`, `cuda`, `rocm`, `intel`, `cpu`) and binds the optimal C-ABI / compute plugin.
+4. **Speculative Drafter Architecture:**
+   * **`dflash2` (Block Non-Causal Drafter):** Evaluates a 7-token draft block in a single forward pass without intermediate dequantization buffers. Saves **+367 MiB VRAM** and evaluates **17.3x faster** on Blackwell, Hopper, and Ada Lovelace GPUs.
+   * **`mtp` (Multitoken Prediction):** Sequential causal draft head optimized for Ampere and Turing GPUs.
+   * **`off`:** Autoregressive single-token decode for low-memory or CPU execution.
+5. **Model Selection:** Recommends models based on available VRAM and RAM:
    * **`IQ3_S` (Recommended for 24 GB GPUs + 64 GB+ RAM):** Highest fidelity quantization (~83.6 GB pack); holds **2,400+ resident experts** in VRAM with high cache hit rates (~85–92%).
    * **`IQ3_XXS` (Recommended for 12 GB–16 GB GPUs):** Balanced footprint (~76.5 GB pack); holds **2,200–2,350+ resident experts**.
-4. **Log-Driven Context Window Auto-Detection:**
-   Before asking for a context window, the tuner analyzes your historical server logs (`hydragen.log`, `hydragen-service.log`, and `strata-service.log`), extracts historical request lengths, computes statistical percentiles, and auto-selects the optimal context threshold:
-   
-   | Workload Pattern | Threshold Criteria | Auto-Suggested Context | Benefit / Rationale |
-   | :--- | :--- | :--- | :--- |
-   | **Light Chat & Q&A** | $C_{\max} \le 28\text{k}$ and $P_{95} \le 24\text{k}$ | **32k (`32768`)** | Saves ~180 MiB VRAM; frees up room for **100+ additional resident experts** in VRAM. |
-   | **Standard Documents & Summaries** | $C_{\max} \le 58\text{k}$ and $P_{95} \le 48\text{k}$ | **64k (`65536`)** | Full headroom for moderate chats while saving ~120 MiB VRAM. |
-   | **Deep Research & Medium Codebases** | $C_{\max} \le 120\text{k}$ and $P_{95} \le 105\text{k}$ | **128k (`131072`)** | Safely covers 99%+ of multi-turn sessions with room for thinking budgets. |
-   | **Ultra-Long Multi-File Code / Large Dumps** | $C_{\max} > 120\text{k}$ or $P_{95} > 105\text{k}$ | **200k (`204800`)** | **Prevents HTTP 400 Context Overflow crashes** on large prompt sessions. |
+6. **Log-Driven Context Window Auto-Detection & Concurrency Profile:**
+   Analyzes historical server logs, computes percentiles, and sets VRAM/RAM streaming thresholds with concurrency targets.
 
-5. **Concurrency Profile & Ultra-Long Context Memory Capacity:**
-   * **`--kv int8` (1,056 Bytes/token):** Thanks to Flash-Next's hybrid architecture (4 QSA attention layers + 44 recurrent GDN layers), a full 200k context consumes only **206.2 MiB per stream**.
-   * **KV Streaming (`--kv-resident 20480` to `32768`):** Keeps recent attention tokens in VRAM and streams the remaining sequence from host RAM over PCIe 4.0 x16.
-   * **Capacity Limits:** Supports **2 to 4 active simultaneous generating streams** (at ~35–45 tok/s each on 2 slots) and holds **hundreds of resident conversations in system RAM** with instant resumption and zero re-prefill delay.
+#### CLI Tuning Options
+
+```powershell
+# Probe and benchmark a remote inference host directly
+python tune_hydragen.py --server http://modelserver01:8080 --benchmark
+
+# Explicit hardware backend & speculative drafter
+python tune_hydragen.py --backend cuda --drafter dflash2 --preset max-concurrency --apply
+
+# Auto-tune for headless server environment
+python tune_hydragen.py --mode headless --preset balanced --ctx auto --apply
+```
 
 ---
 
