@@ -106,12 +106,13 @@ class PagedExpertManager:
             )
 
             # 2. Allocate L2 Host Pool (when not backed by GGUF mmap loader) or staging buffers
+            is_cuda = (device.type == "cuda" and torch.cuda.is_available())
             if self.loader is None:
                 self.host_pool = torch.empty(
                     (self.total_experts, *self.expert_shape),
                     dtype=dtype,
                     device="cpu",
-                    pin_memory=True,
+                    pin_memory=is_cuda,
                 )
                 self.staging_gate_u8 = None
                 self.staging_up_u8 = None
@@ -131,6 +132,7 @@ class PagedExpertManager:
 
         # 3. GPU-resident Indirection Table for Triton / CUDA kernels
         # gpu_slot_table[expert_id] == slot_idx (or -1 if not resident)
+        is_cuda_device = (self.device.type == "cuda" and torch.cuda.is_available())
         self.gpu_slot_table = torch.full(
             (self.total_experts,),
             -1,
@@ -142,7 +144,7 @@ class PagedExpertManager:
             -1,
             dtype=torch.int32,
             device="cpu",
-            pin_memory=True,
+            pin_memory=is_cuda_device,
         )
 
         # Multi-layer indirection tables when multiplexing slots across layers
@@ -162,11 +164,12 @@ class PagedExpertManager:
 
     def _ensure_layer_tables(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         if layer_idx not in self._layer_gpu_tables:
+            is_cuda = (self.device.type == "cuda" and torch.cuda.is_available())
             self._layer_gpu_tables[layer_idx] = torch.full(
                 (self.total_experts,), -1, dtype=torch.int32, device=self.device
             )
             self._layer_cpu_tables[layer_idx] = torch.full(
-                (self.total_experts,), -1, dtype=torch.int32, device="cpu", pin_memory=True
+                (self.total_experts,), -1, dtype=torch.int32, device="cpu", pin_memory=is_cuda
             )
         return self._layer_gpu_tables[layer_idx], self._layer_cpu_tables[layer_idx]
 
