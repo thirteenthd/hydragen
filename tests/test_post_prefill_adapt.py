@@ -5,7 +5,15 @@ from hydragen.expert_manager import PagedExpertManager
 
 class TestPostPrefillAdapt(unittest.TestCase):
     def setUp(self):
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        use_cuda = False
+        if torch.cuda.is_available():
+            try:
+                free_b, _ = torch.cuda.mem_get_info(0)
+                if free_b >= 350 * 1024 * 1024:
+                    use_cuda = True
+            except Exception:
+                pass
+        self.device = torch.device("cuda:0" if use_cuda else "cpu")
 
     def test_adapt_fills_free_slots_first(self):
         """Verify that adapt_post_prefill leverages free VRAM slots for hot experts."""
