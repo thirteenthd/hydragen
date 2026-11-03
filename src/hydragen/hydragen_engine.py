@@ -154,6 +154,8 @@ class HydragenEngine:
                     self.router_gates[1] = self.loader.load_router_gate(1, device=self.device)
                 except Exception:
                     pass
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         else:
             self.n_embd = 2560
             self.n_ff = 640
@@ -184,7 +186,8 @@ class HydragenEngine:
                 )
                 self.max_context = getattr(self.backend, "max_context", max_context)
                 self.batch = int(getattr(self.backend, "batch", self.batch) or self.batch)
-                self.backend.vram(reserve_mib=960, timeout=30.0)
+                reserve_val = int(self.cfg.get("vram_reserve_mib") or 680)
+                self.backend.vram(reserve_mib=reserve_val, timeout=30.0)
             except Exception as e:
                 print(f"[hydragen] Pipeline worker notice: {e}")
 

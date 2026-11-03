@@ -43,6 +43,14 @@ PROMPTS = [
         "Request F (Algorithms / Graph)",
         "Implement Dijkstra's shortest path algorithm in C++ using a priority queue. Provide time and space complexity analysis."
     ),
+    (
+        "Request G (Networking / Kernel)",
+        "Explain Linux epoll edge-triggered vs level-triggered modes and how TCP zero-copy socket transfers work."
+    ),
+    (
+        "Request H (Storage / LSM Tree)",
+        "Describe the write amplification and compaction algorithms of Log-Structured Merge (LSM) trees in modern key-value stores."
+    ),
 ]
 
 
@@ -171,7 +179,7 @@ def run_benchmark(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--concurrency", type=int, default=2, choices=[1, 2, 3, 4, 5, 6])
+    parser.add_argument("--concurrency", type=int, default=2, choices=[1, 2, 3, 4, 5, 6, 7, 8])
     parser.add_argument("--url", type=str, default="http://127.0.0.1:8080/v1/chat/completions")
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--no-warmup", action="store_true")
