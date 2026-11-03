@@ -44,10 +44,14 @@ class DisabledDrafter(SpeculativeDrafter):
 
 
 def resolve_drafting_mode(
-    requested_mode: Optional[DraftingMode] = None,
+    requested_mode: Optional[DraftingMode | HardwareBackend] = None,
     hardware_backend: Optional[HardwareBackend] = None,
 ) -> DraftingMode:
     """Determines the optimal speculative drafting mode based on hardware and env."""
+    if isinstance(requested_mode, HardwareBackend):
+        hardware_backend = requested_mode
+        requested_mode = None
+
     forced = os.environ.get("HYDRAGEN_DRAFTER")
     if forced:
         forced_lower = forced.lower().strip()
