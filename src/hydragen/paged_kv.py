@@ -50,6 +50,7 @@ class PagedKVManager:
         num_kv_heads: int = 8,
         head_dim: int = 128,
         dtype_bytes: int = 1,
+        backend: Optional[Any] = None,
     ):
         self.block_size = int(block_size)
         self.num_blocks = int(num_blocks)
@@ -58,7 +59,9 @@ class PagedKVManager:
         self.head_dim = int(head_dim)
         self.dtype_bytes = int(dtype_bytes)
 
-        self._native_lib = self._load_native_lib()
+        from hydragen.backends.registry import BackendRegistry
+        self._backend = backend or BackendRegistry.get_paged_attention_backend()
+        self._native_lib = getattr(self._backend, "_native_lib", None) or self._load_native_lib()
         self._handle = None
 
         if self._native_lib is not None:
@@ -274,6 +277,11 @@ class PagedKVManager:
             "block_size": self.block_size,
         }
 
+    @property
+    def backend(self):
+        """Active PagedAttentionBackend executing hardware attention operations."""
+        return self._backend
+
     def paged_attention_decode(
         self,
         out,
@@ -286,65 +294,19 @@ class PagedKVManager:
         is_int8_kv: bool = False,
         stream: Optional[Any] = None,
     ):
-        """Single-token decode attention across paged KV blocks."""
-        num_seqs = q.shape[0]
-        num_heads = q.shape[1]
-        head_dim = q.shape[2]
-        num_kv_heads = k_cache.shape[1]
-        max_blocks = block_tables.shape[1]
-        if scale is None:
-            scale = 1.0 / (head_dim ** 0.5)
-
-        is_cuda = hasattr(q, "is_cuda") and q.is_cuda
-        if self._native_lib is not None and is_cuda and hasattr(self._native_lib, "paged_attention_decode"):
-            stream_ptr = stream.cuda_stream if hasattr(stream, "cuda_stream") else (stream or 0)
-            self._native_lib.paged_attention_decode(
-                ctypes.c_void_p(out.data_ptr()),
-                ctypes.c_void_p(q.data_ptr()),
-                ctypes.c_void_p(k_cache.data_ptr()),
-                ctypes.c_void_p(v_cache.data_ptr()),
-                ctypes.c_void_p(block_tables.data_ptr()),
-                ctypes.c_void_p(context_lens.data_ptr()),
-                int(num_seqs), int(num_heads), int(num_kv_heads), int(head_dim),
-                int(self.block_size), int(max_blocks),
-                float(scale), int(1 if is_int8_kv else 0),
-                ctypes.c_void_p(stream_ptr)
-            )
-            return out
-
-        # Torch / CPU fallback with vectorized block gather & clamped indexing
-        import torch
-        group_size = num_heads // num_kv_heads
-        for s in range(num_seqs):
-            ctx_len = int(context_lens[s].item() if hasattr(context_lens[s], "item") else context_lens[s])
-            if ctx_len <= 0:
-                continue
-            bt = block_tables[s]
-            num_blocks = (ctx_len + self.block_size - 1) // self.block_size
-            phys_blocks = bt[:num_blocks]
-            if not isinstance(phys_blocks, torch.Tensor):
-                phys_blocks = torch.tensor(phys_blocks, dtype=torch.long, device=k_cache.device)
-            else:
-                phys_blocks = phys_blocks.long()
-
-            # Vectorized multi-block gather: [num_blocks, num_kv_heads, block_size, head_dim]
-            k_blks = k_cache[phys_blocks]
-            v_blks = v_cache[phys_blocks]
-
-            # Flatten to [num_blocks * block_size, num_kv_heads, head_dim], then slice ctx_len
-            k_seq = k_blks.permute(0, 2, 1, 3).reshape(-1, num_kv_heads, head_dim)[:ctx_len].permute(1, 0, 2).float()
-            v_seq = v_blks.permute(0, 2, 1, 3).reshape(-1, num_kv_heads, head_dim)[:ctx_len].permute(1, 0, 2).float()
-            if is_int8_kv:
-                k_seq = k_seq * 0.015625
-                v_seq = v_seq * 0.015625
-
-            qs = q[s].float() * scale
-            for h in range(num_heads):
-                kv_h = h // group_size
-                scores = torch.matmul(k_seq[kv_h], qs[h])
-                probs = torch.softmax(scores, dim=-1)
-                out[s, h] = torch.matmul(probs, v_seq[kv_h]).to(out.dtype)
-        return out
+        """Single-token decode attention across paged KV blocks (delegated to active hardware plugin)."""
+        return self._backend.paged_attention_decode(
+            out=out,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            scale=scale,
+            is_int8_kv=is_int8_kv,
+            stream=stream,
+            block_size=self.block_size,
+        )
 
     def paged_attention_prefill(
         self,
@@ -360,67 +322,19 @@ class PagedKVManager:
         stream: Optional[Any] = None,
     ):
         """Causal prefill attention across paged KV blocks with Reverse Query-Tile Attention Scheduling (LPT)."""
-        num_seqs = q.shape[0]
-        query_len = q.shape[1]
-        num_heads = q.shape[2]
-        head_dim = q.shape[3]
-        num_kv_heads = k_cache.shape[1]
-        max_blocks = block_tables.shape[1]
-        if scale is None:
-            scale = 1.0 / (head_dim ** 0.5)
-
-        is_cuda = hasattr(q, "is_cuda") and q.is_cuda
-        if self._native_lib is not None and is_cuda and hasattr(self._native_lib, "paged_attention_prefill"):
-            stream_ptr = stream.cuda_stream if hasattr(stream, "cuda_stream") else (stream or 0)
-            ctx_ptr = context_lens.data_ptr() if context_lens is not None else 0
-            self._native_lib.paged_attention_prefill(
-                ctypes.c_void_p(out.data_ptr()),
-                ctypes.c_void_p(q.data_ptr()),
-                ctypes.c_void_p(k_cache.data_ptr()),
-                ctypes.c_void_p(v_cache.data_ptr()),
-                ctypes.c_void_p(block_tables.data_ptr()),
-                ctypes.c_void_p(ctx_ptr),
-                int(num_seqs), int(query_len), int(num_heads), int(num_kv_heads),
-                int(head_dim), int(self.block_size), int(max_blocks),
-                float(scale), int(1 if is_int8_kv else 0), int(1 if reverse_lpt else 0),
-                ctypes.c_void_p(stream_ptr)
-            )
-            return out
-
-        # Torch / CPU fallback with vectorized block gather & causal masking
-        import torch
-        group_size = num_heads // num_kv_heads
-        for s in range(num_seqs):
-            past_len = int(context_lens[s].item() if (context_lens is not None and hasattr(context_lens[s], "item")) else (context_lens[s] if context_lens is not None else 0))
-            bt = block_tables[s]
-            total_tokens = past_len + query_len
-            num_blocks = (total_tokens + self.block_size - 1) // self.block_size
-            phys_blocks = bt[:num_blocks]
-            if not isinstance(phys_blocks, torch.Tensor):
-                phys_blocks = torch.tensor(phys_blocks, dtype=torch.long, device=k_cache.device)
-            else:
-                phys_blocks = phys_blocks.long()
-
-            k_blks = k_cache[phys_blocks]
-            v_blks = v_cache[phys_blocks]
-            k_all = k_blks.permute(0, 2, 1, 3).reshape(-1, num_kv_heads, head_dim)[:total_tokens].permute(1, 0, 2).float()
-            v_all = v_blks.permute(0, 2, 1, 3).reshape(-1, num_kv_heads, head_dim)[:total_tokens].permute(1, 0, 2).float()
-            if is_int8_kv:
-                k_all = k_all * 0.015625
-                v_all = v_all * 0.015625
-
-            for q_tok in range(query_len):
-                visible_len = past_len + q_tok + 1
-                k_vis = k_all[:, :visible_len, :]
-                v_vis = v_all[:, :visible_len, :]
-
-                for h in range(num_heads):
-                    kv_h = h // group_size
-                    q_vec = q[s, q_tok, h].float() * scale
-                    scores = torch.matmul(k_vis[kv_h], q_vec)
-                    probs = torch.softmax(scores, dim=-1)
-                    out[s, q_tok, h] = torch.matmul(probs, v_vis[kv_h]).to(out.dtype)
-        return out
+        return self._backend.paged_attention_prefill(
+            out=out,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            scale=scale,
+            is_int8_kv=is_int8_kv,
+            reverse_lpt=reverse_lpt,
+            stream=stream,
+            block_size=self.block_size,
+        )
 
     def __del__(self):
         if self._handle is not None and self._native_lib is not None:
