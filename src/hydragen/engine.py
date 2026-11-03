@@ -117,9 +117,12 @@ class VLLMEngine:
         else:
             self.max_context = max_context
 
-        # 3. Initialize PagedExpertManager, Router Gates, and Triton Fused MoE Stream
-        self.device = torch.device("cuda:0")
-        self.triton_stream = torch.cuda.Stream(device=self.device)
+        # 3. Initialize PagedExpertManager, Router Gates, and Execution Stream
+        from hydragen.backends.registry import BackendRegistry
+        self.hw = BackendRegistry.get_hardware_backend()
+        dev_type = self.hw.capability.device_type
+        self.device = torch.device(dev_type if dev_type != "cpu" else "cpu")
+        self.triton_stream = self.hw.create_stream(device=self.device)
         self.triton_lock = threading.Lock()
         self.expert_manager = PagedExpertManager(
             num_slots=self.num_slots,
@@ -129,6 +132,7 @@ class VLLMEngine:
             device=self.device,
             loader=self.loader,
             default_layer_idx=0,
+            hw_backend=self.hw,
         )
         self.router_gates: Dict[int, torch.Tensor] = {
             0: self.loader.load_router_gate(0, device=self.device),
@@ -269,8 +273,8 @@ class VLLMEngine:
         `PagedExpertManager` (async PCIe DMA + `libstrata_iq_kernels.so` dequant) ->
         Triton `fused_moe_indexed_slot_kernel`.
         """
-        torch.cuda.set_device(self.device)
-        with self.triton_lock, torch.cuda.stream(self.triton_stream):
+        self.hw.set_device(self.device)
+        with self.triton_lock, self.hw.stream_context(self.triton_stream):
             t0 = time.perf_counter()
             if layer_idx not in self.router_gates:
                 self.router_gates[layer_idx] = self.loader.load_router_gate(
@@ -642,7 +646,7 @@ class VLLMEngine:
         embeddings: Optional[Any] = None,
     ) -> Iterator[int]:
         """Generate tokens through the hybrid vLLM PagedMoE + Triton pipeline."""
-        torch.cuda.set_device(self.device)
+        self.hw.set_device(self.device)
         prompt_len = len(ids)
         reused_tokens = self._match_prefix_cache(ids)
         prompt_read = max(0, prompt_len - reused_tokens)

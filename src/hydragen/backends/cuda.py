@@ -9,6 +9,7 @@ Encapsulates all CUDA-specific execution components:
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -261,3 +262,64 @@ class CUDAHardwareBackend(HardwareBackend):
             from hydragen.backends.ipc import NativeIPCBackend
             self._ipc = NativeIPCBackend()
         return self._ipc
+
+    def set_device(self, device: Any) -> None:
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.set_device(device)
+            except Exception:
+                pass
+
+    def get_mem_info(self, device: Optional[Any] = None) -> Tuple[int, int]:
+        if torch.cuda.is_available():
+            try:
+                return torch.cuda.mem_get_info(device)
+            except Exception:
+                pass
+        return (0, 0)
+
+    def create_stream(self, device: Optional[Any] = None) -> Any:
+        if torch.cuda.is_available():
+            try:
+                return torch.cuda.Stream(device=device)
+            except Exception:
+                pass
+        return None
+
+    def current_stream(self, device: Optional[Any] = None) -> Any:
+        if torch.cuda.is_available():
+            try:
+                return torch.cuda.current_stream(device)
+            except Exception:
+                pass
+        return None
+
+    def stream_context(self, stream: Any) -> Any:
+        if stream is not None and torch.cuda.is_available():
+            try:
+                return torch.cuda.stream(stream)
+            except Exception:
+                pass
+        return contextlib.nullcontext()
+
+    def stream_wait_stream(self, waiter: Any, ready: Any) -> None:
+        if waiter is not None and ready is not None and hasattr(waiter, "wait_stream"):
+            try:
+                waiter.wait_stream(ready)
+            except Exception:
+                pass
+
+    def synchronize(self, stream_or_device: Optional[Any] = None) -> None:
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize(stream_or_device)
+            except Exception:
+                pass
+
+    def allocate_pinned_host_tensor(self, shape: Tuple[int, ...], dtype: Any) -> Any:
+        pin = torch.cuda.is_available()
+        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=pin)
+
+    def empty_tensor(self, shape: Tuple[int, ...], dtype: Any, device: Optional[Any] = None) -> Any:
+        dev = device if device is not None else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+        return torch.empty(shape, dtype=dtype, device=dev)

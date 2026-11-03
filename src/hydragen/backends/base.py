@@ -194,3 +194,57 @@ class HardwareBackend(ABC):
     @abstractmethod
     def get_ipc_backend(self) -> IPCBackend:
         pass
+
+    def set_device(self, device: Any) -> None:
+        """Sets active execution device context."""
+        pass
+
+    def get_mem_info(self, device: Optional[Any] = None) -> Tuple[int, int]:
+        """Returns (free_bytes, total_bytes) for the specified device."""
+        try:
+            import psutil
+            vm = psutil.virtual_memory()
+            return (int(vm.available), int(vm.total))
+        except Exception:
+            return (16 * 1024 * 1024 * 1024, 64 * 1024 * 1024 * 1024)
+
+    def create_stream(self, device: Optional[Any] = None) -> Any:
+        """Creates an asynchronous hardware execution stream (or None on CPU)."""
+        return None
+
+    def current_stream(self, device: Optional[Any] = None) -> Any:
+        """Returns the current active hardware execution stream."""
+        return None
+
+    def stream_context(self, stream: Any) -> Any:
+        """Context manager executing operations inside the given hardware stream."""
+        import contextlib
+        return contextlib.nullcontext()
+
+    def stream_wait_stream(self, waiter: Any, ready: Any) -> None:
+        """Synchronizes two execution streams so waiter blocks until ready completes."""
+        pass
+
+    def synchronize(self, stream_or_device: Optional[Any] = None) -> None:
+        """Synchronizes device execution."""
+        pass
+
+    def allocate_pinned_host_tensor(
+        self,
+        shape: Tuple[int, ...],
+        dtype: Any,
+    ) -> Any:
+        """Allocates host CPU memory, page-locked (pinned) for DMA transfers if supported."""
+        import torch
+        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=False)
+
+    def empty_tensor(
+        self,
+        shape: Tuple[int, ...],
+        dtype: Any,
+        device: Optional[Any] = None,
+    ) -> Any:
+        """Allocates an uninitialized device tensor."""
+        import torch
+        dev = "cpu" if device is None else device
+        return torch.empty(shape, dtype=dtype, device=dev)

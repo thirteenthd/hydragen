@@ -41,6 +41,7 @@ class PagedExpertManager:
         default_layer_idx: int = 0,
         compressed_cache: Optional[bool] = None,
         enable_mailbox: Optional[bool] = None,
+        hw_backend: Optional[Any] = None,
     ):
         self.num_slots = int(num_slots)
         self.expert_shape = tuple(expert_shape)
@@ -52,6 +53,13 @@ class PagedExpertManager:
         self.compressed_cache = (loader is not None) if compressed_cache is None else bool(compressed_cache)
         self._enable_mailbox = enable_mailbox
 
+        # Bind hardware execution backend
+        if hw_backend is not None:
+            self.hw = hw_backend
+        else:
+            from hydragen.backends.registry import BackendRegistry
+            self.hw = BackendRegistry.get_hardware_backend()
+
         # Telemetry counters
         self.cache_hits: int = 0
         self.cache_misses: int = 0
@@ -59,14 +67,14 @@ class PagedExpertManager:
         self.routing_counts: Dict[Any, float] = {}
         self.total_swaps: int = 0
 
-        # Create dedicated CUDA stream first so CUDA context & stream memory are accounted for
-        self.dma_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        # Create dedicated hardware stream first so device context & stream memory are accounted for
+        self.dma_stream = self.hw.create_stream(device=device)
 
         if self.compressed_cache and self.loader is not None:
             self.max_blob_bytes = self.MAX_COMPRESSED_BLOB_BYTES
-            if device.type == "cuda" and torch.cuda.is_available():
-                free_b, _ = torch.cuda.mem_get_info(device)
-                # Leave >=110 MiB for Triton/CUDA scratch workspaces
+            free_b, _ = self.hw.get_mem_info(device)
+            if free_b > 0 and self.hw.capability.device_type != "cpu":
+                # Leave >=110 MiB for Triton/hardware scratch workspaces
                 usable_b = max(
                     8 * self.max_blob_bytes,
                     min(int(free_b * 0.65), free_b - 110 * 1024 * 1024),
@@ -76,7 +84,7 @@ class PagedExpertManager:
                     self.num_slots = max_fit_slots
 
             # Compressed L1 GPU VRAM Slot Pool: [num_slots, max_blob_bytes] uint8 (~1.75 MB/slot vs 9.83 MB FP16)
-            self.vram_blob_cache: Optional[torch.Tensor] = torch.empty(
+            self.vram_blob_cache: Optional[torch.Tensor] = self.hw.empty_tensor(
                 (self.num_slots, self.max_blob_bytes),
                 dtype=torch.uint8,
                 device=device,
@@ -90,8 +98,8 @@ class PagedExpertManager:
             self.vram_blob_cache = None
             self.max_blob_bytes = 0
             # Auto-clamp num_slots to available free GPU memory when sharing GPU
-            if self.loader is not None and torch.cuda.is_available():
-                free_b, _ = torch.cuda.mem_get_info(device)
+            free_b, _ = self.hw.get_mem_info(device)
+            if self.loader is not None and free_b > 0 and self.hw.capability.device_type != "cpu":
                 elem_b = 2 if dtype in (torch.float16, torch.bfloat16) else 4
                 slot_b = elem_b
                 for d in self.expert_shape:
@@ -102,20 +110,17 @@ class PagedExpertManager:
                     self.num_slots = max_fit_slots
 
             # 1. Allocate L1 GPU VRAM Expert Arena [num_slots, *expert_shape]
-            self.vram_arena = torch.empty(
+            self.vram_arena = self.hw.empty_tensor(
                 (self.num_slots, *self.expert_shape),
                 dtype=dtype,
                 device=device,
             )
 
             # 2. Allocate L2 Host Pool (when not backed by GGUF mmap loader) or staging buffers
-            is_cuda = (device.type == "cuda" and torch.cuda.is_available())
             if self.loader is None:
-                self.host_pool = torch.empty(
+                self.host_pool = self.hw.allocate_pinned_host_tensor(
                     (self.total_experts, *self.expert_shape),
                     dtype=dtype,
-                    device="cpu",
-                    pin_memory=is_cuda,
                 )
                 self.staging_gate_u8 = None
                 self.staging_up_u8 = None
@@ -129,7 +134,7 @@ class PagedExpertManager:
                 if enable_box:
                     try:
                         from hydragen.expert_mailbox import HybridExpertMailbox
-                        self.mailbox = HybridExpertMailbox(device=device)
+                        self.mailbox = HybridExpertMailbox(device=device, hw_backend=self.hw)
                     except Exception:
                         self.mailbox = None
                 else:
@@ -138,32 +143,28 @@ class PagedExpertManager:
                 self.host_pool = None
                 self.mailbox = None
                 max_proj_bytes = 1536 * 1024
-                self.staging_gate_u8 = torch.empty(
+                self.staging_gate_u8 = self.hw.empty_tensor(
                     (max_proj_bytes,), dtype=torch.uint8, device=device
                 )
-                self.staging_up_u8 = torch.empty(
+                self.staging_up_u8 = self.hw.empty_tensor(
                     (max_proj_bytes,), dtype=torch.uint8, device=device
                 )
-                self.staging_down_u8 = torch.empty(
+                self.staging_down_u8 = self.hw.empty_tensor(
                     (max_proj_bytes,), dtype=torch.uint8, device=device
                 )
 
-        # 3. GPU-resident Indirection Table for Triton / CUDA kernels
+        # 3. GPU-resident Indirection Table for Triton / hardware kernels
         # gpu_slot_table[expert_id] == slot_idx (or -1 if not resident)
-        is_cuda_device = (self.device.type == "cuda" and torch.cuda.is_available())
         self.gpu_slot_table = torch.full(
             (self.total_experts,),
             -1,
             dtype=torch.int32,
             device=device,
         )
-        self.cpu_slot_table = torch.full(
+        self.cpu_slot_table = self.hw.allocate_pinned_host_tensor(
             (self.total_experts,),
-            -1,
             dtype=torch.int32,
-            device="cpu",
-            pin_memory=is_cuda_device,
-        )
+        ).fill_(-1)
 
         # Multi-layer indirection tables when multiplexing slots across layers
         self._layer_gpu_tables: Dict[int, torch.Tensor] = {
@@ -182,13 +183,12 @@ class PagedExpertManager:
 
     def _ensure_layer_tables(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         if layer_idx not in self._layer_gpu_tables:
-            is_cuda = (self.device.type == "cuda" and torch.cuda.is_available())
             self._layer_gpu_tables[layer_idx] = torch.full(
                 (self.total_experts,), -1, dtype=torch.int32, device=self.device
             )
-            self._layer_cpu_tables[layer_idx] = torch.full(
-                (self.total_experts,), -1, dtype=torch.int32, device="cpu", pin_memory=is_cuda
-            )
+            self._layer_cpu_tables[layer_idx] = self.hw.allocate_pinned_host_tensor(
+                (self.total_experts,), dtype=torch.int32
+            ).fill_(-1)
         return self._layer_gpu_tables[layer_idx], self._layer_cpu_tables[layer_idx]
 
     def get_gpu_slot_table(self, layer_idx: int = 0) -> torch.Tensor:
@@ -304,7 +304,7 @@ class PagedExpertManager:
                 target_slot = self._evict_lru_victim(locked_all)
             locked_all.add(target_slot)
 
-            with torch.cuda.stream(self.dma_stream):
+            with self.hw.stream_context(self.dma_stream):
                 self._dma_expert_into_slot(self.default_layer_idx, expert_id, target_slot)
 
             # Update CPU mapping state
@@ -315,7 +315,7 @@ class PagedExpertManager:
             table_updated = True
 
         if table_updated:
-            with torch.cuda.stream(self.dma_stream):
+            with self.hw.stream_context(self.dma_stream):
                 self.gpu_slot_table.copy_(self.cpu_slot_table, non_blocking=True)
 
         # Refresh LRU ordering for all accessed experts
@@ -363,7 +363,7 @@ class PagedExpertManager:
                     dirty_layers.add(evicted_layer)
             locked_all.add(target_slot)
 
-            with torch.cuda.stream(self.dma_stream):
+            with self.hw.stream_context(self.dma_stream):
                 self._dma_expert_into_slot(layer_idx, eid, target_slot)
 
             key = (layer_idx, eid)
@@ -374,7 +374,7 @@ class PagedExpertManager:
             dirty_layers.add(layer_idx)
 
         if dirty_layers:
-            with torch.cuda.stream(self.dma_stream):
+            with self.hw.stream_context(self.dma_stream):
                 for l_idx in dirty_layers:
                     g_t, c_t = self._ensure_layer_tables(l_idx)
                     g_t.copy_(c_t, non_blocking=True)
@@ -473,10 +473,7 @@ class PagedExpertManager:
 
             if is_multilayer:
                 hot_layer, hot_eid = hot_key
-                if self.dma_stream is not None:
-                    with torch.cuda.stream(self.dma_stream):
-                        self._dma_expert_into_slot(hot_layer, hot_eid, slot)
-                else:
+                with self.hw.stream_context(self.dma_stream):
                     self._dma_expert_into_slot(hot_layer, hot_eid, slot)
 
                 _, hot_cpu_tbl = self._ensure_layer_tables(hot_layer)
@@ -487,10 +484,7 @@ class PagedExpertManager:
                 self.lru_tracker[hot_key] = None
             else:
                 hot_eid = hot_key
-                if self.dma_stream is not None:
-                    with torch.cuda.stream(self.dma_stream):
-                        self._dma_expert_into_slot(self.default_layer_idx, hot_eid, slot)
-                else:
+                with self.hw.stream_context(self.dma_stream):
                     self._dma_expert_into_slot(self.default_layer_idx, hot_eid, slot)
 
                 self.cpu_slot_table[hot_eid] = slot
@@ -532,10 +526,7 @@ class PagedExpertManager:
                     dirty_layers.add(cold_layer)
 
                     hot_layer, hot_eid = hot_key
-                    if self.dma_stream is not None:
-                        with torch.cuda.stream(self.dma_stream):
-                            self._dma_expert_into_slot(hot_layer, hot_eid, slot)
-                    else:
+                    with self.hw.stream_context(self.dma_stream):
                         self._dma_expert_into_slot(hot_layer, hot_eid, slot)
 
                     _, hot_cpu_tbl = self._ensure_layer_tables(hot_layer)
@@ -549,10 +540,7 @@ class PagedExpertManager:
                     self.cpu_slot_table[cold_eid] = -1
 
                     hot_eid = hot_key
-                    if self.dma_stream is not None:
-                        with torch.cuda.stream(self.dma_stream):
-                            self._dma_expert_into_slot(self.default_layer_idx, hot_eid, slot)
-                    else:
+                    with self.hw.stream_context(self.dma_stream):
                         self._dma_expert_into_slot(self.default_layer_idx, hot_eid, slot)
 
                     self.cpu_slot_table[hot_eid] = slot
@@ -566,24 +554,14 @@ class PagedExpertManager:
 
         # Synchronize GPU indirection tables
         if swaps_performed > 0:
-            if is_multilayer and dirty_layers:
-                if self.dma_stream is not None:
-                    with torch.cuda.stream(self.dma_stream):
-                        for l_idx in dirty_layers:
-                            g_tbl, c_tbl = self._ensure_layer_tables(l_idx)
-                            g_tbl.copy_(c_tbl, non_blocking=True)
-                        self.dma_stream.synchronize()
-                else:
+            with self.hw.stream_context(self.dma_stream):
+                if is_multilayer and dirty_layers:
                     for l_idx in dirty_layers:
                         g_tbl, c_tbl = self._ensure_layer_tables(l_idx)
-                        g_tbl.copy_(c_tbl)
-            else:
-                if self.dma_stream is not None:
-                    with torch.cuda.stream(self.dma_stream):
-                        self.gpu_slot_table.copy_(self.cpu_slot_table, non_blocking=True)
-                        self.dma_stream.synchronize()
+                        g_tbl.copy_(c_tbl, non_blocking=True)
                 else:
-                    self.gpu_slot_table.copy_(self.cpu_slot_table)
+                    self.gpu_slot_table.copy_(self.cpu_slot_table, non_blocking=True)
+            self.hw.synchronize(self.dma_stream)
 
         self.total_swaps += swaps_performed
         dt_ms = (time.perf_counter() - t0) * 1000.0
@@ -654,8 +632,10 @@ class PagedExpertManager:
                     return slot, self.default_layer_idx
         raise RuntimeError("Expert Arena thrashing: All VRAM slots are currently locked!")
 
-    def synchronize(self, compute_stream: Optional[torch.cuda.Stream] = None):
+    def synchronize(self, compute_stream: Optional[Any] = None) -> None:
         """Instructs the compute stream to wait for in-flight PCIe DMA transfers."""
+        if self.dma_stream is None:
+            return
         if compute_stream is None:
-            compute_stream = torch.cuda.current_stream(self.device)
-        compute_stream.wait_stream(self.dma_stream)
+            compute_stream = self.hw.current_stream(self.device)
+        self.hw.stream_wait_stream(compute_stream, self.dma_stream)

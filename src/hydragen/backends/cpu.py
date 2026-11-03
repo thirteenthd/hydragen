@@ -9,6 +9,7 @@ Provides 100% portable, zero-dependency implementations of:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import platform
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -212,3 +213,35 @@ class CPUHardwareBackend(HardwareBackend):
             from hydragen.backends.ipc import FallbackIPCBackend
             self._ipc = FallbackIPCBackend()
         return self._ipc
+
+    def set_device(self, device: Any) -> None:
+        pass
+
+    def get_mem_info(self, device: Optional[Any] = None) -> Tuple[int, int]:
+        try:
+            import psutil
+            vm = psutil.virtual_memory()
+            return (int(vm.available), int(vm.total))
+        except Exception:
+            return (16 * 1024 * 1024 * 1024, 64 * 1024 * 1024 * 1024)
+
+    def create_stream(self, device: Optional[Any] = None) -> Any:
+        return None
+
+    def current_stream(self, device: Optional[Any] = None) -> Any:
+        return None
+
+    def stream_context(self, stream: Any) -> Any:
+        return contextlib.nullcontext()
+
+    def stream_wait_stream(self, waiter: Any, ready: Any) -> None:
+        pass
+
+    def synchronize(self, stream_or_device: Optional[Any] = None) -> None:
+        pass
+
+    def allocate_pinned_host_tensor(self, shape: Tuple[int, ...], dtype: Any) -> Any:
+        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=False)
+
+    def empty_tensor(self, shape: Tuple[int, ...], dtype: Any, device: Optional[Any] = None) -> Any:
+        return torch.empty(shape, dtype=dtype, device="cpu")

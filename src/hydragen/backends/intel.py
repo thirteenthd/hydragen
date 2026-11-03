@@ -10,6 +10,7 @@ Provides hardware acceleration for Intel compute architectures:
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import os
 import platform
@@ -269,3 +270,69 @@ class IntelHardwareBackend(HardwareBackend):
             native = NativeIPCBackend()
             self._ipc = native if native.is_available() else FallbackIPCBackend()
         return self._ipc
+
+    def set_device(self, device: Any) -> None:
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            try:
+                torch.xpu.set_device(device)
+            except Exception:
+                pass
+
+    def get_mem_info(self, device: Optional[Any] = None) -> Tuple[int, int]:
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            try:
+                return torch.xpu.mem_get_info(device)
+            except Exception:
+                pass
+        try:
+            import psutil
+            vm = psutil.virtual_memory()
+            return (int(vm.available), int(vm.total))
+        except Exception:
+            return (16 * 1024 * 1024 * 1024, 64 * 1024 * 1024 * 1024)
+
+    def create_stream(self, device: Optional[Any] = None) -> Any:
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            try:
+                return torch.xpu.Stream(device=device)
+            except Exception:
+                pass
+        return None
+
+    def current_stream(self, device: Optional[Any] = None) -> Any:
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            try:
+                return torch.xpu.current_stream(device)
+            except Exception:
+                pass
+        return None
+
+    def stream_context(self, stream: Any) -> Any:
+        if stream is not None and hasattr(torch, "xpu") and torch.xpu.is_available():
+            try:
+                return torch.xpu.stream(stream)
+            except Exception:
+                pass
+        return contextlib.nullcontext()
+
+    def stream_wait_stream(self, waiter: Any, ready: Any) -> None:
+        if waiter is not None and ready is not None and hasattr(waiter, "wait_stream"):
+            try:
+                waiter.wait_stream(ready)
+            except Exception:
+                pass
+
+    def synchronize(self, stream_or_device: Optional[Any] = None) -> None:
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            try:
+                torch.xpu.synchronize()
+            except Exception:
+                pass
+
+    def allocate_pinned_host_tensor(self, shape: Tuple[int, ...], dtype: Any) -> Any:
+        pin = hasattr(torch, "xpu") and torch.xpu.is_available()
+        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=pin)
+
+    def empty_tensor(self, shape: Tuple[int, ...], dtype: Any, device: Optional[Any] = None) -> Any:
+        dev = device if device is not None else ("xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cpu")
+        return torch.empty(shape, dtype=dtype, device=dev)

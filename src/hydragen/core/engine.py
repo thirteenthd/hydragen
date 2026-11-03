@@ -178,7 +178,10 @@ class TRTLLMEngine:
         self.device = torch.device("cpu") if HAS_TORCH else "cpu"
         if self.trt_executor is not None and HAS_TORCH and PagedExpertManager is not None:
             try:
-                self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                from hydragen.backends.registry import BackendRegistry
+                hw = BackendRegistry.get_hardware_backend()
+                dev_type = hw.capability.device_type
+                self.device = torch.device(dev_type if dev_type != "cpu" else "cpu")
                 self.expert_manager = PagedExpertManager(
                     num_slots=self.num_slots,
                     expert_shape=(3, self.n_ff, self.n_embd),
@@ -187,6 +190,7 @@ class TRTLLMEngine:
                     device=self.device,
                     loader=self.loader,
                     default_layer_idx=0,
+                    hw_backend=hw,
                 )
             except Exception as e:
                 print(f"[hydragen:trtllm] PagedExpertManager note: {e}")

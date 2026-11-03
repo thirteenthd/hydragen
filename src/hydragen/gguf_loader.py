@@ -306,9 +306,14 @@ class StrataCUDAKernelBridge:
 
     @staticmethod
     def _resolve_stream_ptr(cuda_stream: Any = None) -> int:
-        if cuda_stream is not None:
+        if cuda_stream is not None and hasattr(cuda_stream, "cuda_stream"):
             return int(cuda_stream.cuda_stream)
-        return int(torch.cuda.current_stream().cuda_stream)
+        if torch.cuda.is_available():
+            try:
+                return int(torch.cuda.current_stream().cuda_stream)
+            except Exception:
+                pass
+        return 0
 
     def native_expert_grouped_forward(
         self,
@@ -569,7 +574,7 @@ class StrataGGUFMoELoader:
         layer_idx: int,
         expert_idx: int,
         dst_blob_u8: torch.Tensor,
-        stream: Optional[torch.cuda.Stream] = None,
+        stream: Optional[Any] = None,
     ) -> int:
         """DMA raw compressed GGUF expert blocks [gate | up | down] directly into VRAM slot.
 
@@ -645,7 +650,7 @@ class StrataGGUFMoELoader:
         dst_down_fp16: torch.Tensor,
         staging_gate_u8: torch.Tensor,
         staging_down_u8: torch.Tensor,
-        stream: Optional[torch.cuda.Stream] = None,
+        stream: Optional[Any] = None,
         dst_up_fp16: Optional[torch.Tensor] = None,
         staging_up_u8: Optional[torch.Tensor] = None,
     ) -> int:

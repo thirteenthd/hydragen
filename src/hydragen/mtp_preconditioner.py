@@ -58,7 +58,12 @@ class MtpDraftPreconditioner:
         self.head_dim = head_dim
         self.kv_dim = n_head_kv * head_dim
         self.max_context = max_context
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is None:
+            from hydragen.backends.registry import BackendRegistry
+            hw = BackendRegistry.get_hardware_backend()
+            dev_type = hw.capability.device_type
+            device = torch.device(dev_type if dev_type != "cpu" else "cpu")
+        self.device = device
         self.mtp_dir = mtp_dir
 
         # Lock for thread-safe state manipulation across concurrent slots

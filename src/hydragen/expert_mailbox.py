@@ -23,14 +23,25 @@ class HybridExpertMailbox:
     def __init__(
         self,
         max_workers: Optional[int] = None,
-        device: torch.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
+        device: Optional[torch.device] = None,
+        hw_backend: Optional[Any] = None,
     ):
+        if hw_backend is not None:
+            self.hw = hw_backend
+        else:
+            from hydragen.backends.registry import BackendRegistry
+            self.hw = BackendRegistry.get_hardware_backend()
+
+        if device is None:
+            dev_type = self.hw.capability.device_type
+            device = torch.device(dev_type if dev_type != "cpu" else "cpu")
+        self.device = device
+
         if max_workers is None:
             # Use up to 8 threads or available host CPU cores
             cpu_cnt = os.cpu_count() or 4
             max_workers = min(8, max(2, cpu_cnt // 2))
         self.max_workers = int(max_workers)
-        self.device = device
         self.executor = ThreadPoolExecutor(
             max_workers=self.max_workers,
             thread_name_prefix="hydragen_expert_mailbox",
@@ -137,24 +148,20 @@ class HybridExpertMailbox:
         self,
         down_out_gpu: torch.Tensor,
         cpu_futures: List[Tuple[int, Future]],
-        cuda_stream: Optional[torch.cuda.Stream] = None,
+        cuda_stream: Optional[Any] = None,
+        stream: Optional[Any] = None,
     ) -> None:
         """Collect completed CPU expert projections and copy them into the GPU output tensor."""
         t0 = time.perf_counter()
-        for compact_idx, fut in cpu_futures:
-            res_cpu = fut.result()
-            if down_out_gpu.device.type == "cuda":
-                # Asynchronously copy to GPU slot in down_out
-                if cuda_stream is not None:
-                    with torch.cuda.stream(cuda_stream):
-                        down_out_gpu[compact_idx].copy_(res_cpu, non_blocking=True)
-                else:
-                    down_out_gpu[compact_idx].copy_(res_cpu, non_blocking=True)
-            else:
-                down_out_gpu[compact_idx].copy_(res_cpu)
+        target_stream = stream if stream is not None else cuda_stream
+        is_device_async = (down_out_gpu.device.type != "cpu")
+        with self.hw.stream_context(target_stream):
+            for compact_idx, fut in cpu_futures:
+                res_cpu = fut.result()
+                down_out_gpu[compact_idx].copy_(res_cpu, non_blocking=is_device_async)
 
-        if down_out_gpu.device.type == "cuda" and cuda_stream is not None:
-            cuda_stream.synchronize()
+        if target_stream is not None:
+            self.hw.synchronize(target_stream)
 
         self.last_cpu_time_ms = (time.perf_counter() - t0) * 1000.0
         self.total_fusions += 1

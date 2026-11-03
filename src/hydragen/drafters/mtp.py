@@ -33,14 +33,10 @@ class MtpDrafter(SpeculativeDrafter):
         mtp_dir: Optional[str] = None,
     ):
         if device is None:
-            if torch.cuda.is_available():
-                try:
-                    torch.cuda.current_device()
-                    device = torch.device("cuda")
-                except Exception:
-                    device = torch.device("cpu")
-            else:
-                device = torch.device("cpu")
+            from hydragen.backends.registry import BackendRegistry
+            hw = BackendRegistry.get_hardware_backend()
+            dev_type = hw.capability.device_type
+            device = torch.device(dev_type if dev_type != "cpu" else "cpu")
 
         self._preconditioner = MtpDraftPreconditioner(
             n_embd=n_embd,

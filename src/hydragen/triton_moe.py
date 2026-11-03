@@ -681,10 +681,15 @@ def triton_paged_moe_forward(
 
         # Collect CPU results from mailbox and merge into down_out
         if cpu_futures:
+            active_stream = (
+                expert_manager.hw.current_stream(x.device)
+                if hasattr(expert_manager, "hw")
+                else (mailbox.hw.current_stream(x.device) if hasattr(mailbox, "hw") else None)
+            )
             mailbox.gather_and_merge(
                 down_out_gpu=down_out,
                 cpu_futures=cpu_futures,
-                cuda_stream=torch.cuda.current_stream(x.device) if x.device.type == "cuda" else None,
+                stream=active_stream,
             )
 
         if hasattr(expert_manager, "get_gpu_slot_table"):

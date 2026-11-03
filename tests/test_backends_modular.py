@@ -320,6 +320,67 @@ class TestHardwareBackendsModular(unittest.TestCase):
         out = moe.forward_moe(x, logits, top_k=2)
         self.assertTrue(torch.equal(out, x))
 
+    def test_hardware_stream_and_context_abstractions(self):
+        """Verifies stream creation, stream context, and synchronization across the hardware quad."""
+        for backend_cls in [CPUHardwareBackend, CUDAHardwareBackend, IntelHardwareBackend, ROCMHardwareBackend]:
+            backend = backend_cls()
+            stream = backend.create_stream()
+            # Context manager must execute cleanly without exceptions
+            with backend.stream_context(stream):
+                t = backend.empty_tensor((4, 4), dtype=torch.float32)
+                t.fill_(1.0)
+            backend.stream_wait_stream(stream, stream)
+            backend.synchronize(stream)
+            self.assertEqual(t.shape, (4, 4))
+
+    def test_hardware_memory_and_allocations(self):
+        """Verifies memory info queries and pinned host / device allocations."""
+        for backend_cls in [CPUHardwareBackend, CUDAHardwareBackend, IntelHardwareBackend, ROCMHardwareBackend]:
+            backend = backend_cls()
+            free_b, total_b = backend.get_mem_info()
+            self.assertIsInstance(free_b, int)
+            self.assertIsInstance(total_b, int)
+            self.assertTrue(total_b >= 0)
+
+            # Pinned host tensor allocation
+            pinned = backend.allocate_pinned_host_tensor((8, 16), dtype=torch.float16)
+            self.assertEqual(pinned.shape, (8, 16))
+            self.assertEqual(pinned.device.type, "cpu")
+
+            # Device empty tensor
+            empty_t = backend.empty_tensor((2, 4), dtype=torch.int32)
+            self.assertEqual(empty_t.shape, (2, 4))
+
+    def test_expert_manager_and_mailbox_modular_injection(self):
+        """Verifies PagedExpertManager and HybridExpertMailbox cleanly decouple via HardwareBackend injection."""
+        from hydragen.expert_manager import PagedExpertManager
+        from hydragen.expert_mailbox import HybridExpertMailbox
+
+        cpu_hw = CPUHardwareBackend()
+        # Initialize PagedExpertManager with explicit CPU hardware backend injection
+        em = PagedExpertManager(
+            num_slots=4,
+            expert_shape=(3, 16, 16),
+            total_experts=8,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            hw_backend=cpu_hw,
+        )
+        self.assertIs(em.hw, cpu_hw)
+        self.assertIsNone(em.dma_stream)
+
+        # Ensure page request and table synchronization work branchlessly on CPU
+        mapping = em.request_experts([0, 1, 2])
+        self.assertEqual(len(mapping), 3)
+        self.assertEqual(em.cpu_slot_table[0].item(), mapping[0])
+        self.assertEqual(em.gpu_slot_table[0].item(), mapping[0])
+        em.synchronize()
+
+        # Initialize HybridExpertMailbox with explicit backend injection
+        box = HybridExpertMailbox(max_workers=2, device=torch.device("cpu"), hw_backend=cpu_hw)
+        self.assertIs(box.hw, cpu_hw)
+        box.close()
+
 
 if __name__ == "__main__":
     unittest.main()
