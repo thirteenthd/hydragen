@@ -117,8 +117,16 @@ class PagedExpertManager:
                 self.staging_gate_u8 = None
                 self.staging_up_u8 = None
                 self.staging_down_u8 = None
+
+                # Milestone 4: Concurrent CPU+GPU Hybrid Expert Mailbox
+                try:
+                    from hydragen.expert_mailbox import HybridExpertMailbox
+                    self.mailbox = HybridExpertMailbox(device=device)
+                except Exception:
+                    self.mailbox = None
             else:
                 self.host_pool = None
+                self.mailbox = None
                 max_proj_bytes = 1536 * 1024
                 self.staging_gate_u8 = torch.empty(
                     (max_proj_bytes,), dtype=torch.uint8, device=device
@@ -181,6 +189,19 @@ class PagedExpertManager:
         if layer_idx is not None and (layer_idx, expert_id) in self.residency_map:
             return True
         return expert_id in self.residency_map
+
+    def partition_experts(
+        self, expert_ids: List[int], layer_idx: Optional[int] = None
+    ) -> Tuple[List[int], List[int]]:
+        """Partition expert IDs into resident (in VRAM) and missed (in host RAM)."""
+        resident = []
+        missed = []
+        for eid in expert_ids:
+            if self.is_resident(eid, layer_idx):
+                resident.append(eid)
+            else:
+                missed.append(eid)
+        return resident, missed
 
     def get_slot(self, expert_id: int) -> int:
         """Retrieve slot for resident expert and refresh its LRU timestamp."""
