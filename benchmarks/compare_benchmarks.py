@@ -12,6 +12,8 @@ def main():
     f4 = m4_files[-1] if m4_files else None
     m5_files = sorted(glob.glob("benchmarks/results/benchmark_mtp_precondition_m5_*.json"))
     f5 = m5_files[-1] if m5_files else None
+    m7_files = sorted(glob.glob("benchmarks/results/benchmark_clamped_branchless_kv_m7_*.json"))
+    f7 = m7_files[-1] if m7_files else None
 
     with open(f0) as f:
         m0 = json.load(f)
@@ -29,19 +31,24 @@ def main():
     if f5 and os.path.exists(f5):
         with open(f5) as f:
             m5 = json.load(f)
+    m7 = None
+    if f7 and os.path.exists(f7):
+        with open(f7) as f:
+            m7 = json.load(f)
 
-    print("=" * 120)
-    print(" PIPELINE COMPARISON: BASELINE (M0) vs LPT (M2) vs ADAPT (M3) vs MAILBOX (M4) vs MTP PRECOND (M5)")
-    print("=" * 120)
-    header = f"{'Test Case':<28} | {'Metric':<9} | {'M0 Base':<8} | {'M2 LPT':<8} | {'M4 Box':<8} | {'M5 MTP':<8} | {'M5 vs M0':<9}"
+    print("=" * 132)
+    print(" PIPELINE COMPARISON: BASELINE (M0) vs LPT (M2) vs MAILBOX (M4) vs MTP PRECOND (M5) vs CLAMPED KV (M7)")
+    print("=" * 132)
+    header = f"{'Test Case':<28} | {'Metric':<9} | {'M0 Base':<8} | {'M2 LPT':<8} | {'M4 Box':<8} | {'M5 MTP':<8} | {'M7 Clamp':<8} | {'M7 vs M0':<9}"
     print(header)
-    print("-" * 120)
+    print("-" * 132)
 
     m3_records = m3["records"] if m3 else [None] * len(m0["records"])
     m4_records = m4["records"] if m4 else [None] * len(m0["records"])
     m5_records = m5["records"] if m5 else [None] * len(m0["records"])
+    m7_records = m7["records"] if m7 else [None] * len(m0["records"])
 
-    for r0, r2, r4, r5 in zip(m0["records"], m2["records"], m4_records, m5_records):
+    for r0, r2, r4, r5, r7 in zip(m0["records"], m2["records"], m4_records, m5_records, m7_records):
         test_name = f"{r0['test_type']} ({r0['prompt_tokens']}p)"
 
         # TTFT
@@ -49,33 +56,37 @@ def main():
         ttft2 = r2["ttft_client_s"]
         ttft4 = r4["ttft_client_s"] if r4 else 0.0
         ttft5 = r5["ttft_client_s"] if r5 else 0.0
-        ttft_diff = ((ttft5 - ttft0) / ttft0) * 100 if ttft0 > 0 and r5 else 0.0
-        print(f"{test_name:<28} | {'TTFT':<9} | {ttft0:5.2f}s   | {ttft2:5.2f}s   | {ttft4:5.2f}s   | {ttft5:5.2f}s   | {ttft_diff:+6.2f}%")
+        ttft7 = r7["ttft_client_s"] if r7 else 0.0
+        ttft_diff = ((ttft7 - ttft0) / ttft0) * 100 if ttft0 > 0 and r7 else 0.0
+        print(f"{test_name:<28} | {'TTFT':<9} | {ttft0:5.2f}s   | {ttft2:5.2f}s   | {ttft4:5.2f}s   | {ttft5:5.2f}s   | {ttft7:5.2f}s   | {ttft_diff:+6.2f}%")
 
         # Decode speed
         dec0 = r0["decode_client_tok_s"]
         dec2 = r2["decode_client_tok_s"]
         dec4 = r4["decode_client_tok_s"] if r4 else 0.0
         dec5 = r5["decode_client_tok_s"] if r5 else 0.0
-        dec_diff = ((dec5 - dec0) / dec0) * 100 if dec0 > 0 and r5 else 0.0
-        print(f"{'':<28} | {'Decode':<9} | {dec0:5.1f} t/s | {dec2:5.1f} t/s | {dec4:5.1f} t/s | {dec5:5.1f} t/s | {dec_diff:+6.2f}%")
+        dec7 = r7["decode_client_tok_s"] if r7 else 0.0
+        dec_diff = ((dec7 - dec0) / dec0) * 100 if dec0 > 0 and r7 else 0.0
+        print(f"{'':<28} | {'Decode':<9} | {dec0:5.1f} t/s | {dec2:5.1f} t/s | {dec4:5.1f} t/s | {dec5:5.1f} t/s | {dec7:5.1f} t/s | {dec_diff:+6.2f}%")
 
         # MTP acceptance rate
         acc0 = r0.get("mtp_acceptance_rate", 0.0) * 100
         acc2 = r2.get("mtp_acceptance_rate", 0.0) * 100
         acc4 = (r4.get("mtp_acceptance_rate", 0.0) * 100) if r4 else 0.0
         acc5 = (r5.get("mtp_acceptance_rate", 0.0) * 100) if r5 else 0.0
-        acc_diff = acc5 - acc0
-        print(f"{'':<28} | {'MTP Acc':<9} | {acc0:5.1f}%   | {acc2:5.1f}%   | {acc4:5.1f}%   | {acc5:5.1f}%   | {acc_diff:+5.1f}% pts")
+        acc7 = (r7.get("mtp_acceptance_rate", 0.0) * 100) if r7 else 0.0
+        acc_diff = acc7 - acc0
+        print(f"{'':<28} | {'MTP Acc':<9} | {acc0:5.1f}%   | {acc2:5.1f}%   | {acc4:5.1f}%   | {acc5:5.1f}%   | {acc7:5.1f}%   | {acc_diff:+5.1f}% pts")
 
         # VRAM hit rate
         hit0 = r0.get("vram_hit_rate", 0.0) * 100
         hit2 = r2.get("vram_hit_rate", 0.0) * 100
         hit4 = (r4.get("vram_hit_rate", 0.0) * 100) if r4 else 0.0
         hit5 = (r5.get("vram_hit_rate", 0.0) * 100) if r5 else 0.0
-        hit_diff = hit5 - hit0
-        print(f"{'':<28} | {'VRAM Hit':<9} | {hit0:5.1f}%   | {hit2:5.1f}%   | {hit4:5.1f}%   | {hit5:5.1f}%   | {hit_diff:+5.1f}% pts")
-        print("-" * 120)
+        hit7 = (r7.get("vram_hit_rate", 0.0) * 100) if r7 else 0.0
+        hit_diff = hit7 - hit0
+        print(f"{'':<28} | {'VRAM Hit':<9} | {hit0:5.1f}%   | {hit2:5.1f}%   | {hit4:5.1f}%   | {hit5:5.1f}%   | {hit7:5.1f}%   | {hit_diff:+5.1f}% pts")
+        print("-" * 132)
 
 if __name__ == "__main__":
     main()
