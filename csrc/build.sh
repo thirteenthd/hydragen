@@ -86,6 +86,6 @@ g++ -O3 -fPIC -std=c++17 -pthread -shared \
 
 echo "====================================================="
 echo "Build complete! Staging to ${PKG_LIB_DIR}..."
-cp -f "${LIB_DIR}"/*.so "${PKG_LIB_DIR}/" || true
+cp --remove-destination "${LIB_DIR}"/*.so "${PKG_LIB_DIR}/" || cp -f "${LIB_DIR}"/*.so "${PKG_LIB_DIR}/" || true
 ls -la "${LIB_DIR}"
 echo "====================================================="
