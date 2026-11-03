@@ -42,6 +42,7 @@ void launch_paged_attention_prefill_f16(
     int32_t max_blocks,
     float scale,
     bool is_int8_kv,
+    bool reverse_lpt,
     cudaStream_t stream
 );
 

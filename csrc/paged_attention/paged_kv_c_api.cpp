@@ -137,12 +137,13 @@ void paged_attention_prefill(
     int32_t max_blocks,
     float scale,
     int32_t is_int8_kv,
+    int32_t reverse_lpt,
     void* stream
 ) {
     hydragen::paged_attention::launch_paged_attention_prefill_f16(
         out, q, k_cache, v_cache, block_tables, context_lens,
         num_seqs, query_len, num_heads, num_kv_heads, head_dim, block_size, max_blocks,
-        scale, is_int8_kv != 0, static_cast<cudaStream_t>(stream)
+        scale, is_int8_kv != 0, reverse_lpt != 0, static_cast<cudaStream_t>(stream)
     );
 }
 

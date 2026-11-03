@@ -123,7 +123,7 @@ class PagedKVManager:
                 ctypes.c_void_p, ctypes.c_void_p,
                 ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
                 ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
-                ctypes.c_float, ctypes.c_int32, ctypes.c_void_p,
+                ctypes.c_float, ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p,
             ]
 
     def allocate_sequence(self, seq_id: int, initial_tokens: int) -> bool:
@@ -351,6 +351,7 @@ class PagedKVManager:
         context_lens=None,
         scale: Optional[float] = None,
         is_int8_kv: bool = False,
+        reverse_lpt: bool = True,
         stream: Optional[Any] = None,
     ):
         """Causal prefill attention across paged KV blocks with Reverse Query-Tile Attention Scheduling (LPT)."""
@@ -376,7 +377,7 @@ class PagedKVManager:
                 ctypes.c_void_p(ctx_ptr),
                 int(num_seqs), int(query_len), int(num_heads), int(num_kv_heads),
                 int(head_dim), int(self.block_size), int(max_blocks),
-                float(scale), int(1 if is_int8_kv else 0),
+                float(scale), int(1 if is_int8_kv else 0), int(1 if reverse_lpt else 0),
                 ctypes.c_void_p(stream_ptr)
             )
             return out

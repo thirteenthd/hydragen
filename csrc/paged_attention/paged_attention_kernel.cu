@@ -205,7 +205,7 @@ void launch_paged_attention_decode_f16(
 
 // Reverse Query-Tile Attention Scheduling (LPT - Longest Processing Time First)
 // Prefill Causal Paged Attention for Ampere SM_86+
-template<int BLOCK_SIZE = 16, int HEAD_DIM = 128, int TILE_Q = 4>
+template<int BLOCK_SIZE = 16, int HEAD_DIM = 128, int TILE_Q = 4, bool REVERSE_LPT = true>
 __global__ void paged_attention_prefill_kernel(
     float* __restrict__ out,
     const float* __restrict__ q,
@@ -228,7 +228,7 @@ __global__ void paged_attention_prefill_kernel(
     // making them significantly heavier than earlier query tiles. Inverting tile dispatch ensures
     // that SMs launch the heaviest computational workloads first; short tiles backfill the trailing
     // wave to minimize SM idle time.
-    const int tile_idx = total_query_tiles - 1 - blockIdx.x;
+    const int tile_idx = REVERSE_LPT ? (total_query_tiles - 1 - blockIdx.x) : blockIdx.x;
     const int head_idx = blockIdx.y;
     const int seq_idx = blockIdx.z;
 
@@ -363,6 +363,7 @@ void launch_paged_attention_prefill_f16(
     int32_t max_blocks,
     float scale,
     bool is_int8_kv,
+    bool reverse_lpt,
     cudaStream_t stream
 ) {
     constexpr int TILE_Q = 4;
@@ -372,22 +373,41 @@ void launch_paged_attention_prefill_f16(
 
     float kv_scale = is_int8_kv ? 0.015625f : 1.0f;
 
-    paged_attention_prefill_kernel<16, 128, TILE_Q><<<grid, block, 0, stream>>>(
-        out,
-        q,
-        reinterpret_cast<const int8_t*>(k_cache),
-        reinterpret_cast<const int8_t*>(v_cache),
-        block_tables,
-        context_lens,
-        num_seqs,
-        query_len,
-        num_heads,
-        num_kv_heads,
-        max_blocks,
-        scale,
-        kv_scale,
-        is_int8_kv
-    );
+    if (reverse_lpt) {
+        paged_attention_prefill_kernel<16, 128, TILE_Q, true><<<grid, block, 0, stream>>>(
+            out,
+            q,
+            reinterpret_cast<const int8_t*>(k_cache),
+            reinterpret_cast<const int8_t*>(v_cache),
+            block_tables,
+            context_lens,
+            num_seqs,
+            query_len,
+            num_heads,
+            num_kv_heads,
+            max_blocks,
+            scale,
+            kv_scale,
+            is_int8_kv
+        );
+    } else {
+        paged_attention_prefill_kernel<16, 128, TILE_Q, false><<<grid, block, 0, stream>>>(
+            out,
+            q,
+            reinterpret_cast<const int8_t*>(k_cache),
+            reinterpret_cast<const int8_t*>(v_cache),
+            block_tables,
+            context_lens,
+            num_seqs,
+            query_len,
+            num_heads,
+            num_kv_heads,
+            max_blocks,
+            scale,
+            kv_scale,
+            is_int8_kv
+        );
+    }
 }
 
 } // namespace hydragen::paged_attention

@@ -90,6 +90,7 @@ PAGED_KV_API void paged_attention_prefill(
     int32_t max_blocks,
     float scale,
     int32_t is_int8_kv,
+    int32_t reverse_lpt,
     void* stream
 );
 
