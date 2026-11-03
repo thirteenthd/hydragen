@@ -34,6 +34,11 @@ from hydragen.backends.intel import (
     IntelPagedAttentionBackend,
 )
 from hydragen.backends.ipc import FallbackIPCBackend, NativeIPCBackend
+from hydragen.backends.rocm import (
+    ROCMHardwareBackend,
+    ROCMMoEBackend,
+    ROCMPagedAttentionBackend,
+)
 
 
 class _CDeviceCaps(ctypes.Structure):
@@ -51,6 +56,7 @@ class _CDeviceCaps(ctypes.Structure):
         ("has_avx512", ctypes.c_int32),
         ("has_dpas", ctypes.c_int32),
         ("has_amx", ctypes.c_int32),
+        ("has_mfma", ctypes.c_int32),
     ]
 
 
@@ -112,12 +118,21 @@ class BackendRegistry:
                 "libpaged_kv_sycl.dll",
             ])
 
+        if torch.cuda.is_available() and getattr(torch.version, "hip", None) is not None:
+            candidates.extend([
+                "libpaged_kv_rocm.so",
+                "libpaged_kv_hip.so",
+                "libpaged_kv_rocm.dll",
+            ])
+
         # Priority 2: Standard shared library names
         candidates.extend([
             "libpaged_kv.so",
             "libpaged_kv.dll",
             "libpaged_kv_intel.so",
             "libpaged_kv_intel.dll",
+            "libpaged_kv_rocm.so",
+            "libpaged_kv_rocm.dll",
         ])
 
         for cand in candidates:
@@ -141,6 +156,7 @@ class BackendRegistry:
                                 "has_cp_async": bool(raw.caps.has_cp_async),
                                 "has_dpas": bool(raw.caps.has_dpas),
                                 "has_amx": bool(raw.caps.has_amx),
+                                "has_mfma": bool(raw.caps.has_mfma),
                             }
                             print(f"[hydragen] Loaded native C-ABI hardware plugin: {name_str} (arch={arch_str}, ABI=v{raw.abi_version})")
                     except Exception:
@@ -155,9 +171,9 @@ class BackendRegistry:
         forced = os.environ.get("HYDRAGEN_DEVICE")
         if forced:
             forced_lower = forced.lower()
-            if forced_lower in ("cuda", "gpu"):
+            if forced_lower in ("cuda", "gpu", "nvidia"):
                 return DeviceType.CUDA
-            elif forced_lower in ("rocm", "hip"):
+            elif forced_lower in ("rocm", "hip", "amd"):
                 return DeviceType.ROCM
             elif forced_lower in ("intel", "xpu", "arc", "sycl"):
                 return DeviceType.INTEL
@@ -186,6 +202,10 @@ class BackendRegistry:
         if target_device in (DeviceType.INTEL, DeviceType.XPU):
             paged_lib = cls.discover_paged_attention_library()
             return IntelHardwareBackend(intel_lib=paged_lib)
+
+        if target_device == DeviceType.ROCM:
+            paged_lib = cls.discover_paged_attention_library()
+            return ROCMHardwareBackend(rocm_lib=paged_lib)
 
         return CPUHardwareBackend()
 

@@ -43,6 +43,7 @@ class DeviceCapability:
     has_dpas: bool = False
     has_amx: bool = False
     has_vnni: bool = False
+    has_mfma: bool = False
     details: Optional[Dict[str, Any]] = None
 
 

@@ -35,6 +35,7 @@ typedef struct {
     int32_t has_avx512;             // 1 if AVX-512 supported
     int32_t has_dpas;               // 1 if Intel XMX / DPAS supported
     int32_t has_amx;                // 1 if Intel AMX matrix tiles supported
+    int32_t has_mfma;               // 1 if AMD CDNA Matrix Core (MFMA) supported
 } hydragen_device_caps_t;
 
 // Paged KV Block Manager & Attention Function Pointer Table

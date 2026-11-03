@@ -22,6 +22,9 @@ from hydragen.backends import (
     MoEBackend,
     NativeIPCBackend,
     PagedAttentionBackend,
+    ROCMHardwareBackend,
+    ROCMMoEBackend,
+    ROCMPagedAttentionBackend,
     get_hardware_backend,
     get_ipc_backend,
     get_paged_attention_backend,
@@ -169,6 +172,7 @@ class TestHardwareBackendsModular(unittest.TestCase):
         caps.has_cp_async = 1
         caps.has_dpas = 0
         caps.has_amx = 0
+        caps.has_mfma = 0
 
         desc = _CPluginDescriptor()
         desc.abi_version = 1
@@ -185,6 +189,7 @@ class TestHardwareBackendsModular(unittest.TestCase):
         self.assertEqual(desc.caps.has_cp_async, 1)
         self.assertEqual(desc.caps.has_dpas, 0)
         self.assertEqual(desc.caps.has_amx, 0)
+        self.assertEqual(desc.caps.has_mfma, 0)
 
     def test_intel_hardware_backend_introspection(self):
         """Validates Intel hardware backend capabilities (XPU or AMX/VNNI CPU)."""
@@ -246,6 +251,70 @@ class TestHardwareBackendsModular(unittest.TestCase):
         moe = IntelMoEBackend()
         self.assertEqual(moe.device_type, DeviceType.INTEL)
         self.assertEqual(moe.name, "intel_ipex_moe")
+        x = torch.randn(2, 64)
+        logits = torch.randn(2, 8)
+        out = moe.forward_moe(x, logits, top_k=2)
+        self.assertTrue(torch.equal(out, x))
+
+    def test_rocm_hardware_backend_introspection(self):
+        """Validates AMD ROCm hardware backend capabilities (RDNA3 WMMA / CDNA MFMA)."""
+        rocm_hw = ROCMHardwareBackend()
+        cap = rocm_hw.capability
+        self.assertEqual(cap.device_type, DeviceType.ROCM)
+        self.assertTrue(len(cap.device_name) > 0)
+        self.assertTrue(cap.multi_processor_count >= 1)
+        self.assertIn("architecture", cap.details)
+
+    def test_forced_rocm_backend_selection(self):
+        """Validates forcing AMD ROCm hardware backend instantiation."""
+        hw = get_hardware_backend(force_device=DeviceType.ROCM)
+        self.assertIsInstance(hw, ROCMHardwareBackend)
+        self.assertEqual(hw.device_type, DeviceType.ROCM)
+
+        paged_att = get_paged_attention_backend(force_device=DeviceType.ROCM)
+        self.assertIsInstance(paged_att, ROCMPagedAttentionBackend)
+        self.assertEqual(paged_att.device_type, DeviceType.ROCM)
+        self.assertEqual(paged_att.name, "rocm_paged_attention")
+
+    def test_rocm_paged_attention_execution(self):
+        """Validates AMD ROCm paged attention decode and prefill execution path."""
+        backend = ROCMPagedAttentionBackend()
+        q_decode = torch.randn(1, 4, 64)
+        k_cache = torch.randn(8, 2, 16, 64)
+        v_cache = torch.randn(8, 2, 16, 64)
+        block_tables = torch.tensor([[0, 1]], dtype=torch.int32)
+        context_lens = torch.tensor([18], dtype=torch.int32)
+        out_decode = torch.zeros_like(q_decode)
+
+        backend.paged_attention_decode(
+            out=out_decode,
+            q=q_decode,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=block_tables,
+            context_lens=context_lens,
+        )
+        self.assertFalse(torch.isnan(out_decode).any())
+        self.assertTrue((out_decode != 0.0).any())
+
+        # Prefill
+        q_prefill = torch.randn(1, 4, 4, 64)
+        out_prefill = torch.zeros_like(q_prefill)
+        backend.paged_attention_prefill(
+            out=out_prefill,
+            q=q_prefill,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=block_tables,
+            context_lens=context_lens,
+        )
+        self.assertFalse(torch.isnan(out_prefill).any())
+
+    def test_rocm_moe_backend(self):
+        """Validates AMD ROCm MoE backend interface."""
+        moe = ROCMMoEBackend()
+        self.assertEqual(moe.device_type, DeviceType.ROCM)
+        self.assertEqual(moe.name, "rocm_hipblas_moe")
         x = torch.randn(2, 64)
         logits = torch.randn(2, 8)
         out = moe.forward_moe(x, logits, top_k=2)

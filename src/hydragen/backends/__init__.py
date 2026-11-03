@@ -23,6 +23,11 @@ from hydragen.backends.registry import (
     get_ipc_backend,
     get_paged_attention_backend,
 )
+from hydragen.backends.rocm import (
+    ROCMHardwareBackend,
+    ROCMMoEBackend,
+    ROCMPagedAttentionBackend,
+)
 
 __all__ = [
     "DeviceType",
@@ -38,6 +43,9 @@ __all__ = [
     "IntelHardwareBackend",
     "IntelPagedAttentionBackend",
     "IntelMoEBackend",
+    "ROCMHardwareBackend",
+    "ROCMPagedAttentionBackend",
+    "ROCMMoEBackend",
     "NativeIPCBackend",
     "FallbackIPCBackend",
     "BackendRegistry",
