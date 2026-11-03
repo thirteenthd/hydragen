@@ -9,6 +9,7 @@ Re-exports and executes the full `strata_vllm` pipeline:
 """
 
 from hydragen.engine import VLLMEngine
+from hydragen.hydragen_engine import HydragenEngine
 from hydragen.expert_locality_policy import ExpertLocalityPolicy
 from hydragen.expert_manager import PagedExpertManager
 from hydragen.gguf_loader import (
@@ -24,6 +25,7 @@ from hydragen.triton_moe import (
 
 __all__ = [
     "ExpertLocalityPolicy",
+    "HydragenEngine",
     "PagedExpertManager",
     "StrataCUDAKernelBridge",
     "StrataGGUFMoELoader",

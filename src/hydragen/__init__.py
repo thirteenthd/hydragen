@@ -24,6 +24,7 @@ _EXPORT_MAP = {
     "TRTLLMEngine": "hydragen.trtllm_engine",
     "TRTPagedBlockManager": "hydragen.core.block_manager",
     "InFlightScheduler": "hydragen.core.scheduler",
+    "HydragenEngine": "hydragen.hydragen_engine",
 }
 
 __all__ = list(_EXPORT_MAP.keys()) + ["__version__"]

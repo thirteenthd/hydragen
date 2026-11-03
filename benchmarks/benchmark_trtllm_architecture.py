@@ -165,8 +165,8 @@ def run_trtllm_engine_contract_test():
     
     from unittest.mock import MagicMock, patch
     
-    with patch("hydragen.trtllm_engine.StrataGGUFMoELoader") as MockLoader, \
-         patch("hydragen.trtllm_engine.PagedExpertManager") as MockExpMgr:
+    with patch("hydragen.core.engine.StrataGGUFMoELoader") as MockLoader, \
+         patch("hydragen.core.engine.PagedExpertManager") as MockExpMgr:
         
         mock_loader_inst = MagicMock()
         mock_loader_inst.get_layer_expert_metadata.return_value = {

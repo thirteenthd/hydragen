@@ -510,7 +510,7 @@ def calculate_concurrency_capacity(
 def main():
     parser = argparse.ArgumentParser(description="Hydragen AI Engine Performance & Concurrency Tuner")
     parser.add_argument("--server", type=str, default=None, help="Remote or local Hydragen server URL to probe/benchmark (e.g. http://modelserver01:8080 or http://127.0.0.1:8080)")
-    parser.add_argument("--engine", choices=["auto", "strata", "vllm", "trtllm"], default="auto", help="Engine architecture: strata, vllm, or trtllm (default: auto)")
+    parser.add_argument("--engine", choices=["auto", "strata", "hydragen", "vllm", "trtllm"], default="auto", help="Engine architecture: strata, hydragen, vllm, or trtllm (default: auto)")
     parser.add_argument("--backend", choices=["auto", "cuda", "rocm", "intel", "cpu"], default="auto", help="Hardware acceleration backend (default: auto)")
     parser.add_argument("--drafter", choices=["auto", "dflash2", "mtp", "off"], default="auto", help="Speculative drafter engine (default: auto-resolve)")
     parser.add_argument("--benchmark", action="store_true", help="Run live latency benchmark before tuning")
@@ -606,9 +606,10 @@ def main():
     # Step 4: Engine Architecture
     print(bold("\n--- [Step 4/7] Engine Architecture (Serving Runtime) ---"))
     engine_options = [
-        ("strata", "Strata Hybrid MoE Engine - High-throughput PCIe streaming + RAM caching + MTP/DFlash2 (Recommended for 1x GPU)"),
-        ("vllm", "Hydragen vLLM Bridge - Continuous batching with locality-aware expert admission and Triton fused MoE kernels"),
-        ("trtllm", "TensorRT-LLM Bridge - In-Flight Batching scheduler with custom TRT-LLM plugins and virtual Paged KV"),
+        ("strata", "Strata Hybrid MoE Engine - High-throughput PCIe streaming + RAM caching + MTP/DFlash2 (Recommended for 1x GPU peak solo speed)"),
+        ("hydragen", "Hydragen Unified Serving Engine - In-Flight Batching + Paged KV (CoW 75% savings) + MoE Locality Scheduling (Recommended for Multi-Slot Concurrency)"),
+        ("vllm", "Legacy vLLM Bridge (Forwarded to Hydragen Unified)"),
+        ("trtllm", "Legacy TensorRT-LLM Bridge (Forwarded to Hydragen Unified)"),
     ]
     engine_choice = args.engine if args.engine != "auto" else ask_choice(
         "Select Engine Architecture",

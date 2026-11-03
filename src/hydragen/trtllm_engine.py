@@ -7,5 +7,6 @@ Maintains backward compatibility with all existing imports.
 from hydragen.core.block_manager import TRTPagedBlockManager
 from hydragen.core.engine import TRTLLMEngine
 from hydragen.core.scheduler import InFlightScheduler
+from hydragen.hydragen_engine import HydragenEngine
 
-__all__ = ["TRTLLMEngine", "TRTPagedBlockManager", "InFlightScheduler"]
+__all__ = ["HydragenEngine", "TRTLLMEngine", "TRTPagedBlockManager", "InFlightScheduler"]

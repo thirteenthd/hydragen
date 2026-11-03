@@ -8859,7 +8859,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             event_sink = None
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--engine", choices=["mock", "strata", "vllm", "trtllm"], default="mock")
+    ap.add_argument("--engine", choices=["mock", "strata", "hydragen", "vllm", "trtllm"], default="mock")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
@@ -9173,26 +9173,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                                  linux_desktop()) if not groups and not split else None
         if note:                                        # #560 #516: before --open starts a browser on that card
             print(note, flush=True)
-    elif a.engine == "vllm":
+    elif a.engine in ("hydragen", "vllm", "trtllm"):
         effort_end = None
-        from hydragen.server.vllm_engine import VLLMEngine
-        engine = VLLMEngine(cfg, tok, batch_slots=a.parallel or 4)
-        vision = None
-        if cfg.get("vision"):
-            print("loading the vision encoder ...", flush=True)
-            vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
-                        if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
-                    for k, v in cfg["vision"].items() if not (k == "exe" and engine_component.is_reference(v))}
-            if engine_component.is_reference(cfg["vision"].get("exe")):
-                vcfg["exe"] = _component_exe(cfg["vision"]["exe"], cfg)
-            env = child_env(cfg, offline=a.offline)
-            vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=vision_env(cfg, env), lazy=lazy)
-        sampling_defaults = sampling_defaults_from_config(cfg)
-    elif a.engine == "trtllm":
-        effort_end = None
-        from hydragen.trtllm_engine import TRTLLMEngine
-        engine = TRTLLMEngine(cfg, tok, batch_slots=a.parallel or 4)
+        from hydragen.hydragen_engine import HydragenEngine
+        engine = HydragenEngine(cfg, tok, batch_slots=a.parallel or 4)
         vision = None
         if cfg.get("vision"):
             print("loading the vision encoder ...", flush=True)
