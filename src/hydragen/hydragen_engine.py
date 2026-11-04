@@ -77,6 +77,7 @@ class HydragenEngine:
         block_size: int = 16,
         max_blocks: int = 4096,
         standalone_mode: bool = False,
+        hardware_worker: Any = None,
     ):
         self.tok = tok
         self.batch = int(batch_slots)
@@ -166,38 +167,34 @@ class HydragenEngine:
             self.n_ff = 640
             self.n_exp = 512
 
-        # 5. Resident Hardware Execution Worker (bin/strata C++/CUDA Worker)
-        self.hardware_worker = None
-        self.backend = None
-        if not self.standalone_mode and "exe" in self.cfg:
+        # 5. Resident Hardware Execution Worker (bin/strata, replicas or split serving).
+        # The server builds it (every start-up guard lives there); a worker is only spawned here when none is given.
+        self.hardware_worker = hardware_worker
+        self.backend = hardware_worker  # Backward-compatibility alias
+        if hardware_worker is not None:
+            self.max_context = getattr(hardware_worker, "max_context", max_context)
+            self.batch = int(getattr(hardware_worker, "batch", self.batch) or self.batch)
+        elif not self.standalone_mode and "exe" in self.cfg:
             try:
-                from hydragen.server.server import HardwareExecutionWorker, StrataEngine, engine_args
+                from hydragen.server.server import HardwareExecutionWorker, engine_args
             except ImportError:
-                try:
-                    from hydragen.server.server import StrataEngine as HardwareExecutionWorker, engine_args
-                except ImportError:
-                    from serve.server import StrataEngine as HardwareExecutionWorker, engine_args
+                from serve.server import StrataEngine as HardwareExecutionWorker, engine_args
 
             exe = (
                 self.cfg["exe"]
                 if os.path.isabs(self.cfg["exe"])
-                else os.path.abspath(
-                    os.path.join(self.cfg.get("cwd") or ".", self.cfg["exe"])
-                )
+                else os.path.abspath(os.path.join(self.cfg.get("cwd") or ".", self.cfg["exe"]))
             )
             args_list = engine_args(self.cfg)
             log_path = self.cfg.get("log") or os.environ.get("HYDRAGEN_LOG") or os.path.join(self.cfg.get("cwd") or ".", "hydragen.log")
-            env = self.cfg.get("env")
             print(f"[hydragen] Initializing HardwareExecutionWorker: {exe}")
             try:
                 self.hardware_worker = HardwareExecutionWorker(
-                    exe, args_list, cwd=self.cfg.get("cwd"), log=log_path, env=env
+                    exe, args_list, cwd=self.cfg.get("cwd"), log=log_path, env=self.cfg.get("env")
                 )
-                self.backend = self.hardware_worker  # Backward-compatibility alias
+                self.backend = self.hardware_worker
                 self.max_context = getattr(self.hardware_worker, "max_context", max_context)
                 self.batch = int(getattr(self.hardware_worker, "batch", self.batch) or self.batch)
-                reserve_val = int(self.cfg.get("vram_reserve_mib") or 680)
-                self.hardware_worker.vram(reserve_mib=reserve_val, timeout=30.0)
             except Exception as e:
                 print(f"[hydragen] Hardware worker notice: {e}")
 
@@ -261,6 +258,25 @@ class HydragenEngine:
             "drafting_mode": self.drafter.mode.value,
         }
         self.last: Dict[str, Any] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        """Anything the engine does not define (silence_s, spawn, death_note, restart, ...) is the worker's."""
+        if name.startswith("__") or name in ("hardware_worker", "backend"):
+            raise AttributeError(name)
+        worker = self.__dict__.get("hardware_worker")
+        if worker is None:
+            raise AttributeError(name)
+        return getattr(worker, name)
+
+    _WORKER_OWNED = ("gpu_busy", "silence_s", "silent_note")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """The stall watchdog reads these on the worker, so a write through the engine must land there."""
+        worker = self.__dict__.get("hardware_worker")
+        if name in self._WORKER_OWNED and worker is not None:
+            setattr(worker, name, value)
+            return
+        object.__setattr__(self, name, value)
 
     def slots_view(self) -> List[Dict[str, Any]]:
         """Unified telemetry view showing active slot state, prompt read, speed, and paged KV blocks."""
