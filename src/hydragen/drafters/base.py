@@ -74,3 +74,45 @@ class SpeculativeDrafter(ABC):
     def accept_feedback(self, n_accepted: int) -> None:
         """Updates internal acceptance telemetry and adaptive thresholds."""
         ...
+
+
+class WorkerDelegatedDrafter(SpeculativeDrafter):
+    """Speculative drafter managed by the hardware execution worker (e.g. bin/strata)."""
+
+    def __init__(self, mode: DraftingMode = DraftingMode.MTP, name: Optional[str] = None):
+        self._mode = mode
+        if name:
+            self._name = name
+        elif mode == DraftingMode.MTP:
+            self._name = "mtp_autoregressive_drafter"
+        elif mode == DraftingMode.DFLASH2:
+            self._name = "dflash2_block_drafter"
+        else:
+            self._name = "speculative_drafting_worker"
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def mode(self) -> DraftingMode:
+        return self._mode
+
+    def is_available(self) -> bool:
+        return True
+
+    def prefill_step(self, prompt_tokens: torch.Tensor, hidden_states: torch.Tensor) -> None:
+        pass
+
+    def draft(
+        self,
+        anchor_token: int,
+        hidden_state: torch.Tensor,
+        n_tokens: int = 4,
+        **kwargs: Any,
+    ) -> DraftCandidate:
+        return DraftCandidate(tokens=[], confidence=1.0, source="hardware_worker")
+
+    def accept_feedback(self, n_accepted: int) -> None:
+        pass
+

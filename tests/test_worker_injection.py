@@ -1,4 +1,4 @@
-﻿# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: Apache-2.0
 """tests/test_worker_injection.py - HydragenEngine wraps a server-built hardware worker."""
 
 import os
@@ -75,6 +75,18 @@ class TestWorkerInjection(unittest.TestCase):
         eng = HydragenEngine({}, None, batch_slots=2, standalone_mode=True)
         with self.assertRaises(AttributeError):
             eng.spawn
+
+    def test_worker_drafter_delegation_mtp(self):
+        cfg = {"args": ["--spec", "4", "--mtp", "models/mtp/rt"]}
+        eng = HydragenEngine(cfg, None, hardware_worker=FakeWorker())
+        self.assertEqual(eng.info["drafter"], "mtp_autoregressive_drafter")
+        self.assertEqual(eng.info["drafting_mode"], "mtp")
+
+    def test_worker_drafter_delegation_dflash2(self):
+        cfg = {"args": ["--draft", "dflash2"]}
+        eng = HydragenEngine(cfg, None, hardware_worker=FakeWorker())
+        self.assertEqual(eng.info["drafter"], "dflash2_block_drafter")
+        self.assertEqual(eng.info["drafting_mode"], "dflash2")
 
 
 if __name__ == "__main__":

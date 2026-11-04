@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """src/hydragen/drafters/__init__.py - Pluggable Speculative Drafter Architecture."""
 
-from hydragen.drafters.base import DraftCandidate, DraftingMode, SpeculativeDrafter
+from hydragen.drafters.base import (
+    DraftCandidate,
+    DraftingMode,
+    SpeculativeDrafter,
+    WorkerDelegatedDrafter,
+)
 from hydragen.drafters.dflash2 import DFlash2Drafter
 from hydragen.drafters.factory import (
     DisabledDrafter,
@@ -14,6 +19,7 @@ __all__ = [
     "DraftingMode",
     "DraftCandidate",
     "SpeculativeDrafter",
+    "WorkerDelegatedDrafter",
     "MtpDrafter",
     "DFlash2Drafter",
     "DisabledDrafter",

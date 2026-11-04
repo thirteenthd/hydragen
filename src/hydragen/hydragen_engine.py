@@ -199,21 +199,39 @@ class HydragenEngine:
                 print(f"[hydragen] Hardware worker notice: {e}")
 
         # 6. Speculative Drafter Architecture
-        from hydragen.drafters import DisabledDrafter, get_speculative_drafter
-        mtp_path = os.path.join(self.cfg.get("cwd") or ".", "models/mtp/rt")
-        try:
-            self.drafter = get_speculative_drafter(
-                hardware_backend=self.hw,
-                device=self.device,
-                n_embd=self.n_embd,
-                hc=4,
-                n_head_kv=2,
-                head_dim=128,
-                max_context=self.max_context,
-                mtp_dir=mtp_path if os.path.exists(mtp_path) else None,
-            )
-        except Exception:
-            self.drafter = DisabledDrafter()
+        from hydragen.drafters import DisabledDrafter, WorkerDelegatedDrafter, get_speculative_drafter
+        from hydragen.drafters.base import DraftingMode
+
+        worker_args = self.cfg.get("args") or []
+        if self.hardware_worker is not None:
+            # Under Option C, speculative drafting is executed natively inside the hardware worker
+            # process (bin/strata with --mtp / --spec / --draft). We delegate drafter telemetry
+            # to the worker rather than allocating redundant PyTorch GPU tensors that would OOM.
+            has_dflash = "--draft" in worker_args and "dflash2" in worker_args
+            has_mtp = "--mtp" in worker_args or any(isinstance(a, str) and a.startswith("--mtp") for a in worker_args)
+            has_spec = "--spec" in worker_args or any(isinstance(a, str) and a.startswith("--spec") for a in worker_args)
+
+            if has_dflash:
+                self.drafter = WorkerDelegatedDrafter(mode=DraftingMode.DFLASH2, name="dflash2_block_drafter")
+            elif has_mtp or has_spec:
+                self.drafter = WorkerDelegatedDrafter(mode=DraftingMode.MTP, name="mtp_autoregressive_drafter")
+            else:
+                self.drafter = DisabledDrafter()
+        else:
+            mtp_path = os.path.join(self.cfg.get("cwd") or ".", "models/mtp/rt")
+            try:
+                self.drafter = get_speculative_drafter(
+                    hardware_backend=self.hw,
+                    device=self.device,
+                    n_embd=self.n_embd,
+                    hc=4,
+                    n_head_kv=2,
+                    head_dim=128,
+                    max_context=self.max_context,
+                    mtp_dir=mtp_path if os.path.exists(mtp_path) else None,
+                )
+            except Exception:
+                self.drafter = DisabledDrafter()
 
         # 7. Priority Wait Queue for Locality-Aware Admission
         self.wait_queue: List[Dict[str, Any]] = []
