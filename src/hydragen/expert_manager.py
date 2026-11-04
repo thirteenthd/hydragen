@@ -129,23 +129,8 @@ class PagedExpertManager:
                 self.staging_gate_u8 = None
                 self.staging_up_u8 = None
                 self.staging_down_u8 = None
-
-                # Milestone 4: Concurrent CPU+GPU Hybrid Expert Mailbox (opt-in via HYDRAGEN_ENABLE_MAILBOX=1 or enable_mailbox=True)
-                if self._enable_mailbox is not None:
-                    enable_box = bool(self._enable_mailbox)
-                else:
-                    enable_box = (os.environ.get("HYDRAGEN_ENABLE_MAILBOX", "0").lower() in ("1", "true", "yes"))
-                if enable_box:
-                    try:
-                        from hydragen.expert_mailbox import HybridExpertMailbox
-                        self.mailbox = HybridExpertMailbox(device=device, hw_backend=self.hw)
-                    except Exception:
-                        self.mailbox = None
-                else:
-                    self.mailbox = None
             else:
                 self.host_pool = None
-                self.mailbox = None
                 max_proj_bytes = 1536 * 1024
                 self.staging_gate_u8 = self.hw.empty_tensor(
                     (max_proj_bytes,), dtype=torch.uint8, device=device
@@ -156,6 +141,22 @@ class PagedExpertManager:
                 self.staging_down_u8 = self.hw.empty_tensor(
                     (max_proj_bytes,), dtype=torch.uint8, device=device
                 )
+
+        # Milestone 4: Concurrent CPU+GPU Hybrid Expert Mailbox (opt-in via HYDRAGEN_ENABLE_MAILBOX=1 or enable_mailbox=True)
+        if self._enable_mailbox is not None:
+            enable_box = bool(self._enable_mailbox)
+        else:
+            enable_box = (os.environ.get("HYDRAGEN_ENABLE_MAILBOX", "0").lower() in ("1", "true", "yes"))
+        if enable_box:
+            try:
+                from hydragen.expert_mailbox import HybridExpertMailbox
+                self.mailbox = HybridExpertMailbox(device=device, hw_backend=self.hw)
+                print(f"[hydragen] CPU HybridExpertMailbox activated ({self.mailbox.max_workers} worker threads)")
+            except Exception as exc:
+                print(f"[hydragen] CPU HybridExpertMailbox init failed: {exc}")
+                self.mailbox = None
+        else:
+            self.mailbox = None
 
         # 3. GPU-resident Indirection Table for Triton / hardware kernels
         # gpu_slot_table[expert_id] == slot_idx (or -1 if not resident)

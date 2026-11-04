@@ -91,6 +91,10 @@ class HydragenEngine:
         self.route_prior = float(
             env_cfg.get("STRATA_ROUTE_PRIOR", os.environ.get("STRATA_ROUTE_PRIOR", "0.85"))
         )
+        self.enable_mailbox = (
+            str(env_cfg.get("HYDRAGEN_ENABLE_MAILBOX", os.environ.get("HYDRAGEN_ENABLE_MAILBOX", "0"))).lower()
+            in ("1", "true", "yes")
+        )
 
         # 1. Hardware Backend Resolution (Decoupled from CUDA)
         self.hw = BackendRegistry.get_hardware_backend()
@@ -148,6 +152,7 @@ class HydragenEngine:
                     loader=self.loader,
                     default_layer_idx=0,
                     hw_backend=self.hw,
+                    enable_mailbox=self.enable_mailbox,
                 )
                 try:
                     self.router_gates[0] = self.loader.load_router_gate(0, device=self.device)
@@ -437,6 +442,11 @@ class HydragenEngine:
                 last_dict["prompt_ms"] = round((t_first_token - t_start) * 1000.0, 1)
             if self.expert_manager is not None:
                 last_dict["moe_hit_rate"] = round(self.expert_manager.hit_rate, 4)
+                if getattr(self.expert_manager, "mailbox", None) is not None:
+                    mb = self.expert_manager.mailbox
+                    last_dict["mailbox_cpu_experts"] = mb.total_cpu_experts
+                    last_dict["mailbox_gpu_experts"] = mb.total_gpu_experts
+                    last_dict["mailbox_fusions"] = mb.total_fusions
             if cancel.is_set():
                 last_dict["finish"] = "cancel"
             self.last = last_dict
