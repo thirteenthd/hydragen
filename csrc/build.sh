@@ -81,11 +81,46 @@ g++ -shared -fPIC \
     -Wl,-rpath,"\$ORIGIN/../src/hydragen/server:\$ORIGIN/../serve" \
     -o "${LIB_DIR}/libstrata_trtllm_plugin.so"
 
-echo "[5/5] Compiling and linking libstrata_fast_ipc.so (Lock-Free C++ Ring Buffer)..."
+echo "[5/6] Compiling and linking libstrata_fast_ipc.so (Lock-Free C++ Ring Buffer)..."
 g++ -O3 -fPIC -std=c++17 -pthread -shared \
     -I"${SCRIPT_DIR}/ipc" \
     "${SCRIPT_DIR}/ipc/strata_fast_ipc.cpp" \
     -o "${LIB_DIR}/libstrata_fast_ipc.so"
+
+echo "[6/6] Compiling and linking libhydragen_core.so (Native C++ Unified Engine)..."
+g++ -c -O3 -fPIC -std=c++17 \
+    -I"${SCRIPT_DIR}/include" \
+    -I"${SCRIPT_DIR}/paged_attention" \
+    -I"${SCRIPT_DIR}/core" \
+    "${SCRIPT_DIR}/core/native_scheduler.cpp" \
+    -o "${BUILD_DIR}/native_scheduler.o"
+
+g++ -c -O3 -fPIC -std=c++17 \
+    -I"${SCRIPT_DIR}/core" \
+    "${SCRIPT_DIR}/core/native_locality.cpp" \
+    -o "${BUILD_DIR}/native_locality.o"
+
+g++ -c -O3 -fPIC -std=c++17 \
+    -I"${SCRIPT_DIR}/include" \
+    -I"${SCRIPT_DIR}/paged_attention" \
+    -I"${SCRIPT_DIR}/core" \
+    "${SCRIPT_DIR}/core/hydragen_engine.cpp" \
+    -o "${BUILD_DIR}/hydragen_engine.o"
+
+g++ -c -O3 -fPIC -std=c++17 \
+    -I"${SCRIPT_DIR}/include" \
+    -I"${SCRIPT_DIR}/paged_attention" \
+    -I"${SCRIPT_DIR}/core" \
+    "${SCRIPT_DIR}/core/hydragen_engine_c_api.cpp" \
+    -o "${BUILD_DIR}/hydragen_engine_c_api.o"
+
+g++ -shared -fPIC -pthread \
+    "${BUILD_DIR}/paged_kv_manager.o" \
+    "${BUILD_DIR}/native_scheduler.o" \
+    "${BUILD_DIR}/native_locality.o" \
+    "${BUILD_DIR}/hydragen_engine.o" \
+    "${BUILD_DIR}/hydragen_engine_c_api.o" \
+    -o "${LIB_DIR}/libhydragen_core.so"
 
 echo "====================================================="
 echo "Build complete! Staging to ${PKG_LIB_DIR}..."

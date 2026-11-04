@@ -166,13 +166,17 @@ class HydragenEngine:
             self.n_ff = 640
             self.n_exp = 512
 
-        # 5. Resident Pipeline Worker (Strata C++/CUDA Worker if configured)
+        # 5. Resident Hardware Execution Worker (bin/strata C++/CUDA Worker)
+        self.hardware_worker = None
         self.backend = None
         if not self.standalone_mode and "exe" in self.cfg:
             try:
-                from hydragen.server.server import StrataEngine, engine_args
+                from hydragen.server.server import HardwareExecutionWorker, StrataEngine, engine_args
             except ImportError:
-                from serve.server import StrataEngine, engine_args
+                try:
+                    from hydragen.server.server import StrataEngine as HardwareExecutionWorker, engine_args
+                except ImportError:
+                    from serve.server import StrataEngine as HardwareExecutionWorker, engine_args
 
             exe = (
                 self.cfg["exe"]
@@ -184,17 +188,18 @@ class HydragenEngine:
             args_list = engine_args(self.cfg)
             log_path = self.cfg.get("log") or os.environ.get("HYDRAGEN_LOG") or os.path.join(self.cfg.get("cwd") or ".", "hydragen.log")
             env = self.cfg.get("env")
-            print(f"[hydragen] Launching unified pipeline worker: {exe}")
+            print(f"[hydragen] Initializing HardwareExecutionWorker: {exe}")
             try:
-                self.backend = StrataEngine(
+                self.hardware_worker = HardwareExecutionWorker(
                     exe, args_list, cwd=self.cfg.get("cwd"), log=log_path, env=env
                 )
-                self.max_context = getattr(self.backend, "max_context", max_context)
-                self.batch = int(getattr(self.backend, "batch", self.batch) or self.batch)
+                self.backend = self.hardware_worker  # Backward-compatibility alias
+                self.max_context = getattr(self.hardware_worker, "max_context", max_context)
+                self.batch = int(getattr(self.hardware_worker, "batch", self.batch) or self.batch)
                 reserve_val = int(self.cfg.get("vram_reserve_mib") or 680)
-                self.backend.vram(reserve_mib=reserve_val, timeout=30.0)
+                self.hardware_worker.vram(reserve_mib=reserve_val, timeout=30.0)
             except Exception as e:
-                print(f"[hydragen] Pipeline worker notice: {e}")
+                print(f"[hydragen] Hardware worker notice: {e}")
 
         # 6. Speculative Drafter Architecture
         from hydragen.drafters import DisabledDrafter, get_speculative_drafter
@@ -282,9 +287,31 @@ class HydragenEngine:
         return view
 
     def vram(self, reserve_mib: Optional[int] = None, timeout: float = 30.0) -> Optional[int]:
-        if self.backend is not None and hasattr(self.backend, "vram"):
-            return self.backend.vram(reserve_mib=reserve_mib, timeout=timeout)
+        worker = self.hardware_worker or self.backend
+        if worker is not None and hasattr(worker, "vram"):
+            return worker.vram(reserve_mib=reserve_mib, timeout=timeout)
         return reserve_mib or 0
+
+    def close(self) -> None:
+        worker = self.hardware_worker or self.backend
+        if worker is not None and hasattr(worker, "close"):
+            worker.close()
+
+    def restart(self) -> None:
+        worker = self.hardware_worker or self.backend
+        if worker is not None and hasattr(worker, "restart"):
+            worker.restart()
+
+    def alive(self) -> bool:
+        worker = self.hardware_worker or self.backend
+        if worker is not None and hasattr(worker, "alive"):
+            return worker.alive()
+        return True
+
+    def unload(self) -> None:
+        worker = self.hardware_worker or self.backend
+        if worker is not None and hasattr(worker, "unload"):
+            worker.unload()
 
     def _acquire_locality_slot(
         self,

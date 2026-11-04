@@ -2781,6 +2781,11 @@ def vision_start_error(line: str, log=None, code: int | None = None, waited: flo
     return msg
 
 
+# Unified Hardware Worker Aliases
+HardwareExecutionWorker = StrataEngine
+StrataHardwareWorker = StrataEngine
+
+
 class Vision:
     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
@@ -8865,8 +8870,12 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             event_sink = None
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--engine", choices=["mock", "strata", "hydragen", "vllm", "trtllm"], default="mock")
-    ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
+    ap.add_argument("--engine", default="hydragen",
+                    help="Engine architecture (default: hydragen). Note: engine selection is retired; "
+                         "'hydragen' is the unified engine with HardwareExecutionWorker. 'mock' is available for offline testing.")
+    ap.add_argument("--mock", action="store_true",
+                    help="Run offline MockEngine without hardware (for tests and offline validation)")
+    ap.add_argument("--config", help="engine config (JSON: exe, args, cwd, tokenizer, model_name), "
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other devices "
@@ -8944,7 +8953,13 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                          "{\"prefill_gpu\": 0, \"decode_gpu\": 1}; docs/SPLIT_SERVE.md)")
     launch_args = list(sys.argv[1:] if argv is None else argv)
     a = ap.parse_args(launch_args)
-    if a.engine == "strata" and (_rt := rttime_limit_note()):   # #3238: say it before the first unexplained -9
+    if a.mock or a.engine == "mock":
+        a.engine = "mock"
+    elif a.engine in ("strata", "vllm", "trtllm"):
+        print(f"[hydragen] Notice: --engine {a.engine} is deprecated. Engine selection is retired in favor of the unified HydragenEngine with HardwareExecutionWorker.", flush=True)
+        a.engine = "hydragen"
+
+    if a.engine in ("strata", "hydragen") and (_rt := rttime_limit_note()):   # #3238: say it before the first unexplained -9
         print("[strata] WARNING: " + _rt, flush=True)
     global OPENS_BROWSER
     OPENS_BROWSER = bool(a.open)
@@ -8975,9 +8990,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     split_joined_args(cfg)
     if a.config:
         cfg_engine = cfg.get("engine")
-        if cfg_engine and a.engine == "mock":
+        if cfg_engine and a.engine == "mock" and not a.mock:
             a.engine = str(cfg_engine).lower()
-    if a.config and a.engine == "strata":
+            if a.engine in ("strata", "vllm", "trtllm"):
+                a.engine = "hydragen"
+    if a.config and a.engine in ("strata", "hydragen"):
         cfg = apply_saved_tuning(cfg)
     attestation_key = os.environ.pop("STRATA_OWNER_ATTEST_KEY", None)
     launch_attestation = None
@@ -9052,7 +9069,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
-    if a.engine == "strata" and not (tpath / "vocab.json").exists():
+    if a.engine in ("strata", "hydragen") and not (tpath / "vocab.json").exists():
         ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
     if (tpath / "vocab.json").exists():
         import strata_tokenizer as ST
@@ -9082,9 +9099,12 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if blocked:
             ap.error("--offline cannot be strict for this profile: " + "; ".join(blocked))
     lazy = a.lazy or (cfg.get("lazy_load") is True if cfg else False)
-    if a.engine == "strata":
+    groups = []
+    split = None
+    env = {}
+    if a.engine == "hydragen":
         if not cfg:
-            ap.error("--engine strata needs --config")
+            ap.error("Unified HydragenEngine needs --config")
         cfg = with_component_engine(cfg)
         vision = None
         # The engine's own environment. It carries the offline policy too: an engine that fetched a
@@ -9094,7 +9114,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
-            print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
+            print(f"[hydragen] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
         for line in card_roles_lines(cfg):             # the card roles: said first; every card Off stops here, before anything touches a card
             print(line, flush=True)
@@ -9110,19 +9130,12 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             if engine_component.is_reference(cfg["vision"].get("exe")):     # the engine from the component folder
                 vcfg["exe"] = _component_exe(cfg["vision"]["exe"], cfg)
             if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
-                print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
-                      "encoder its VRAM): the encoder starts with the model instead", flush=True)
+                print('[hydragen] the vision section\'s "elastic" needs "vram_elastic": true: the encoder starts with the model instead', flush=True)
                 vcfg["elastic"] = False
-            elif vcfg.get("elastic") is True and layer_split_of(cfg):
-                # the engine turns --vram-elastic off on a layer split (a cache per GPU): the encoder still starts
-                # with the first picture and stops when idle, but its VRAM has to be free already
-                print('[strata] images: on a layer split the expert cache cannot make room for the image encoder (the '
-                      'engine turns --vram-elastic off); keep its VRAM free with "--vram-reserve-mib" on the '
-                      "encoder's GPU, or the first picture may not get it", flush=True)
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                             env=vision_env(cfg, env), lazy=lazy)
         print("model unloaded; the first request loads it ..." if lazy else
-              "loading the model (the first start takes a minute or two) ...", flush=True)
+              "loading the model into Hydragen unified engine (with HardwareExecutionWorker) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
         note = card_note(cfg, env)
         if note:
@@ -9130,71 +9143,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         igpu_line = igpu_split_warning(cfg)
         if igpu_line:
             print(igpu_line, flush=True)
-        if layer_split_of(cfg):
-            try:
-                split = layer_split_value(cfg)          # #644: before the (minutes-long) start
-            except ValueError as e:
-                raise SystemExit(f"[strata] config {e}")
-            print(f"[strata] layer split across GPUs {gpu_list(cfg)} ({split})", flush=True)
-        elif len(gpu_list(cfg)) > 1:
-            print(f"[strata] GPUs {gpu_list(cfg)}: the later card(s) serve as the peer expert tier (--peer-device)",
-                  flush=True)
-        # a relative "exe" is the config's cwd's: Windows' CreateProcess resolves "engine/strata.exe" against nothing
-        # it is told about (WinError 2), so it is made absolute here
-        if engine_component.is_reference(cfg["exe"]):      # "component:strata-engine": the engine package for this PC
-            exe = _component_exe(cfg["exe"], cfg)
-        else:
-            exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
-        try:
-            silence = engine_silence_s(cfg)             # #481: checked before the (minutes-long) start
-            apply_ready_timeout(cfg)
-        except ValueError as e:
-            raise SystemExit(f"[strata] config {e}")
-        try:
-            effort_end = effort_end_args(cfg, exe, tok)  # #458
-        except ValueError as e:
-            raise SystemExit(f"[strata] config {e}")
-        from hydragen.server import replicas as rp
-        try:
-            groups = rp.gpu_groups(cfg)
-        except rp.ReplicaConfigError as e:
-            raise SystemExit(f"[strata] config {e}")
-        from hydragen.server import split as split_mod
-        try:
-            split = split_mod.split_spec(cfg)
-            if split:
-                split_mod.check_cfg(cfg, split)
-        except split_mod.SplitConfigError as e:
-            raise SystemExit(f"[strata] config {e}")
-        if groups:
-            engine = start_replicas(cfg, groups, exe, effort_end or [], lazy, offline=a.offline)
-        elif split:
-            engine = start_split(cfg, split, exe, effort_end or [], lazy, offline=a.offline)
-        else:
-            engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
-                                  env=env, lazy=lazy)
-        engine.silence_s = silence                      # an attribute of its own: restart() keeps it
-        warn_tight_ram(engine.info.get("arena_mib"))
-        note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
-                                 linux_desktop()) if not groups and not split else None
-        if note:                                        # #560 #516: before --open starts a browser on that card
-            print(note, flush=True)
-    elif a.engine in ("hydragen", "vllm", "trtllm"):
+
         effort_end = None
         from hydragen.hydragen_engine import HydragenEngine
         engine = HydragenEngine(cfg, tok, batch_slots=a.parallel or 4)
-        vision = None
-        if cfg.get("vision"):
-            print("loading the vision encoder ...", flush=True)
-            vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
-                        if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
-                    for k, v in cfg["vision"].items() if not (k == "exe" and engine_component.is_reference(v))}
-            if engine_component.is_reference(cfg["vision"].get("exe")):
-                vcfg["exe"] = _component_exe(cfg["vision"]["exe"], cfg)
-            env = child_env(cfg, offline=a.offline)
-            vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=vision_env(cfg, env), lazy=lazy)
-        sampling_defaults = sampling_defaults_from_config(cfg)
     else:
         effort_end = None
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
@@ -9217,7 +9169,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
     svc.launch_attestation = launch_attestation
-    if (cfg.get("arch") or "") == "deepseek41" and vision is None and a.engine == "strata":
+    if (cfg.get("arch") or "") == "deepseek41" and vision is None and a.engine in ("strata", "hydragen"):
         # DeepSeek-V4.1 reads pictures with the engine's own tower (--vision on, the default): no separate reader process.
         # `--vision off` in the config's args, or a pack without a tower, leaves svc.vision None: pictures are refused with the 400 as before.
         _dsp = DsPictures.from_config(cfg, tmp_dir=Path(cfg["log"]).parent / "ds-pictures" if cfg.get("log") else None)
@@ -9227,7 +9179,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.offline = a.offline
     svc.max_queue = max_queue
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
-    if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
+    if a.engine in ("strata", "hydragen"):                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
         svc.set_family(svc.model_arch if svc.model_arch == "deepseek41" else None)
         requested = cfg.get("parallel")
@@ -9363,19 +9315,19 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.reasoning_loop_recovery = recovery
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
-    if a.engine == "strata" and groups:                 # replicas: every card of every group
+    if a.engine in ("strata", "hydragen") and groups:                 # replicas: every card of every group
         svc.gpu_indices = [c for g in groups for c in g]
         svc.gpu_index = svc.gpu_indices[0]
         svc.replica_gpu_groups = groups
-    if a.engine == "strata" and split:                  # split serving: the two cards (the prefill card first)
+    if a.engine in ("strata", "hydragen") and split:                  # split serving: the two cards (the prefill card first)
         svc.gpu_indices = [split["prefill_gpu"], split["decode_gpu"]]
         svc.gpu_index = split["decode_gpu"]
-    svc.terminal_visibility_order = visible_device_order(env, cfg.get("backend")) if a.engine == "strata" else []
-    svc.terminal_topology_mode = ("replicas (configured)" if a.engine == "strata" and groups
-                                  else "split serve (configured)" if a.engine == "strata" and split
-                                  else "layer split (configured)" if a.engine == "strata" and layer_split_of(cfg)
-                                  else "single GPU or CPU" if a.engine == "strata" else "mock")
-    svc.terminal_configured_split = (layer_split_value(cfg) if a.engine == "strata" and layer_split_of(cfg)
+    svc.terminal_visibility_order = visible_device_order(env, cfg.get("backend")) if a.engine in ("strata", "hydragen") else []
+    svc.terminal_topology_mode = ("replicas (configured)" if a.engine in ("strata", "hydragen") and groups
+                                  else "split serve (configured)" if a.engine in ("strata", "hydragen") and split
+                                  else "layer split (configured)" if a.engine in ("strata", "hydragen") and layer_split_of(cfg)
+                                  else "single GPU or CPU" if a.engine in ("strata", "hydragen") else "mock")
+    svc.terminal_configured_split = (layer_split_value(cfg) if a.engine in ("strata", "hydragen") and layer_split_of(cfg)
                                      else None)
     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)
     if a.config:
