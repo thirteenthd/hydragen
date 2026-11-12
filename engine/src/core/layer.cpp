@@ -968,6 +968,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     if (p.mode == 0) {
         std::vector<int32_t> tab((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) tab[(size_t) i] = (int32_t) i;
+        if (std::getenv("STRATA_COW_PERMUTE") != nullptr) {   // cow-m1 validation: a legal non-identity layout
+            for (int64_t i = 0; i + 1 < pages; i += 2) std::swap(tab[(size_t) i], tab[(size_t) (i + 1)]);
+        }
         cudaMemcpy(st.page_table, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
     } else if (p.mode == 1) {
         strata::kernels::kv_stream_reset(st.map, nullptr);
