@@ -4321,6 +4321,13 @@ int main(int argc, char** argv) {
         return 2;
     }
     strata::core::qsa_set_kv_resident(o.kv_resident);
+    {   // cow-m1: global K/V slot arenas (opt-in; streamed INT8 only)
+        const char* en = std::getenv("STRATA_COW_ARENA");
+        const char* ns = std::getenv("STRATA_COW_ARENA_SLOTS");
+        if (en != nullptr && en[0] == '1' && o.kv_resident > 0 && o.kv == "int8")
+            strata::core::qsa_set_cow_arena(ns != nullptr ? std::atoll(ns)
+                                                          : 4 * (o.kv_resident / 4));   // page_size = 4 cells
+    }
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
     // up to 2 tokens longer; the draft policy (strata/spec/draft_policy.hpp) takes one only where it pays. Code
     // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.

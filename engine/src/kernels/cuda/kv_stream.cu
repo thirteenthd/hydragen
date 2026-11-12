@@ -104,8 +104,12 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
             ++lookups;
             const int sl = m.page_table[b];
             if (sl >= 0) {
-                m.slot_stamp[sl] = epoch;
-                m.slot_ref[sl] = 1;
+                // cow-m1: an entry may name a slot outside this map's own arena range (a shared
+                // page from another session): the stamp/ref arrays are local, the owner's clock governs.
+                if (sl >= m.slot_base && sl < m.slot_base + (int) m.n_slots) {
+                    m.slot_stamp[sl - m.slot_base] = epoch;
+                    m.slot_ref[sl - m.slot_base] = 1;
+                }
             } else if (sl == -1 && atomicCAS(&m.page_table[b], -1, -2) == -1) {
                 m.miss_block[atomicAdd(&s_nmiss, 1)] = b;
             }
@@ -150,7 +154,7 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
         m.slot_block[sl] = b;
         m.slot_stamp[sl] = epoch;
         m.slot_ref[sl] = 1;
-        m.page_table[b] = sl;
+        m.page_table[b] = sl + (int) m.slot_base;   // cow-m1: the table names global arena pages
     }
     if (threadIdx.x == 0) {
         m.ctl[0] = epoch;
@@ -171,7 +175,7 @@ __global__ void copy_kernel(KvStreamMap m, Runs r) {
         const long long b = m.miss_block[k], sl = m.miss_slot[k];
         for (int a = 0; a < r.n; ++a) {
             const uint4* src = reinterpret_cast<const uint4*>(r.src[a] + b * r.len[a]);
-            uint4* dst = reinterpret_cast<uint4*>(r.dst[a] + sl * r.len[a]);
+            uint4* dst = reinterpret_cast<uint4*>(r.dst[a] + (sl + m.slot_base) * r.len[a]);   // cow-m1
             for (int i = threadIdx.x; i < r.len[a] / 16; i += blockDim.x) dst[i] = src[i];
         }
     }

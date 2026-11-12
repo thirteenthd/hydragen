@@ -106,11 +106,13 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     s.qsa_buf_arena = take(qsa_buffers_bytes(g, max_cells));
 
     uint8_t* qp = (uint8_t*) s.qsa_state_arena;
+    qsa_cow_session_begin();   // cow-m1: claim this session's range in the K/V slot arenas
     // a layer whose pinned RAM could not be had (KV streaming's host copy) is half-built: going on would have the
     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
     for (int64_t j = 0; j < s.qsa_alloc; ++j)
         if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
-                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0]) == 0)
+                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0],
+                           0, s.qsa_ord0 + j) == 0)
             return 0;
     qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
 

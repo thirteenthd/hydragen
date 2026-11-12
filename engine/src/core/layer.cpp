@@ -624,6 +624,14 @@ uint8_t* kv_host_alloc(uint64_t bytes) {
 // ---- the elastic K/V (--kv-grow): one VMM range per state, each pool array at a chunk boundary in it
 bool g_kv_elastic = false;
 int64_t g_kv_elastic_init = 16384;
+// cow-m1: global K/V slot arenas, one per QSA ordinal (share-at-fork CoW; M-C1a: private ranges only).
+bool g_cow_arena = false;
+int64_t g_cow_arena_slots = 0;
+namespace {
+struct CowArena { int8_t* k = nullptr; int8_t* v = nullptr; uint16_t* ks = nullptr; uint16_t* vs = nullptr; };
+std::vector<CowArena> g_cow_arenas;
+int64_t g_cow_session_ctr = -1;
+}
 struct ElasticPool {
     strata::core::VmmRange range;
     std::vector<uint64_t> off, per_slot;   // each array's offset in the range (whole chunks) and bytes per page slot
@@ -785,6 +793,12 @@ int64_t qsa_kv_resident_min() {
 }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
+void qsa_set_cow_arena(int64_t slots_per_layer) {   // cow-m1 (extern scope; the globals are file-local)
+    g_cow_arena = slots_per_layer > 0;
+    g_cow_arena_slots = slots_per_layer;
+}
+void qsa_cow_session_begin() { ++g_cow_session_ctr; }
+
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
@@ -805,11 +819,12 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 }
 
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope, int64_t ring_cells) {
+                        const QsaState* share_rope, int64_t ring_cells, int64_t qsa_ordinal) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     const int64_t pages = p.pages;
     Cursor c{(uint8_t*) base};
+    int64_t cow_sb = 0;   // cow-m1: this state's slot_base in the layer arena (0: private pool)
     st.kv_int8 = g_kv_int8 && !g_kv_q4;
     st.kv_q4 = g_kv_q4;
     // Hybrid K8V4, main layers only (the drafter's state is created with the globals toggled to INT8 -
@@ -876,6 +891,53 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.k_pool = c.take<uint16_t>(rows * s.head_dim);
         st.v_pool = c.take<uint16_t>(rows * s.head_dim);
     }
+    if (g_cow_arena && p.mode == 1 && st.kv_int8 && !st.kv_q4) {
+        // cow-m1: the streamed INT8 state's slots live in its layer's global arena, range
+        // [session * n_slots, (session + 1) * n_slots). The private carve above stays for now:
+        // M-C1a proves the plumbing; the pricing drops it next.
+        if (qsa_ordinal < 0 || qsa_ordinal >= g.n_qsa_layers()) {
+            std::fprintf(stderr, "cow: a streamed state initialized without its QSA ordinal\n");
+            return 0;
+        }
+        if (g_cow_arenas.empty()) {
+            const uint64_t nc = (uint64_t) s.n_head_kv * s.page_size;
+            const uint64_t kb = (uint64_t) g_cow_arena_slots * nc * s.head_dim;
+            const uint64_t sb2 = (uint64_t) g_cow_arena_slots * nc * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+            bool ok = true;
+            g_cow_arenas.resize((size_t) g.n_qsa_layers());
+            for (int64_t j = 0; j < g.n_qsa_layers() && ok; ++j) {
+                CowArena& a = g_cow_arenas[(size_t) j];
+                ok = cudaMalloc((void**) &a.k, kb) == cudaSuccess && cudaMalloc((void**) &a.v, kb) == cudaSuccess &&
+                     cudaMalloc((void**) &a.ks, sb2) == cudaSuccess && cudaMalloc((void**) &a.vs, sb2) == cudaSuccess;
+            }
+            if (ok)
+                std::fprintf(stderr, "cow: K/V arenas: %lld QSA layers x %lld slots = %.2f GiB (INT8 streamed)\n",
+                             (long long) g.n_qsa_layers(), (long long) g_cow_arena_slots,
+                             (double) g.n_qsa_layers() * 2.0 * (kb + sb2) / 1073741824.0);
+            if (!ok) {
+                std::fprintf(stderr, "cow: the K/V arenas could not be allocated: falling back to private pools\n");
+                for (CowArena& a : g_cow_arenas) {
+                    cudaFree(a.k); cudaFree(a.v); cudaFree(a.ks); cudaFree(a.vs);
+                }
+                g_cow_arenas.clear();
+                g_cow_arena = false;
+            }
+        }
+        if (g_cow_arena) {
+            const int64_t so = (g_cow_session_ctr < 0 ? 0 : g_cow_session_ctr) * p.slots;
+            if (so + p.slots > g_cow_arena_slots) {
+                std::fprintf(stderr, "cow: no room for another session in the K/V arenas (%lld slots/layer)\n",
+                             (long long) g_cow_arena_slots);
+                return 0;
+            }
+            const CowArena& a = g_cow_arenas[(size_t) qsa_ordinal];
+            st.k_q = a.k;
+            st.v_q = a.v;
+            st.k_scale = a.ks;
+            st.v_scale = a.vs;
+            cow_sb = so;
+        }
+    }
     st.page_table = c.take<int32_t>((uint64_t) pages);
     st.n_pages = pages;
     st.max_cells = max_cells;
@@ -883,6 +945,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.map.page_table = st.page_table;
     st.map.n_blocks = pages;
     st.map.n_slots = p.slots;
+    st.map.slot_base = cow_sb;   // cow-m1
     if (p.mode == 1) {
         st.map.slot_block = c.take<int32_t>((uint64_t) p.slots);
         st.map.slot_stamp = c.take<int32_t>((uint64_t) p.slots);
@@ -995,10 +1058,13 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
         cudaMemsetAsync(st.k_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
         cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
     } else if (st.kv_int8) {
-        cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
-        cudaMemsetAsync(st.v_q, 0, rows * s.head_dim, cs);
-        cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
-        cudaMemsetAsync(st.v_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
+        // cow-m1: an arena state zeroes only its own slot range inside the layer arena.
+        const uint64_t zc = (uint64_t) st.map.slot_base * s.n_head_kv * s.page_size;
+        const uint64_t zs = (uint64_t) st.map.slot_base * s.n_head_kv * s.page_size * (s.head_dim / strata::kernels::KV_Q8_GROUP);
+        cudaMemsetAsync(st.k_q + zc, 0, rows * s.head_dim, cs);
+        cudaMemsetAsync(st.v_q + zc, 0, rows * s.head_dim, cs);
+        cudaMemsetAsync(st.k_scale + zs, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
+        cudaMemsetAsync(st.v_scale + zs, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
     } else {
         cudaMemsetAsync(st.k_pool, 0, rows * s.head_dim * 2, cs);
         cudaMemsetAsync(st.v_pool, 0, rows * s.head_dim * 2, cs);

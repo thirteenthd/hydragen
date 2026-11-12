@@ -73,6 +73,9 @@ struct KvStreamMap {
     int32_t* miss_slot = nullptr;   ///< (n_slots,)
     int64_t n_blocks = 0;
     int64_t n_slots = 0;
+    /// cow-m1: this map's local slot j names pool page (slot_base + j) in the layer's global arena;
+    /// 0: the pool is private and the identity holds. Set once at state init; graph-baked.
+    int64_t slot_base = 0;
 };
 
 inline constexpr int kKvCtlInts = 16;   ///< [0] epoch [1] hand [2] misses [3] overflow; u64 at [4] misses, [6] lookups, [8] calls
