@@ -627,8 +627,9 @@ int64_t g_kv_elastic_init = 16384;
 // cow-m1: global K/V slot arenas, one per QSA ordinal (share-at-fork CoW; M-C1a: private ranges only).
 bool g_cow_arena = false;
 int64_t g_cow_arena_slots = 0;
+int64_t g_cow_slot_cells = 0;
 namespace {
-struct CowArena { int8_t* k = nullptr; int8_t* v = nullptr; uint16_t* ks = nullptr; uint16_t* vs = nullptr; };
+struct CowArena { int8_t* k = nullptr; int8_t* v = nullptr; uint16_t* ks = nullptr; uint16_t* vs = nullptr; int* use = nullptr; };
 std::vector<CowArena> g_cow_arenas;
 int64_t g_cow_session_ctr = -1;
 }
@@ -798,12 +799,74 @@ void qsa_set_cow_arena(int64_t slots_per_layer) {   // cow-m1 (extern scope; the
     g_cow_arena_slots = slots_per_layer;
 }
 void qsa_cow_session_begin() { ++g_cow_session_ctr; }
+void qsa_set_cow_slot_cells(int64_t cells) { g_cow_slot_cells = cells > 0 ? cells : 0; }
+
+int64_t qsa_cow_fork(const QsaState& from, QsaState& to, int64_t upto, std::string& error) {
+    if (from.kv_mode != 1 || to.kv_mode != 1 || from.map.slot_use == nullptr ||
+        from.map.slot_use != to.map.slot_use) return 0;   // not a forkable pair: a silent no-op
+    const int64_t P = std::min(to.map.n_blocks, std::min(from.map.n_blocks, upto / 4));   // only COMPLETE pages: the partial tail page stays cold, its cells read from the host copy; two sessions appending into one shared page would trample each other
+    if (P <= 0) return 0;
+    std::vector<int32_t> ftab((size_t) P);
+    if (cudaMemcpy(ftab.data(), from.map.page_table, (size_t) P * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        error = "cow fork: the source page table could not be read";
+        return -1;
+    }
+    const int64_t fb = from.map.slot_base, fn = from.map.n_slots;
+    const int64_t tb = to.map.slot_base;
+    int64_t shared = 0;
+    for (int64_t b = 0; b < P; ++b) {
+        const int32_t sl = ftab[b];
+        if (sl >= fb && sl < fb + fn) ++shared;                                   // the source's own page: fork it
+        else if (sl >= tb && sl < tb + (int64_t) to.n_slots) ftab[b] = -1;        // names to's own range: cold, not aliased
+        else if (sl < 0) ftab[b] = -1;                                            // -1 or a claimed -2: cold
+    }
+    if (shared > 0) {   // bump the source range's refcounts
+        std::vector<int32_t> fuse((size_t) fn, 0);
+        if (cudaMemcpy(fuse.data(), from.map.slot_use + fb, (size_t) fn * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            error = "cow fork: the source refcounts could not be read";
+            return -1;
+        }
+        for (int64_t b = 0; b < P; ++b) {
+            const int32_t sl = ftab[b];
+            if (sl >= fb && sl < fb + fn) ++fuse[sl - fb];
+        }
+        if (cudaMemcpy(from.map.slot_use + fb, fuse.data(), (size_t) fn * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+            error = "cow fork: the source refcounts could not be written";
+            return -1;
+        }
+    }
+    if (cudaMemcpy(to.map.page_table, ftab.data(), (size_t) P * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+        error = "cow fork: the table splice failed";
+        return -1;
+    }
+    return shared;
+}
+
+void qsa_cow_release(QsaState& st) {
+    if (st.kv_mode != 1 || st.map.slot_use == nullptr) return;
+    const int64_t P = st.map.n_blocks;
+    std::vector<int32_t> tab((size_t) P);
+    if (cudaMemcpy(tab.data(), st.map.page_table, (size_t) P * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return;
+    const int64_t b0 = st.map.slot_base, n = st.map.n_slots;
+    int64_t foreign = 0;
+    for (int64_t i = 0; i < P; ++i)
+        if (tab[i] >= 0 && !(tab[i] >= b0 && tab[i] < b0 + n)) ++foreign;
+    if (foreign == 0) return;
+    std::vector<int32_t> use((size_t) g_cow_arena_slots);
+    if (cudaMemcpy(use.data(), st.map.slot_use, (size_t) g_cow_arena_slots * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return;
+    for (int64_t i = 0; i < P; ++i) {
+        const int32_t sl = tab[i];
+        if (sl >= 0 && !(sl >= b0 && sl < b0 + n) && sl < g_cow_arena_slots && use[sl] > 1) --use[sl];
+    }
+    (void) cudaMemcpy(st.map.slot_use, use.data(), (size_t) g_cow_arena_slots * 4, cudaMemcpyHostToDevice);
+}
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     uint64_t n = 0;
-    if (!(g_kv_elastic && p.mode == 0))   // the elastic K/V's pools are in their own VMM range
+    if (!(g_kv_elastic && p.mode == 0) &&
+        !(g_cow_arena && p.mode == 1 && g_kv_int8 && !g_kv_q4 && !g_kv_hybrid))   // cow-m1: the arena's ranges are not carved here
         n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
                            g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
     n += (uint64_t) p.pages * 4;                                               // page_table
@@ -821,12 +884,17 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope, int64_t ring_cells, int64_t qsa_ordinal) {
     const QsaShapes s = qsa_shapes(g);
-    const KvPlan p = kv_plan(s, max_cells, ring_cells);
+    KvPlan p = kv_plan(s, max_cells, ring_cells);   // cow-m1b: not const, the slot-window shrink below adjusts p.slots
     const int64_t pages = p.pages;
     Cursor c{(uint8_t*) base};
     int64_t cow_sb = 0;   // cow-m1: this state's slot_base in the layer arena (0: private pool)
     st.kv_int8 = g_kv_int8 && !g_kv_q4;
     st.kv_q4 = g_kv_q4;
+    // cow-m1b: the batch-slot states (every streamed session after the first) live on a smaller VRAM
+    // window; the first session keeps the full one and holds the shared prefix their forks point at.
+    if (g_cow_arena && g_cow_slot_cells > 0 && g_cow_session_ctr > 0 && p.mode == 1 &&
+        st.kv_int8 && !st.kv_q4 && g_cow_slot_cells < max_cells)
+        p.slots = g_cow_slot_cells / s.page_size;
     // Hybrid K8V4, main layers only (the drafter's state is created with the globals toggled to INT8 -
     // mtp.cpp). A streamed one keeps its host copy in the same three runs (kv_stream.cu, kKvHybrid).
     if (g_kv_hybrid && ring_cells <= 0) {
@@ -883,10 +951,12 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.k_q4 = c.take<uint8_t>(rows * q4_row);
         st.v_q4 = c.take<uint8_t>(rows * q4_row);
     } else if (st.kv_int8) {   // st, not the global: the drafter's ring is INT8 under --kv k8v4 too
-        st.k_q = c.take<int8_t>(rows * s.head_dim);
-        st.v_q = c.take<int8_t>(rows * s.head_dim);
-        st.k_scale = c.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
-        st.v_scale = c.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+        if (!(g_cow_arena && p.mode == 1)) {   // cow-m1: an arena state carves no private pool; its slots come from the layer arena
+            st.k_q = c.take<int8_t>(rows * s.head_dim);
+            st.v_q = c.take<int8_t>(rows * s.head_dim);
+            st.k_scale = c.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+            st.v_scale = c.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+        }
     } else {
         st.k_pool = c.take<uint16_t>(rows * s.head_dim);
         st.v_pool = c.take<uint16_t>(rows * s.head_dim);
@@ -908,7 +978,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             for (int64_t j = 0; j < g.n_qsa_layers() && ok; ++j) {
                 CowArena& a = g_cow_arenas[(size_t) j];
                 ok = cudaMalloc((void**) &a.k, kb) == cudaSuccess && cudaMalloc((void**) &a.v, kb) == cudaSuccess &&
-                     cudaMalloc((void**) &a.ks, sb2) == cudaSuccess && cudaMalloc((void**) &a.vs, sb2) == cudaSuccess;
+                     cudaMalloc((void**) &a.ks, sb2) == cudaSuccess && cudaMalloc((void**) &a.vs, sb2) == cudaSuccess &&
+                     cudaMalloc((void**) &a.use, (size_t) g_cow_arena_slots * 4) == cudaSuccess;
+                if (ok) ok = cudaMemset(a.use, 0, (size_t) g_cow_arena_slots * 4) == cudaSuccess;
             }
             if (ok)
                 std::fprintf(stderr, "cow: K/V arenas: %lld QSA layers x %lld slots = %.2f GiB (INT8 streamed)\n",
@@ -924,7 +996,10 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             }
         }
         if (g_cow_arena) {
-            const int64_t so = (g_cow_session_ctr < 0 ? 0 : g_cow_session_ctr) * p.slots;
+            static std::vector<int64_t> g_cow_next;   // per-ordinal next free slot: ranges may differ in size when the slot-window shrink applies
+            if (g_cow_next.size() < (size_t) g.n_qsa_layers()) g_cow_next.resize((size_t) g.n_qsa_layers(), 0);
+            const int64_t so = g_cow_next[(size_t) qsa_ordinal];
+            g_cow_next[(size_t) qsa_ordinal] += p.slots;
             if (so + p.slots > g_cow_arena_slots) {
                 std::fprintf(stderr, "cow: no room for another session in the K/V arenas (%lld slots/layer)\n",
                              (long long) g_cow_arena_slots);
@@ -935,7 +1010,17 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             st.v_q = a.v;
             st.k_scale = a.ks;
             st.v_scale = a.vs;
+            st.cow_codes = so * s.n_head_kv * s.page_size * s.head_dim;
+            st.cow_scale = so * s.n_head_kv * s.page_size * (s.head_dim / strata::kernels::KV_Q8_GROUP);
             cow_sb = so;
+            {   // cow-m1b: the owner holds its own range: use = 1 across it
+                std::vector<int32_t> ones((size_t) p.slots, 1);
+                if (cudaMemcpy(g_cow_arenas[(size_t) qsa_ordinal].use + so, ones.data(),
+                               (size_t) p.slots * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    std::fprintf(stderr, "cow: could not seed the slot refcounts\n");
+                    return 0;
+                }
+            }
         }
     }
     st.page_table = c.take<int32_t>((uint64_t) pages);
@@ -946,6 +1031,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.map.n_blocks = pages;
     st.map.n_slots = p.slots;
     st.map.slot_base = cow_sb;   // cow-m1
+    if (g_cow_arena && p.mode == 1 && st.kv_int8 && !st.kv_q4 && !g_cow_arenas.empty())
+        st.map.slot_use = g_cow_arenas[(size_t) qsa_ordinal].use;   // cow-m1b: baked with the map; the sweep guard reads it. NOT keyed on cow_sb: session 0's range legitimately starts at 0
     if (p.mode == 1) {
         st.map.slot_block = c.take<int32_t>((uint64_t) p.slots);
         st.map.slot_stamp = c.take<int32_t>((uint64_t) p.slots);
@@ -1059,8 +1146,8 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
         cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
     } else if (st.kv_int8) {
         // cow-m1: an arena state zeroes only its own slot range inside the layer arena.
-        const uint64_t zc = (uint64_t) st.map.slot_base * s.n_head_kv * s.page_size;
-        const uint64_t zs = (uint64_t) st.map.slot_base * s.n_head_kv * s.page_size * (s.head_dim / strata::kernels::KV_Q8_GROUP);
+        const uint64_t zc = (uint64_t) st.cow_codes;
+        const uint64_t zs = (uint64_t) st.cow_scale;
         cudaMemsetAsync(st.k_q + zc, 0, rows * s.head_dim, cs);
         cudaMemsetAsync(st.v_q + zc, 0, rows * s.head_dim, cs);
         cudaMemsetAsync(st.k_scale + zs, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);

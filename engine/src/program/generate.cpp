@@ -4324,9 +4324,12 @@ int main(int argc, char** argv) {
     {   // cow-m1: global K/V slot arenas (opt-in; streamed INT8 only)
         const char* en = std::getenv("STRATA_COW_ARENA");
         const char* ns = std::getenv("STRATA_COW_ARENA_SLOTS");
-        if (en != nullptr && en[0] == '1' && o.kv_resident > 0 && o.kv == "int8")
+        if (en != nullptr && en[0] == '1' && o.kv_resident > 0 && o.kv == "int8") {
             strata::core::qsa_set_cow_arena(ns != nullptr ? std::atoll(ns)
                                                           : 4 * (o.kv_resident / 4));   // page_size = 4 cells
+            const char* sc = std::getenv("STRATA_COW_SLOT_CELLS");
+            if (sc != nullptr) strata::core::qsa_set_cow_slot_cells(std::atoll(sc));
+        }
     }
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
     // up to 2 tokens longer; the draft policy (strata/spec/draft_policy.hpp) takes one only where it pays. Code
@@ -14372,6 +14375,10 @@ int main(int argc, char** argv) {
         // a slot copy can go device to device (the same bytes into the same places as the checkpoint/K-V image
         // round trip through host memory, which costs ~40-90 ms per admission on a 4-card split); each device is
         // synchronized once before and once after.  Opt-in: STRATA_SLOT_COPY_DIRECT=1 (default: the host path).
+        static const bool cow_fork_on = [] {
+            const char* v = std::getenv("STRATA_COW_FORK");
+            return v != nullptr && v[0] == '1';
+        }();
         static const bool slot_copy_direct = [] {
             const char* v = std::getenv("STRATA_SLOT_COPY_DIRECT");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
@@ -14403,6 +14410,17 @@ int main(int argc, char** argv) {
                     if (!strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
                                                             to.qsa_states[to.qsa_ord0 + j], g, upto, true, e, queued))
                         return failed();
+                if (cow_fork_on) {
+                    int64_t sh0 = -1;
+                    for (int64_t j = 0; j < from.qsa_alloc; ++j) {
+                        const int64_t sh = strata::core::qsa_cow_fork(from.qsa_states[from.qsa_ord0 + j],
+                                                                      to.qsa_states[to.qsa_ord0 + j], upto, e);
+                        if (sh < 0) return failed();
+                        if (sh0 < 0) sh0 = sh;
+                    }
+                    std::fprintf(stderr, "cow: the admission fork points at %lld of %lld prefix pages per K/V layer (upto %lld cells)\n",
+                                 (long long) sh0, (long long) ((upto + 3) / 4), (long long) upto);
+                }
             }
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
             return true;
@@ -14433,6 +14451,17 @@ int main(int argc, char** argv) {
                     if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
                     if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                         return false;
+                }
+                if (cow_fork_on) {
+                    int64_t sh0 = -1;
+                    for (int64_t j = 0; j < from.qsa_alloc; ++j) {
+                        const int64_t sh = strata::core::qsa_cow_fork(from.qsa_states[from.qsa_ord0 + j],
+                                                                      to.qsa_states[to.qsa_ord0 + j], upto, e);
+                        if (sh < 0) return false;
+                        if (sh0 < 0) sh0 = sh;
+                    }
+                    std::fprintf(stderr, "cow: the admission fork points at %lld of %lld prefix pages per K/V layer (upto %lld cells)\n",
+                                 (long long) sh0, (long long) ((upto + 3) / 4), (long long) upto);
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
             }
@@ -14495,6 +14524,17 @@ int main(int argc, char** argv) {
                     if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
                     if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                         return false;
+                }
+                if (cow_fork_on) {
+                    int64_t sh0 = -1;
+                    for (int64_t j = 0; j < from.qsa_alloc; ++j) {
+                        const int64_t sh = strata::core::qsa_cow_fork(from.qsa_states[from.qsa_ord0 + j],
+                                                                      to.qsa_states[to.qsa_ord0 + j], upto, e);
+                        if (sh < 0) return false;
+                        if (sh0 < 0) sh0 = sh;
+                    }
+                    std::fprintf(stderr, "cow: the admission fork points at %lld of %lld prefix pages per K/V layer (upto %lld cells)\n",
+                                 (long long) sh0, (long long) ((upto + 3) / 4), (long long) upto);
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
             }

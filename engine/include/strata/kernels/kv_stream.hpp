@@ -76,6 +76,9 @@ struct KvStreamMap {
     /// cow-m1: this map's local slot j names pool page (slot_base + j) in the layer's global arena;
     /// 0: the pool is private and the identity holds. Set once at state init; graph-baked.
     int64_t slot_base = 0;
+    /// cow-m1: (arena capacity,) refcounts over arena pages, host-managed (fork/release), device-read by
+    /// the clock sweep: a slot named by another session's table (use > 1) is never taken as its owner's victim.
+    int* slot_use = nullptr;
 };
 
 inline constexpr int kKvCtlInts = 16;   ///< [0] epoch [1] hand [2] misses [3] overflow; u64 at [4] misses, [6] lookups, [8] calls

@@ -227,6 +227,9 @@ struct QsaState {
     /// back: always for Q4_0, for INT8 by qsa_set_kv_int8_rotate (spreads outlier channels over the scale groups)
     bool kv_rot = false;
     int32_t* page_table = nullptr;   ///< (n_pages,) logical page -> physical page (-1: not resident, streamed)
+    /// cow-m1: element offsets of this state's slot range inside the layer K/V arena (0: private pool).
+    int64_t cow_codes = 0;   ///< (codes arrays: k_q, v_q) element offset = slot_base * n_head_kv * page_size * head_dim
+    int64_t cow_scale = 0;   ///< (scale arrays: k_scale, v_scale) element offset = slot_base * n_head_kv * page_size * (head_dim/64)
     int64_t n_pages = 0;
     int64_t max_cells = 0;
 
@@ -282,6 +285,15 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 /// session before its qsa_state_init loop). Pages named by a page table are arena-global.
 void qsa_set_cow_arena(int64_t slots_per_layer);
 void qsa_cow_session_begin();
+/// cow-m1: streamed states after the first (the batch-slot sessions) get this smaller VRAM window; the
+/// first session keeps the full one and holds the shared prefix the forks point at. 0: off.
+void qsa_set_cow_slot_cells(int64_t cells);
+/// cow-m1: point `to`'s page table at `from`'s resident pages for the prefix [0, upto): shared pages
+/// name from's arena slots (refcounts bumped); from's cold pages stay cold and stream into to's range.
+/// Returns the number of shared pages, -1 on failure. Requires both states on the same layer arena.
+int64_t qsa_cow_fork(const QsaState& from, QsaState& to, int64_t upto, std::string& error);
+/// cow-m1: decrement the refcounts of the foreign pages `to`'s table names, before its map is reset.
+void qsa_cow_release(QsaState& st);
 /// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
 /// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully

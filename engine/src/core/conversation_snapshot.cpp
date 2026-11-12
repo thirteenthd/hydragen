@@ -85,8 +85,10 @@ std::array<void*, 5> pools(const QsaState& st, bool resident = false) {
     if (st.kv_q4)
         return {host ? st.host.k_q4 : st.k_q4, host ? st.host.v_q4 : st.v_q4, nullptr, nullptr, st.idx_pooled};
     if (st.kv_int8)
-        return {host ? st.host.k_q : st.k_q, host ? st.host.v_q : st.v_q,
-                host ? st.host.k_scale : st.k_scale, host ? st.host.v_scale : st.v_scale, st.idx_pooled};
+        // cow-m1: an arena state's device pools are the layer arenas; this state's slots are its range inside them.
+        return {host ? st.host.k_q : st.k_q + st.cow_codes, host ? st.host.v_q : st.v_q + st.cow_codes,
+                host ? st.host.k_scale : st.k_scale + st.cow_scale,
+                host ? st.host.v_scale : st.v_scale + st.cow_scale, st.idx_pooled};
     return {host ? st.host.k_pool : st.k_pool, host ? st.host.v_pool : st.v_pool, nullptr, nullptr, st.idx_pooled};
 }
 
@@ -406,7 +408,10 @@ namespace {
 // After the authoritative pools were rewritten: the VRAM slots of a streamed state still hold the outgoing
 // conversation, so resolve must refill them before any attention reads (shared by restore and direct copy).
 bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
-    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
+    if (st.kv_mode == 1) {
+        strata::core::qsa_cow_release(const_cast<QsaState&>(st));   // cow-m1b: let go of forked pages before the map resets
+        strata::kernels::kv_stream_reset(st.map, nullptr);
+    }
     if (st.kv_mode == 2 && upto > 0) {
         auto shapes = strata::kernels::qsa_real_shapes();
         shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;

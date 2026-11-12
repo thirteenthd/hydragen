@@ -124,7 +124,9 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
     for (int scanned = 0; got < need && scanned < 3 * n; scanned += RT) {
         const int j = (int) (((long long) hand + threadIdx.x) % n);
         const bool mine = m.slot_stamp[j] == epoch;
-        const bool cand = !mine && (m.slot_block[j] < 0 || m.slot_ref[j] == 0);
+        // cow-m1: a page another session forked onto (use > 1) is never taken as this owner's victim.
+        const bool cow_hold = m.slot_use != nullptr && m.slot_use[j + (int) m.slot_base] > 1;
+        const bool cand = !cow_hold && !mine && (m.slot_block[j] < 0 || m.slot_ref[j] == 0);
         int total = 0;
         const int rank = block_scan(cand ? 1 : 0, warp_sums, total);
         const int want = need - got;
