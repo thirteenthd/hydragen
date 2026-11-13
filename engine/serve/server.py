@@ -8044,6 +8044,7 @@ def make_handler(svc: Service):
                 body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
                 if not path:
                     # the chat's svg/html preview is a sandboxed frame; this keeps it from navigating away to a web page
                     # (a link or <meta refresh> inside a model's html), which no sandbox flag does (serve/web/preview.js)
