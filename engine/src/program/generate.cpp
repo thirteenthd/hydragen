@@ -4329,6 +4329,8 @@ int main(int argc, char** argv) {
                                                           : 4 * (o.kv_resident / 4));   // page_size = 4 cells
             const char* jh = std::getenv("STRATA_COW_JOIN_HH");
             if (jh != nullptr) strata::core::qsa_set_cow_join_hh(std::atoll(jh));
+            const char* csh = std::getenv("STRATA_COW_SHARED");
+            if (csh != nullptr) strata::core::qsa_set_cow_shared(std::atoll(csh));
             const char* sc = std::getenv("STRATA_COW_SLOT_CELLS");
             if (sc != nullptr) strata::core::qsa_set_cow_slot_cells(std::atoll(sc));
         }
@@ -14422,8 +14424,9 @@ int main(int argc, char** argv) {
                     }
                     std::fprintf(stderr, "cow: the admission fork points at %lld of %lld prefix pages per K/V layer (upto %lld cells)\n",
                                  (long long) sh0, (long long) ((upto + 3) / 4), (long long) upto);
-                    std::fprintf(stderr, "cow: joins-at-fetch served so far: %llu\n",
-                                 (unsigned long long) strata::core::qsa_cow_joins(0));
+                    std::fprintf(stderr, "cow: joins-at-fetch served so far: %llu, lineage shared fetches: %llu\n",
+                                 (unsigned long long) strata::core::qsa_cow_joins(0),
+                                 (unsigned long long) strata::core::qsa_cow_shared_fetches(0));
                 }
             }
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
@@ -14466,8 +14469,9 @@ int main(int argc, char** argv) {
                     }
                     std::fprintf(stderr, "cow: the admission fork points at %lld of %lld prefix pages per K/V layer (upto %lld cells)\n",
                                  (long long) sh0, (long long) ((upto + 3) / 4), (long long) upto);
-                    std::fprintf(stderr, "cow: joins-at-fetch served so far: %llu\n",
-                                 (unsigned long long) strata::core::qsa_cow_joins(0));
+                    std::fprintf(stderr, "cow: joins-at-fetch served so far: %llu, lineage shared fetches: %llu\n",
+                                 (unsigned long long) strata::core::qsa_cow_joins(0),
+                                 (unsigned long long) strata::core::qsa_cow_shared_fetches(0));
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
             }
@@ -14541,8 +14545,9 @@ int main(int argc, char** argv) {
                     }
                     std::fprintf(stderr, "cow: the admission fork points at %lld of %lld prefix pages per K/V layer (upto %lld cells)\n",
                                  (long long) sh0, (long long) ((upto + 3) / 4), (long long) upto);
-                    std::fprintf(stderr, "cow: joins-at-fetch served so far: %llu\n",
-                                 (unsigned long long) strata::core::qsa_cow_joins(0));
+                    std::fprintf(stderr, "cow: joins-at-fetch served so far: %llu, lineage shared fetches: %llu\n",
+                                 (unsigned long long) strata::core::qsa_cow_joins(0),
+                                 (unsigned long long) strata::core::qsa_cow_shared_fetches(0));
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
             }

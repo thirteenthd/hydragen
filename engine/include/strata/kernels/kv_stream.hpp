@@ -73,7 +73,17 @@ struct CowPeer {
     int32_t n_slots = 0;
     int32_t n_blocks = 0;   ///< its table's length
     int32_t* pt = nullptr;  ///< its page table (null: entry free)
+    int32_t floor = 0x7FFFFFFF;  ///< cow-m1e: byte-identity floor in COMPLETE pages: blocks >= floor
+                                 ///< diverge across the lineage (each member generates its own tail), so
+                                 ///< no sharing path may name them. Lowered by every fork of the lineage.
 };
+
+/// cow-m1e: a lineage hint table (one of kCowLinTabs rolling tables per arena): block -> the block's
+/// shared-region slot, -1 never fetched there, -2 fetch in flight. A map consults the table indexed
+/// by its registry conv % kCowLinTabs, so one table serves the whole fork lineage; the host zeroes
+/// it when a tab slot is handed to a new lineage (stale hints from a dead lineage would only cost a
+/// rollback round-trip, never a corruption).
+inline constexpr int kCowLinTabs = 16;
 
 struct KvStreamMap {
     int32_t* page_table = nullptr;  ///< (n_blocks,) block -> slot, or -1
@@ -95,11 +105,28 @@ struct KvStreamMap {
     CowPeer* reg = nullptr;
     int reg_n = 0;
     unsigned long long* join_ctr = nullptr;   ///< telemetry: joins of this arena
+    /// cow-m1e: the per-lineage shared region at the arena's far end: slots [shared_base,
+    /// shared_base + n_shared) owned by NO session window. A lineage member missing a cold block
+    /// consults its hint table first: a sibling's fetched page is adopted with a refcount pin (one
+    /// host->VRAM copy per LINEAGE, not per window), and a block nobody fetched claims the hint so
+    /// the fetch lands on a region slot whose eviction clock is the region's own sweep. A region
+    /// slot is victimizable only while slot_use == 0: no live table entry names it, hence no gather
+    /// can be reading it - the PIN LAW holds by construction and pinning a shared page costs no
+    /// session window anything. Null/zero when sharing is off: every code path degrades to M-C1d.
+    int32_t* lin_all = nullptr;       ///< (kCowLinTabs, n_blocks) rolling lineage hint tables
+    int32_t shared_base = 0;          ///< arena-global slot index where the region starts
+    int32_t n_shared = 0;             ///< 0: sharing off for this map
+    int32_t* sblk = nullptr;          ///< (n_shared,) shared slot -> block it holds, or -1
+    int32_t* sst  = nullptr;          ///< (n_shared,) epoch stamp (per-map epochs: aliasing only skips a candidate, conservative)
+    int32_t* srf  = nullptr;          ///< (n_shared,) clock reference bit
+    int32_t* miss_sh = nullptr;       ///< (n_slots,) blocks whose lineage fetch this call claimed
+    int32_t* miss_sh_slot = nullptr;  ///< (n_slots,) their arena-global slots (same slot_base basis as miss_slot)
+    unsigned long long* sh_ctr = nullptr; ///< telemetry: committed lineage fetches
 };
 
 inline constexpr int kKvCtlInts = 16;   ///< [0] epoch [1] hand [2] misses [3] overflow; u64 at [4] misses, [6] lookups, [8] calls
 /// Bytes of the map's arrays besides the page table (which the state already has): 5 per-slot ints + ctl.
-inline uint64_t kv_stream_map_bytes(int64_t n_slots) { return (uint64_t) n_slots * 4 * 5 + kKvCtlInts * 4; }
+inline uint64_t kv_stream_map_bytes(int64_t n_slots) { return (uint64_t) n_slots * 4 * 7 + kKvCtlInts * 4; }   // cow-m1e: + miss_sh, miss_sh_slot
 
 /// Every block evicted: page table all -1, slots free, counters zero.
 void kv_stream_reset(const KvStreamMap& m, void* stream);

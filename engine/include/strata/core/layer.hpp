@@ -289,6 +289,7 @@ void qsa_cow_session_begin();
 /// first session keeps the full one and holds the shared prefix the forks point at. 0: off.
 void qsa_set_cow_slot_cells(int64_t cells);
 void qsa_set_cow_join_hh(int64_t v);   // cow-m1d: STRATA_COW_JOIN_HH join headroom per range; 0 disables joins
+void qsa_set_cow_shared(int64_t v);    // cow-m1e: STRATA_COW_SHARED shared-region slots per QSA ordinal; 0 disables the region
 /// cow-m1: point `to`'s page table at `from`'s resident pages for the prefix [0, upto): shared pages
 /// name from's arena slots (refcounts bumped); from's cold pages stay cold and stream into to's range.
 /// Returns the number of shared pages, -1 on failure. Requires both states on the same layer arena.
@@ -297,6 +298,7 @@ int64_t qsa_cow_fork(const QsaState& from, QsaState& to, int64_t upto, std::stri
 void qsa_cow_release(QsaState& st);
 /// cow-m1d: telemetry: joins-at-fetch this arena has served.
 uint64_t qsa_cow_joins(int64_t qsa_ordinal);
+uint64_t qsa_cow_shared_fetches(int64_t qsa_ordinal);   // cow-m1e: committed lineage fetches (telemetry)
 /// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
 /// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully
