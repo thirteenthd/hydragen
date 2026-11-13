@@ -174,12 +174,7 @@ collapses.
 when a returning session's image is read back off disk, so those turns are
 labeled deep-warm. The engine log shows **6 restores of 98-107k-token images
 in 0.8-3.6 s each** inside the C8 window; the genuinely recomputed tokens were
-closer to ~116k than 716k. The C8 tier arm is **contaminated, not a measured regression**: 13 of its
-48 requests failed outright (the engine generated 0-1 tokens after full
-prefill; baseline: zero failures; one request also starved 437 s). Disk
-restores mount whole images without the RAM tier's copy-on-write prefix
-sharing, so 8-deep churn inflates the resident working set. Treat the C8 row
-as "to be re-measured"; the M-C3b segment-view work is the fix.
+closer to ~116k than 716k. At C8 (8-deep) the full-copy tier is currently **net-negative on wall** (951 → 1284 s, +35%), though it eliminates the deep-warm failures (8/8 needles, zero failed requests) and still lifts warm decode (13.8 → 22.4 tok/s). The tier converts ~1.1 M tokens of re-prefill into ~19 whole-image restores, but spills write whole images (141 GiB) and restores read whole images back (122 GiB) on the same volume the expert blobs stream from — at 8-deep that contention costs more than the recompute saved. Below ~6-deep the tier pays off; above it, it doesn't, until M-C3b ships segment-view files (spill only unique tail + state; restore re-adopts verified shared views instead of private full copies).
 
 Honest summary of where this leaves 12 GB + a ~35 B-class routed MoE:
 
