@@ -320,6 +320,30 @@ public:
         return best;
     }
 
+    // M-C2: the longest COMMON token prefix with any parked conversation (a sibling subagent shares a
+    // head then diverges: best() only matches whole conversation prefixes and never sees it). A park
+    // anchored on this must byte-verify the shared range before adopting it (adopt_shared's `mine`).
+    template<class Token>
+    Match common_best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images,
+                      bool cvec) const {
+        Match best;
+        if (prompt.empty() || !images.empty()) return best;   // picture-carrying parks: fail closed
+        for (size_t i = entries_.size(); i-- > 0;) {
+            const auto& e = entries_[i];
+            if (e.cvec != cvec) continue;
+            auto consider = [&](const ConversationCheckpoint& c, bool live) {
+                if (!c.imgs.empty()) return;
+                const size_t m = std::min(c.ids.size(), prompt.size());
+                int64_t n = 0;
+                while (n < (int64_t) m && (int64_t) c.ids[(size_t) n] == (int64_t) prompt[(size_t) n]) ++n;
+                if (n > best.tokens) best = {i, n, live, serials_[i]};
+            };
+            consider(e.live, true);
+            for (const auto& c : e.checkpoints) consider(c, false);
+        }
+        return best;
+    }
+
     /// A parked conversation holds this state already (its live tokens or one of its checkpoints start with `ids`,
     /// same pictures, same steering): see conversation_covers.  Read-only; no LRU effect.
     template<class Token>

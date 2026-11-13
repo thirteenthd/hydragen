@@ -293,7 +293,8 @@ size_t conversation_kv_bytes(const QsaState& st, const ModelGeometry& g, int64_t
 
 bool conversation_kv_save(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error,
-                          int64_t unchanged_tokens, size_t* reused_bytes) {
+                          int64_t unchanged_tokens, size_t* reused_bytes,
+                          const ConversationKv* anchor, int64_t anchor_tokens) {
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error)) return false;
@@ -312,6 +313,30 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     const auto src = pools(st);
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<ConversationBuffer*,5> dst = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+    // M-C2: the donor image's prefix bytes this session was RESTORED from (byte-identical to its own
+    // through whole pages and complete indexer rows below anchor_tokens). Geometry mismatch: no anchor.
+    std::array<const ConversationBuffer*,5> anchor_part{};
+    std::array<size_t,5> anchor_keep{};
+    if (anchor != nullptr && anchor_tokens > 0) {
+        if (anchor->format != l.format || anchor->cells < l.cells || anchor->heads != g.n_head_kv ||
+            anchor->head_dim != g.head_dim || anchor->page_size != l.page_size || anchor->idx_dim != g.idx_key_dim)
+            anchor = nullptr;
+        else {
+            const int64_t at = std::min<int64_t>(anchor_tokens, upto);
+            const int64_t ac = (at / l.page_size) * l.page_size;
+            const int64_t arows = at / strata::kernels::qsa_real_shapes().idx_block;
+            anchor_part = {&anchor->k, &anchor->v, &anchor->k_scale, &anchor->v_scale, &anchor->pooled};
+            for (size_t i = 0; i < 5; ++i)
+                anchor_keep[i] = i == 4 ? (index ? size_t(arows) * g.idx_key_dim * 4 : 0)
+                                        : (l.cells ? (sizes[i] / size_t(l.cells)) * size_t(ac) : 0);
+            for (size_t i = 0; i < 5; ++i)
+                if (anchor_keep[i] > anchor_part[i]->size()) {
+                    anchor = nullptr;
+                    for (auto& x : anchor_keep) x = 0;
+                    break;
+                }
+        }
+    }
     // STRATA_PARK_VRAM_MIB: this layer's parts go into the park's slot under a fresh tag (0: no slot this park)
     image.dev_tag = park_async().slot != nullptr ? vram_kv().next_tag++ : 0;
     for (size_t i = 0; i < dst.size(); ++i) {
@@ -320,6 +345,18 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
                                   : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
+        const size_t anc = anchor ? anchor_keep[i] : 0;
+        if (anc > keep && src[i] && !on_device(src[i]) && dst[i]->adopt_shared(*anchor_part[i], anc,
+                                                         static_cast<const uint8_t*>(src[i]))) {
+            // (device-resident pools - the indexer pooled part, kv_mode 0 - are verified by copying, not memcmp)
+            // M-C2: verified identical - view the donor's bytes; copy only past the views
+            dst[i]->resize_for_overwrite(sizes[i]);   // appends owned segments past the views
+            if (!dst[i]->visit(anc, sizes[i] - anc, [&](uint8_t* p, size_t n, size_t at2) {
+                    return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at2 : nullptr, n, error);
+                })) return false;
+            if (reused_bytes) *reused_bytes += anc;
+            continue;
+        }
         {   // STRATA_PARK_VRAM_MIB: with a slot, the whole part goes device to device into it (a restore of this image
             // reads it from there) and the host buffer gets only the bytes past the kept prefix, read from the slot on
             // the background thread; a part the slot cannot take is copied synchronously - never through the stage,

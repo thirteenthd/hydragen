@@ -12231,6 +12231,27 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: conversation cache: retained K/V reused for %lld of its %lld tokens "
                                      "(the rest is not this conversation's)\n", (long long) reuse.unchanged_tokens,
                              (long long) retained_n);
+            // M-C2 host-tier CoW: the longest parked conversation this prompt starts with (proper prefix:
+            // never itself) anchors the park; its image's K/V bytes become views, not a second copy.
+            static const bool park_cow = [] {
+                const char* v = std::getenv("STRATA_PARK_COW");
+                return v != nullptr && v[0] == '1';
+            }();
+            const strata::core::SavedConversation* anchor_img = nullptr;
+            int64_t anchor_tokens = 0;
+            if (park_cow && src.with_reuse && !src.ids.empty()) {
+                const auto m = conversations.common_best(src.ids, src.imgs, src.cvec);
+                if (m.tokens > 0 && m.tokens < (int64_t) src.ids.size()) {
+                    const strata::core::SavedConversation* d = conversations.find(m.serial);
+                    if (d != nullptr && !d->kv.empty() && (int64_t) d->live.ids.size() >= m.tokens) {
+                        anchor_img = d;
+                        anchor_tokens = m.tokens;
+                    }
+                }
+                std::fprintf(stderr, "strata serve: conversation cache: park COW anchor %s for %lld of %lld tokens\n",
+                             anchor_img != nullptr ? "mounted" : "none",
+                             (long long) anchor_tokens, (long long) src.ids.size());
+            }
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
             stage_reuse.resize(n_st);
             reuse.stages.clear();
@@ -12343,7 +12364,7 @@ int main(int argc, char** argv) {
                 }
                 const bool saved = strata::core::conversation_snapshot_save(image, view, src.session, g, draft0, err,
                         std::move(reuse), &reused_bytes, storage.empty() ? nullptr : &storage,
-                        moved.empty() ? nullptr : &moved);
+                        moved.empty() ? nullptr : &moved, anchor_img, anchor_tokens);
                 for (ConvCheckpoint& c : storage) ckpt_pool.give(std::move(c));
                 if (!saved) return false;
                 pool_topup();   // what the park took (and what moved out) is allocated again, in the background

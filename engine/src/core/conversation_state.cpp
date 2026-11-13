@@ -519,7 +519,8 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse, size_t* reused_bytes,
                                 std::vector<ConversationCheckpoint>* storage,
-                                std::vector<ConversationCheckpoint>* moved) {
+                                std::vector<ConversationCheckpoint>* moved,
+                                const SavedConversation* anchor, int64_t anchor_tokens) {
     static const bool ptr = std::getenv("STRATA_PARK_TRACE") != nullptr;
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
@@ -579,7 +580,9 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     for (size_t j = 0; j < layers; ++j) {
         const auto k0 = now();
         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
-                                  unchanged, reused_bytes)) return false;
+                                  unchanged, reused_bytes,
+                                  anchor != nullptr && j < anchor->kv.size() ? &anchor->kv[j] : nullptr,
+                                  anchor != nullptr && j < anchor->kv.size() ? anchor_tokens : 0)) return false;
         const double kt = ms(k0, now());
         kv_sum += kt; kv_max = std::max(kv_max, kt);
     }
