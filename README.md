@@ -58,6 +58,8 @@ closed-negative experiments, kept default-off for roomier substrates. See `docs/
 
 ## Install
 
+### Linux
+
 ```bash
 git clone https://github.com/thirteenthd/hydragen.git
 cd hydragen
@@ -71,6 +73,21 @@ compiles the vendored engine with the upstream `cuda-compile` release flags, and
 `HYDRAGEN_CUDA_ARCH=89-real ./install.sh` for RTX 40-series. A source build is the only
 option: prebuilt Strata release binaries do not contain the CoW chain. Verified end-to-end:
 `install.sh` from a fresh clone of this repo builds a working engine on a 3080 Ti.
+
+### Windows
+
+```powershell
+git clone https://github.com/thirteenthd/hydragen.git
+cd hydragen
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Prerequisites: NVIDIA driver, a CUDA toolkit (https://developer.nvidia.com/cuda-downloads),
+and an MSVC C++ toolchain — the script tells you exactly what is missing and how to get it
+(`winget install Microsoft.VisualStudio.2022.BuildTools` with the VC workload). cmake +
+ninja again come from pip; Python 3.10+ required. `install.ps1` mirrors `install.sh`
+(same presets, sm_86 default, `HYDRAGEN_CUDA_ARCH` override) and writes
+`hydragen-local.json` with Windows paths — edit the model/pack paths before serving.
 
 **Model blobs.** The canonical config points at the quant set behind the published
 measurements: IQ3_XXS routed-expert pack, native model + PLE GGUFs (Qwen3.8-Flash-Next,
