@@ -144,12 +144,28 @@ def sse(messages, max_tokens):
     return {"t_start": t0, "ttft": (t_first - t0) if t_first else None,
             "wall": t_done - t0, "decode": (ntok - 1) / max(1e-6, (pieces[-1][0] - pieces[0][0])) if len(pieces) > 1 else None,
             "max_gap": max(gaps) if gaps else None, "prompt_tokens": (usage or {}).get("prompt_tokens"),
+            "cached_tokens": (usage or {}).get("prompt_tokens_details", {}).get("cached_tokens", 0),
             "completion_tokens": ntok, "content_head": content[:120]}
 
 def pct(xs, p):
     if not xs: return None
     xs = sorted(xs); k = min(len(xs)-1, int(round(p/100*(len(xs)-1))))
     return xs[k]
+
+def classify(r, arm):
+    """c/w/d taxonomy from EXACT reuse counts (usage.prompt_tokens_details.cached_tokens),
+    not TTFT bands (queueing behind other 100k prefills corrupts TTFT at C>=4).
+      cold               : first turn of a session (or any natural request) - full prefill paid
+      warm               : later turn, prefix reuse landed (>=1k tokens cached)
+      deep_warm_reprefill: later turn but reuse missed (parked eviction / lost prefix)
+      warm_hit           : natural arm only - unexpected cross-run prefix hit (artifact flag)
+    """
+    cached = r.get("cached_tokens") or 0
+    if arm == "natural":
+        return "warm_hit" if cached > 1000 else "cold"
+    if r.get("turn") == 0:
+        return "cold"
+    return "warm" if cached > 1000 else "deep_warm_reprefill"
 
 def run_natural(C, target, out):
     nlines, _, _ = calibrate(target, 1000)
@@ -231,6 +247,20 @@ def main():
     needle_ok = sum(1 for r in rows if r.get("needle_ok"))
     def rnd(x, d=2):
         return round(x, d) if x is not None else None
+    per = {}
+    for r in rows:
+        k = classify(r, a.arm)
+        d = per.setdefault(k, {"n": 0, "out": 0, "ttft": [], "decode": [], "prefill": 0})
+        d["n"] += 1; d["out"] += r["completion_tokens"]
+        d["prefill"] += (r["prompt_tokens"] or 0) - (r.get("cached_tokens") or 0)
+        if r["ttft"] is not None: d["ttft"].append(r["ttft"])
+        if r.get("decode"): d["decode"].append(r["decode"])
+    per_class = {}
+    for k, v in per.items():
+        per_class[k] = {"n": v["n"], "out_tokens": v["out"], "prefill_tokens": v["prefill"],
+                        "ttft_p50": rnd(pct(v["ttft"], 50)), "ttft_p95": rnd(pct(v["ttft"], 95)),
+                        "decode_p50": rnd(pct(v["decode"], 50), 1),
+                        "decode_min": rnd(min(v["decode"]), 1) if v["decode"] else None}
     summary = {"tag": tag, "wall_s": round(wall, 1), "requests": len(rows),
                "prompt_tokens": tot_in, "completion_tokens": tot_out,
                "agg_decode_tok_s": round(tot_out / wall, 1),
@@ -241,6 +271,7 @@ def main():
                "n_decode_samples": len(decs),
                "max_stall_gap": round(max([r["max_gap"] or 0 for r in rows]), 2),
                "needle": "%d/%d" % (needle_ok, needles),
+               "per_class": per_class,
                "guard": {"pauses": guard["pauses"], "min_memavail_gib": round(guard["min_avail_kb"]/2**20, 1)}}
     with open(out_path.replace(".jsonl", ".summary.json"), "w") as f:
         json.dump(summary, f, indent=1)
