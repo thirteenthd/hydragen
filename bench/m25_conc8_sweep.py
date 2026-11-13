@@ -98,7 +98,9 @@ def mk_prompt(seed, nlines, code_pos, q):
     parts = [HDR.format(seed=seed), mk_text(seed, nlines)]
     parts.insert(1 + min(code_pos, len(parts) - 1), code_line)
     parts.append("\nAnswer directly, no preamble: first line = this team's incident code exactly. "
-                 "Then a numbered list of %d concise diagnostic steps.\n" % q)
+                 "Then a numbered list of %d diagnostic steps. For EACH step write 3-4 full sentences "
+                 "explaining what to check, what a failure looks like, and the exact remediation. "
+                 "Be exhaustive; do not stop early.\n" % q)
     return "".join(parts), code
 
 def calibrate(target, seed):
@@ -154,9 +156,9 @@ def run_natural(C, target, out):
     print("[natural] C=%d calibrated nlines=%d" % (C, nlines), flush=True)
     res = {}
     def w(c):
-        seed = 1000 + 100 * C + c
+        seed = 7000 + 100 * C + c
         prompt, code = mk_prompt(seed, nlines, (c*997) % nlines, 12)
-        r = sse([{"role": "user", "content": prompt}], 512)
+        r = sse([{"role": "user", "content": prompt}], 2048)
         r["needle_ok"] = code.lower() in r["content_head"].lower(); r["code"] = code
         res[c] = r
     ts = [threading.Thread(target=w, args=(c,)) for c in range(C)]
@@ -172,16 +174,16 @@ def run_harness(C, turns, out):
     print("[harness] C=%d turns=%d head_lines=%d hist_lines=%d" % (C, turns, head_lines, hist_lines), flush=True)
     sess = {}
     def w(c):
-        seed = 2000 + 100 * C + c
+        seed = 9000 + 100 * C + c
         prompt, code = mk_prompt(seed, hist_lines, (c*613) % hist_lines, 4)
         msgs = [{"role": "system", "content": head_text}, {"role": "user", "content": prompt}]
         rows = []
         for t in range(turns):
             if t > 0:
                 rnd = random.Random(seed * 31 + t)
-                msgs.append({"role": "user", "content": "Follow-up %d context:\n%s\nSame rules; restate the code first, then 3 next steps."
+                msgs.append({"role": "user", "content": "Follow-up %d context:\n%s\nSame rules; restate the code first, then 3 detailed next steps (3-4 sentences each; do not stop early)."
                                                     % (t, mk_text(seed * 100 + t, 70))})
-            r = sse(msgs, 800)
+            r = sse(msgs, 1600)
             r["turn"] = t
             rows.append(r)
             if t == 0:
@@ -235,6 +237,8 @@ def main():
                "ttft_p50": rnd(pct(ttfts, 50)), "ttft_p95": rnd(pct(ttfts, 95)),
                "ttft_max": rnd(max(ttfts)) if ttfts else None,
                "decode_p50": rnd(pct(decs, 1), 1), "decode_min": rnd(min(decs), 1) if decs else None,
+               "decode_p10": rnd(pct(decs, 10), 1), "decode_p90": rnd(pct(decs, 90), 1),
+               "n_decode_samples": len(decs),
                "max_stall_gap": round(max([r["max_gap"] or 0 for r in rows]), 2),
                "needle": "%d/%d" % (needle_ok, needles),
                "guard": {"pauses": guard["pauses"], "min_memavail_gib": round(guard["min_avail_kb"]/2**20, 1)}}
