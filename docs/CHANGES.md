@@ -3,6 +3,24 @@
 Chronological record of every measurement → decision → commit in the program.
 Newest first; section numbers are stable, so §N always refers to the same entry.
 
+## 128. M-C3b1 landed: deduped block files for the park-disk tier (STRATA_PARK_DISK_V2)
+cow-m3b / 10f90c7e, built green (356/356). The tier now writes a STRP/KD2 envelope whose payload is
+exactly the STRSES v1 byte stream: session_payload_blocks walks put_payload through host buffers and
+hands ParkDisk (offset,ptr,len) blocks; blocks >= 64 KiB are published as content-keyed chunk files
+(128-bit key = two SessionHasher seeds over a 16 MiB block) under park-disk/chunks/, everything else
+stays inline in the file body; a 32 B-per-entry table (<= 2048 entries, 8 GiB payload cap) records the
+order. A sibling of a parked fleet now spills only its unique tail: the shared prefix chunk set is
+written once per fleet, refcounted per table occurrence, unlinked at the last holder, orphans swept at
+boot. Restore feeds the SAME bounded parser through session_payload_unblocks and RECOMPUTES each
+chunk key while its bytes serve it: a mutated or missing chunk fails closed and deletes the ses file.
+Any structural refusal falls back to a plain v1 write for the same image, and readers speak v1 and v2
+side by side regardless of the write knob, so the existing 26-file fleet stayed indexed untouched
+(0 refused). POSIX-only for now; the knob forces v1 on Windows. Default OFF pending the C8 discriminator.
+Serve layer: ParkDiskLog parses the v2 activation, dedup and sweep lines into /metrics (v2, chunks,
+chunk_bytes, saved_mib); the Park disk tier card gains a "Block store" fact row (lan-87 green with the
+knob off = v1 path unchanged on the new binary; lan-88 green with v2 active, restores cross-boot at
+0.6-1.2 s). run7 = C8 harness sweep under V2 with chunk-store sampling: the bytes-per-spill verdict.
+
 ## 127. run6 C8 at 32 GiB tier: failures gone, but full-copy I/O is net-negative at 8-deep (verdict on the discriminator)
 
 run6 (mc3b/, harness C8, tier budget 32768, everything else = run5): wall 1283.9 s vs baseline 951.2 vs run5 1019.4. Needle 8/8, zero failed requests (run5 at 8 GiB tier: 13/48 failed). Guard min MemAvailable 2.7 GiB (base 4.3, run5 3.0). Tier counters over the run: 118 spills = 140.9 GiB written, restores read back 121.8 GiB, 18 budget drops at the 30-entry/31.9 GiB ceiling; boot scan was 4 files.
