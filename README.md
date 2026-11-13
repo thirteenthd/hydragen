@@ -174,10 +174,12 @@ collapses.
 when a returning session's image is read back off disk, so those turns are
 labeled deep-warm. The engine log shows **6 restores of 98-107k-token images
 in 0.8-3.6 s each** inside the C8 window; the genuinely recomputed tokens were
-closer to ~116k than 716k. The wall regression at C8 is real however: spill
-writes (~15 GiB churn during the arm) contend with expert-blob streaming on
-the same nearly-full volume, one cold request starved 437 s server-side, and
-the host memory floor dropped to 2.9 GiB.
+closer to ~116k than 716k. The C8 tier arm is **contaminated, not a measured regression**: 13 of its
+48 requests failed outright (the engine generated 0-1 tokens after full
+prefill; baseline: zero failures; one request also starved 437 s). Disk
+restores mount whole images without the RAM tier's copy-on-write prefix
+sharing, so 8-deep churn inflates the resident working set. Treat the C8 row
+as "to be re-measured"; the M-C3b segment-view work is the fix.
 
 Honest summary of where this leaves 12 GB + a ~35 B-class routed MoE:
 
