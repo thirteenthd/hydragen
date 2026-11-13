@@ -413,6 +413,29 @@ function renderTotals(t) {
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
+// Batch-slot concurrency, ported from the archived HydraGen dashboard (experimental-final serve/web) onto the
+// 0.2.13 payload: live.slots carries one entry per batch slot (idle/reading/decoding + held tokens); queued and
+// outside_slots/waiting/admitting count requests that want a slot. Engine capacity is engine.batch_slots.
+function renderConcurrency(live, eng) {
+  const max = eng.batch_slots || live.parallel || 0;
+  const slots = live.slots || [];
+  const active = slots.filter((s) => s.state && s.state !== "idle").length;
+  const run = live.running != null ? live.running : active;
+  $("conc-run").textContent = `${run} / ${max || "?"}`;
+  const parts = [];
+  if (live.queued) parts.push(`${live.queued} queued`);
+  if (live.outside_slots) parts.push(`${live.outside_slots} outside slots`);
+  if (live.waiting) parts.push(`${live.waiting} waiting`);
+  if (live.admitting) parts.push(`${live.admitting} admitting`);
+  $("conc-extra").textContent = parts.join(" · ");
+  $("conc-slots").innerHTML = slots.map((s) => `
+    <div class="conc-slot" data-s="${esc(s.state || "idle")}">
+      <span class="conc-slot__n">slot ${esc(String(s.slot))}</span>
+      <span class="conc-slot__state">${esc(s.state || "idle")}</span>
+      <span class="conc-slot__tok">${fmt(s.held_tokens || 0)} tok</span>
+    </div>`).join("");
+}
+
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // model state
   // A local turn keeps metrics on "unloaded" for the whole engine start.
@@ -462,6 +485,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   $("state-label").textContent = label;
   $("state-detail").textContent = detail;
   $("state-bar").style.width = `${pct}%`;
+  if ($("conc-card")) renderConcurrency(live, eng);
 
   // the eight cards
   // Idle: not the last request's speed (one request is noisy) but the run's average from the server's totals
