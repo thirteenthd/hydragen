@@ -106,11 +106,54 @@ for the adaptive cache. Point the paths in `hydragen-local.json` at your own set
 ```bash
 git clone https://github.com/thirteenthd/hydragen.git
 # build engine/ (CUDA, Ampere), place IQ3_XXS blobs + MTP drafters per configs/
-bash bench/m25iso3.sh canon          # boot canonical
-python3 bench/battery_quality_m25.py canon   # quality oracle
-python3 bench/m25_farm5.py canon     # concurrency ladder
-python3 bench/m25_parkladder100k.py 4 canon  # park-dedup fleet
+bash bench/m25iso3.sh canon                # boot canonical
+python3 bench/battery_quality_m25.py canon # quality oracle
+python3 bench/m25_farm5.py canon           # concurrency ladder
+python3 bench/m25_parkladder100k.py 4 canon # park-dedup fleet
+python3 bench/m25_conc8_sweep.py --arm natural --C 2  # deep-ctx sweep (client-side timing)
+python3 bench/letta_sim_bench.py --C 4 --turns 6      # agent-harness traffic sim
 ```
+
+## Measured expectations on one 12 GB Ampere card
+
+Deep-context concurrency sweep on the canonical stack (IQ3_XXS qwen4_exp, C++
+worker, batch 2, park CoW on, 131k ctx). All timings are **client-side**
+(TTFT = first streamed token; decode rate from piece arrival timestamps), and
+every arm passed a needle-completeness QC (the model must echo an embedded
+unique code). Two traffic shapes: *natural* (C simultaneous unique ~100k-token
+requests, zero shared prefix) and *harness* (C sessions x 6 incremental turns
+over a shared 66k-token head, like an agent loop). Reproduce with
+`bench/m25_conc8_sweep.py`.
+
+| traffic | C | requests | total prompt tok | TTFT p50 (s) | TTFT p95 (s) | decode p50 (tok/s/stream) |
+|---|---|---|---|---|---|---|
+| natural | 1 | 1 | 100k | 37.3 | — | 100.4 |
+| natural | 2 | 2 | 200k | 0.3 | 45.1 | 8.6 |
+| natural | 4 | 4 | 401k | 45.4 | 91.9 | 8.3 |
+| natural | 8 | 8 | 802k | 219.1 | 357.9 | 8.4 |
+| harness | 1 | 6 | 607k | 2.5 | 35.8 | **74.0** |
+| harness | 2 | 12 | 1.21M | **2.5** | 35.8 | 8.3 |
+| harness | 4 | 24 | 2.43M | 41.2 | 95.0 | 1.0 |
+| harness | 8 | 48 | 4.86M | 72.6 | 282.7 | 4.1 |
+
+What to expect from 12 GB + a ~35 B-class routed MoE:
+
+- **One deep agent session (harness C1): comfortable.** Warm incremental turns
+  at ~100k context start in ~2.5 s (parked-session prefix reuse) and decode at
+  70+ tok/s. This is the product sweet spot today.
+- **Two concurrent deep sessions: the hard ceiling.** TTFT stays ~2.5 s warm,
+  but each stream decodes ~8 tok/s — at two 100k-token contexts the KV window
+  and expert cache are several-fold oversubscribed. Fine for patient tools;
+  not interactive-chat grade on both streams.
+- **C>=4 at 100k context: don't.** TTFT climbs to minutes and decode
+  collapses. Keep deep-context fleets at C<=2, or run shorter contexts where
+  the published wide-batch ladder applies (`docs/FINAL_REPORT.md`).
+- **Cold unique 100k requests are prefill-serialized:** each ~100k prompt
+  costs ~37 s of prefill; concurrency past C=2 mostly queues them.
+
+Closing the deep-context concurrency gap is the open M-C campaign (parked-cache
+disk tiering + KV-window dedup, tracked in `docs/CHANGES.md`); updated numbers
+land as each milestone ships.
 
 ## Provenance & license
 
