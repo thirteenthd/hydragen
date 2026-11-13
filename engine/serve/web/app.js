@@ -600,7 +600,9 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     const lit = (b.dataset.s === on || b.dataset.s === live.state) && !(starting && b.dataset.s === "unloaded");
     b.classList.toggle("on", lit);
   }
-  const prog = $("state-progress");
+  // Model State card replaced by Concurrency States (2026-11-13): the card's DOM is gone from the Monitor;
+  // keep the logic null-safe so a stale cached index.html still works and shared code paths survive.
+  const prog = $("state-progress") || {dataset: {}, style: {}};
   let label = "Waiting for a request", detail = "", pct = 0;
   if (modelOp === "load" || (busy != null && live.state === "unloaded" && !imageNow)) {
     label = "Loading";
@@ -636,9 +638,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     delete prog.dataset.tone;
     detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
   }
-  $("state-label").textContent = label;
-  $("state-detail").textContent = detail;
-  $("state-bar").style.width = `${pct}%`;
+  if ($("state-label")) {   // present only in the legacy (cached) Monitor layout
+    $("state-label").textContent = label;
+    $("state-detail").textContent = detail;
+    $("state-bar").style.width = `${pct}%`;
+  }
   if ($("slots-bars-grid")) renderConcurrency(live, eng, hw);
 
   // the eight cards
@@ -648,8 +652,10 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   const readTokens = totals ? totals.prompt_tokens - (totals.reused || 0) : 0;
   const avgPrefill = totals && totals.prompt_ms > 0 && readTokens > 0 ? readTokens / (totals.prompt_ms / 1000) : null;
   const speed = live.state === "generating" ? live.tok_s : avgDecode != null ? avgDecode : last ? last.decode_tok_s : null;
+  // live.tok_s is the engine's sum over all parallel streams (server _tok_s): with N batch slots decoding it IS the aggregate.
   setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
-            live.state === "generating" ? "Decode now" : avgDecode != null ? "Decode · run average" : last ? "Decode last request" : "Decode");
+            live.state === "generating" ? (live.running > 1 ? `Decode now · sum of ${live.running} streams` : "Decode now")
+            : avgDecode != null ? "Decode · run average" : last ? "Decode last request" : "Decode");
   const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
                 : avgPrefill != null ? avgPrefill : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
   setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
