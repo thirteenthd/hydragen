@@ -3,6 +3,13 @@
 Chronological record of every measurement → decision → commit in the program.
 Newest first; section numbers are stable, so §N always refers to the same entry.
 
+## 125. run5 C8 arm contamination: 13/48 tier-ON requests failed outright (correction to 124)
+
+Dashboard recent-requests review (user screenshot): the red Error rows are run5 C8 traffic, not live serving. Client jsonl forensics: mc3/conc8_harness_C8.jsonl has 13 rows with no TTFT and 16 with no prompt accounting; baseline conc8_harness_C8.jsonl has zero. Engine log shows 12 of those completing with 0 or 1 generated tokens after full prefill (4x zero, 8x one; the 13th is the 437 s starve). VRAM-free warnings (391/261 MiB at request start) fire during C8 - but also 17 times under normal battery traffic since restart, so the warning is endemic to the full card, NOT tier-specific; the 0/1-token outcome is what is new vs baseline.
+
+Consequence: C4 tier comparison stands (0 failures both arms). C8 tier row is contaminated - treat wall 1019 vs 951 as unmeasured until a rerun, not as a regression finding. C8 failures correlate with full-take restores: M-C3a disk restores mount images without park CoW donor sharing, so 6+ deep restores at 8-deep churn inflate the resident working set that baseline dedup kept shared.
+
+Actions banked: rerun MC3 C8 with park_disk counter + free monitoring logged per request; sweep v4 must count HTTP-level failures explicitly in the summary instead of surfacing only via needle counts; M-C3b segment-view files become the fix for restore-time sharing. README C8 note corrected in public sync.
 ## 124. Dashboard disk-tier visibility + first park-disk comparison sweep (cow-m3 + 1b1d4001)
 
 UI: Conversation cache card renamed to RAM; new Park disk tier sibling card (entries, bytes/budget bar, spills/drops/read-backs/fallbacks, last switch); .cache-pair grid puts RAM left / disk right at desktop width, RAM full-width when the tier is off. Serve-side ParkDiskLog parses the engine park-disk stderr lines into /metrics park_disk (engine gained one drop log line, 1b1d4001). Public chain: 5bfdcfde8 + 74abe296a via git am --directory=engine, dashboard commit 38e3150a9/1e0171b5c. Browser-verified live: RAM x=24, disk x=841, same row, 4 entries 7.2/8.0 GB, 8 read-backs.
@@ -14,6 +21,7 @@ Comparison sweep (conc8_run5.log, mc3/): MC3 C4 vs v3 C4 — wall 472.2 vs 501.0
 Taxonomy finding: engine log shows 6 disk restores of 98-107k tokens (0.8-3.6 s reads) inside the C8 window, but usage.prompt_tokens_details.cached_tokens stays ~0 for disk-restored admissions — the client classifies them deep_warm_reprefill, inflating apparent re-prefill. Real C8 re-prefill was roughly 716k - ~600k restored = ~116k. C8 wall regression hypothesis: 11 spills (~15 GiB writes) + 4 RAM-preflight refusals on the nearly-full /home LV contend with expert-blob streaming during 8-way cold prefill; C4 (smaller tier churn) wins cleanly.
 
 Actions: sweep v4 must diff /metrics park_disk.restores per request to add a deep_warm_disk_restore class; C8 needs spill-churn reduction (M-C3b segment views shrink images ~2x) or tier on a quieter volume. min_memavail 2.9 GiB during C8 (vs 4.0 baseline) — watch the floor.
+
 ## 123. M-C3a landed: park-disk tier under the parked cache (cow-m3 / c9d6fc44)
 
 - ParkDisk module (include/strata/core/conversation_park_disk.hpp + src/core/conversation_park_disk.cpp):
