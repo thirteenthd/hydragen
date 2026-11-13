@@ -3,6 +3,35 @@
 Chronological record of every measurement → decision → commit in the program.
 Newest first; section numbers are stable, so §N always refers to the same entry.
 
+## 123. M-C3a landed: park-disk tier under the parked cache (cow-m3 / c9d6fc44)
+
+- ParkDisk module (include/strata/core/conversation_park_disk.hpp + src/core/conversation_park_disk.cpp):
+  evict_oldest() hands the FULL victim image to the tier before its RAM goes; admission with no usable RAM
+  match reads the deepest disk prefix back and restores through the normal conversation-snapshot take path.
+  Reuses STRSES v1 (conversation_file.cpp): model+config identity fingerprints, bounded parse, payload hashes,
+  RAM preflight, temp+rename publish, folder 0700 files 0600. Knobs: STRATA_PARK_DISK=DIR (default OFF),
+  STRATA_PARK_DISK_MIB (budget), STRATA_PARK_DISK_MIN_FREE_MIB (keep-free, default 4096). Pinned prefixes and
+  the guarded donor never reach the tier; drop_superseded/clear never spill. Boot scan revalidates every file
+  and deletes foreign/corrupt ones (warm boot: index rebuilt, no RAM parked images until a request reaches them).
+- Gates on the reference host, canonical cow build + STRATA_PARK_COW=1 + STRATA_PARK_DISK on (8 GiB tier on
+  /home, keep-free 4 GiB):
+  * battery lan-83 green (QC6 exact 97,101,103) tier ON fresh boot.
+  * 6-sibling 102k forked-agent gate (bench_4x102k_shared.py range(6)): 22 LRU evictions spilled
+    (1.2-2.1 GiB files in 2.9-3.9 s, ~300-600 MB/s on /home), 5 disk restores read back in 0.87-1.6 s,
+    all streams completed 256 tokens, decode 9.8-113 t/s.
+  * fail-closed exercised for real: 2 restores REFUSED by the RAM preflight (2.1 GiB read + 2560 MiB floor
+    with ~4.6 GiB avail) -> fell back to reading the prompt, no partial state.
+  * race safety: no crash under --batch 2 + 6-deep churn; park COW anchor-lost fallback held (cow-m2fix path).
+  * boot scan with 4 tier files (7.4 GiB): 0 refused, index rebuilt in 7.0 s; battery lan-84 green after that boot.
+- Measured economics: spill write ~3 s, disk read ~1 s, then the usual ~20 s state remount; vs ~44 s cold
+  re-prefill at 100k. Break-even is immediate; the real win is harness deep-warm turns (the 505k/712k wasted
+  prompt tokens from sweep v3 harness C4/C8).
+- Comparison sweep launched (harness C4+C8 arms with tier ON, tags in mc3/, log conc8_run4.log) - the README
+  comparison rows the owner asked for come from those numbers.
+- Known v1 inefficiencies (M-C3b): full-copy spills (a re-spilled conversation replaces its file by LRU, but
+  stale superseded files can sit until the budget evicts them); spill path does not reuse M-C2 segment views;
+  disk entries never participate in borrows, only full takes.
+
 ## 122. archive refs deleted from public remote
 
 - Owner decision: provenance stays local. Remote deleted: archive/experimental-main, tags experimental-final-20261112, archive/feat-* , v0.4.0 (it pointed at old-main tip 72f825d0 and kept ~150 unscrubbed commits addressable).
