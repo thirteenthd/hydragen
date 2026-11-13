@@ -95,9 +95,9 @@ Write-Host "Building the HydraGen engine (CUDA arch: $ARCH) ..."
   -DSTRATA_PORTABLE=ON `
   -DSTRATA_Q6K_EXPERTS=ON `
   -DSTRATA_MMQ_KQUANTS=ON `
-  -DCMAKE_CUDA_ARCHITECTURES=$ARCH `
-  -DCMAKE_CUDA_COMPILER="$CUDA\bin\nvcc.exe" `
-  -DCMAKE_MAKE_PROGRAM=$NINJA
+  "-DCMAKE_CUDA_ARCHITECTURES=$ARCH" `
+  "-DCMAKE_CUDA_COMPILER=$CUDA\bin\nvcc.exe" `
+  "-DCMAKE_MAKE_PROGRAM=$NINJA"
 if ($LASTEXITCODE -ne 0) { Write-Error "install.ps1: cmake configure failed" }
 & $CMAKE --build engine/build --parallel ([Environment]::ProcessorCount)
 if ($LASTEXITCODE -ne 0) { Write-Error "install.ps1: build failed" }
