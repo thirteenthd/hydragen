@@ -11,7 +11,7 @@ Demonstrated on one RTX 3080 Ti (12 GB) + 60 GB host RAM, no multi-GPU, no datac
 
 | Path | Contents |
 |---|---|
-| `engine/` | git submodule → [hydragen-engine](https://github.com/thirteenthd/hydragen-engine), our fork of [Strata](https://github.com/Niko1221/Strata) (v0.2.13 + the CoW commit chain, branch `hydragen-cow`) |
+| `engine/` | our fork of [Strata](https://github.com/Niko1221/Strata) (MIT) — vendored at v0.2.13 with the six-commit CoW chain applied on top, full commit history inside this repo |
 | `configs/` | canonical ctx-131k serving config + launcher |
 | `bench/` | the gate suite used for every landing: battery (quality oracle), farm (concurrency ladder), park-ladders (22k and 100k depth), CoW arm runner |
 | `docs/` | final benchmark report, the 116-section program changelog, engineering laws distilled from the campaign |
@@ -58,7 +58,7 @@ donor's host K/V buffer segments as verified views — only the tail is copied.
 ## Reproducing
 
 ```bash
-git clone --recurse-submodules https://github.com/thirteenthd/hydragen.git
+git clone https://github.com/thirteenthd/hydragen.git
 # build engine/ (CUDA, Ampere), place IQ3_XXS blobs + MTP drafters per configs/
 bash bench/m25iso3.sh canon          # boot canonical
 python3 bench/battery_quality_m25.py canon   # quality oracle
@@ -69,7 +69,8 @@ python3 bench/m25_parkladder100k.py 4 canon  # park-dedup fleet
 ## Provenance & license
 
 The engine is a fork of **[Strata](https://github.com/Niko1221/Strata)** (MIT, Niko1221) —
-v0.2.13 plus our six-commit CoW chain, applied cleanly upstream. See `NOTICE`.
+vendored at v0.2.13 plus our six-commit CoW chain, with upstream commit history
+preserved under `engine/`. See `NOTICE`.
 HydraGen code is Apache-2.0 (`LICENSE`); Strata-derived engine code remains MIT.
-The full 116-section program changelog (`docs/CHANGES.md`) is the notarized record
+The full 117-section program changelog (`docs/CHANGES.md`) is the notarized record
 of every measurement → decision → commit in this campaign.
