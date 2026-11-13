@@ -628,8 +628,9 @@ int64_t g_kv_elastic_init = 16384;
 bool g_cow_arena = false;
 int64_t g_cow_arena_slots = 0;
 int64_t g_cow_slot_cells = 0;
+int64_t g_cow_join_hh = 0;               // cow-m1d: per-range join headroom; 0 = join-at-fetch OFF (forkb4 behavior)
 namespace {
-struct CowArena { int8_t* k = nullptr; int8_t* v = nullptr; uint16_t* ks = nullptr; uint16_t* vs = nullptr; int* use = nullptr; };
+struct CowArena { int8_t* k = nullptr; int8_t* v = nullptr; uint16_t* ks = nullptr; uint16_t* vs = nullptr; int* use = nullptr; unsigned long long* jctr = nullptr; };   // cow-m1d: jctr = joins-at-fetch counter (telemetry)
 std::vector<CowArena> g_cow_arenas;
 int64_t g_cow_session_ctr = -1;
 }
@@ -800,6 +801,32 @@ void qsa_set_cow_arena(int64_t slots_per_layer) {   // cow-m1 (extern scope; the
 }
 void qsa_cow_session_begin() { ++g_cow_session_ctr; }
 void qsa_set_cow_slot_cells(int64_t cells) { g_cow_slot_cells = cells > 0 ? cells : 0; }
+void qsa_set_cow_join_hh(int64_t v) { g_cow_join_hh = v > 0 ? v : 0; }
+
+// cow-m1d: the join-at-fetch registry. Entries are born at state init (full write, before anything decodes)
+// and afterwards ONLY `conv` mutates, and only as its own 4 B store: a concurrent device scan never sees a
+// torn entry. Siblings share a `conv` set by the admission fork's lineage call.
+static constexpr int kCowRegCap = 192;
+static strata::kernels::CowPeer* g_cow_reg = nullptr;
+static std::vector<strata::kernels::CowPeer> g_cow_reg_h;
+static int64_t g_cow_conv_serial = 0;
+static strata::kernels::CowPeer* cow_reg_entry(int32_t* pt) {
+    for (auto& pe : g_cow_reg_h) if (pe.pt == pt) return &pe;
+    return nullptr;
+}
+static void cow_reg_conv(const strata::kernels::CowPeer& pe) {   // the 4 B mutation law
+    (void) cudaMemcpy(&g_cow_reg[&pe - g_cow_reg_h.data()].conv, &pe.conv, 4, cudaMemcpyHostToDevice);
+}
+static void cow_reg_reset_fields(const strata::kernels::CowPeer& pe) {   // conv + hhead, one 8 B store (each 4 B half lands atomically)
+    (void) cudaMemcpy(&g_cow_reg[&pe - g_cow_reg_h.data()].conv, &pe.conv, 8, cudaMemcpyHostToDevice);
+}
+uint64_t qsa_cow_joins(int64_t qsa_ordinal) {
+    if (qsa_ordinal < 0 || (size_t) qsa_ordinal >= g_cow_arenas.size() ||
+        g_cow_arenas[(size_t) qsa_ordinal].jctr == nullptr) return 0;
+    uint64_t v = 0;
+    if (cudaMemcpy(&v, g_cow_arenas[(size_t) qsa_ordinal].jctr, 8, cudaMemcpyDeviceToHost) != cudaSuccess) return 0;
+    return v;
+}
 
 int64_t qsa_cow_fork(const QsaState& from, QsaState& to, int64_t upto, std::string& error) {
     if (from.kv_mode != 1 || to.kv_mode != 1 || from.map.slot_use == nullptr ||
@@ -820,45 +847,34 @@ int64_t qsa_cow_fork(const QsaState& from, QsaState& to, int64_t upto, std::stri
         else if (sl >= tb && sl < tb + (int64_t) to.n_slots) ftab[b] = -1;        // names to's own range: cold, not aliased
         else if (sl < 0) ftab[b] = -1;                                            // -1 or a claimed -2: cold
     }
-    if (shared > 0) {   // bump the source range's refcounts
-        std::vector<int32_t> fuse((size_t) fn, 0);
-        if (cudaMemcpy(fuse.data(), from.map.slot_use + fb, (size_t) fn * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
-            error = "cow fork: the source refcounts could not be read";
-            return -1;
-        }
-        for (int64_t b = 0; b < P; ++b) {
-            const int32_t sl = ftab[b];
-            if (sl >= fb && sl < fb + fn) ++fuse[sl - fb];
-        }
-        if (cudaMemcpy(from.map.slot_use + fb, fuse.data(), (size_t) fn * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
-            error = "cow fork: the source refcounts could not be written";
-            return -1;
-        }
-    }
     if (cudaMemcpy(to.map.page_table, ftab.data(), (size_t) P * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
         error = "cow fork: the table splice failed";
         return -1;
+    }
+    // cow-m1d: the bump moved ON-DEVICE: a host read-modify-write could trample a join pinning the source
+    // concurrently (pipelined windows decode while admissions run). The kernel revalidates every spliced
+    // entry against the source table before adding the holder's ref, and reverts the dead ones to cold.
+    strata::kernels::kv_stream_cow_fork_join(to.map, from.map, nullptr);
+    {   // cow-m1d: fork lineage: `to` joins `from`'s join lineage (a -1 `from` gets a fresh serial)
+        strata::kernels::CowPeer* pf = cow_reg_entry(from.map.page_table);
+        strata::kernels::CowPeer* pt2 = cow_reg_entry(to.map.page_table);
+        if (pf != nullptr && pt2 != nullptr) {
+            if (pf->conv < 0) { pf->conv = (int32_t) (++g_cow_conv_serial); cow_reg_conv(*pf); }
+            pt2->conv = pf->conv; cow_reg_conv(*pt2);
+        }
     }
     return shared;
 }
 
 void qsa_cow_release(QsaState& st) {
     if (st.kv_mode != 1 || st.map.slot_use == nullptr) return;
-    const int64_t P = st.map.n_blocks;
-    std::vector<int32_t> tab((size_t) P);
-    if (cudaMemcpy(tab.data(), st.map.page_table, (size_t) P * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return;
-    const int64_t b0 = st.map.slot_base, n = st.map.n_slots;
-    int64_t foreign = 0;
-    for (int64_t i = 0; i < P; ++i)
-        if (tab[i] >= 0 && !(tab[i] >= b0 && tab[i] < b0 + n)) ++foreign;
-    if (foreign == 0) return;
-    std::vector<int32_t> use((size_t) g_cow_arena_slots);
-    if (cudaMemcpy(use.data(), st.map.slot_use, (size_t) g_cow_arena_slots * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return;
-    for (int64_t i = 0; i < P; ++i) {
-        const int32_t sl = tab[i];
-        if (sl >= 0 && !(sl >= b0 && sl < b0 + n) && sl < g_cow_arena_slots && use[sl] > 1) --use[sl];
+    // cow-m1d: on-device atomics; the host read-modify-write raced concurrent join pins. Sequenced on the
+    // same stream as the map reset that follows, so the table it scans is the live one.
+    strata::kernels::kv_stream_cow_release(st.map, nullptr);
+    if (strata::kernels::CowPeer* pe = cow_reg_entry(st.map.page_table)) {
+        pe->conv = -1; pe->hhead = (int32_t) std::min<int64_t>(g_cow_join_hh, pe->n_slots / 2);   // the window just emptied: the join budget refreshes to policy
+        cow_reg_reset_fields(*pe);
     }
-    (void) cudaMemcpy(st.map.slot_use, use.data(), (size_t) g_cow_arena_slots * 4, cudaMemcpyHostToDevice);
 }
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
@@ -979,8 +995,17 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                 CowArena& a = g_cow_arenas[(size_t) j];
                 ok = cudaMalloc((void**) &a.k, kb) == cudaSuccess && cudaMalloc((void**) &a.v, kb) == cudaSuccess &&
                      cudaMalloc((void**) &a.ks, sb2) == cudaSuccess && cudaMalloc((void**) &a.vs, sb2) == cudaSuccess &&
-                     cudaMalloc((void**) &a.use, (size_t) g_cow_arena_slots * 4) == cudaSuccess;
-                if (ok) ok = cudaMemset(a.use, 0, (size_t) g_cow_arena_slots * 4) == cudaSuccess;
+                     cudaMalloc((void**) &a.use, (size_t) g_cow_arena_slots * 4) == cudaSuccess &&
+                     cudaMalloc((void**) &a.jctr, 8) == cudaSuccess;
+                if (ok) ok = cudaMemset(a.use, 0, (size_t) g_cow_arena_slots * 4) == cudaSuccess &&
+                             cudaMemset(a.jctr, 0, 8) == cudaSuccess;
+            }
+            if (ok) {   // cow-m1d: the join-at-fetch registry: a fixed device array, entries created at state init, never destroyed
+                g_cow_reg_h.assign((size_t) kCowRegCap, strata::kernels::CowPeer{});
+                if (cudaMalloc((void**) &g_cow_reg, (size_t) kCowRegCap * sizeof(strata::kernels::CowPeer)) != cudaSuccess ||
+                    cudaMemcpy(g_cow_reg, g_cow_reg_h.data(), (size_t) kCowRegCap * sizeof(strata::kernels::CowPeer),
+                               cudaMemcpyHostToDevice) != cudaSuccess)
+                    ok = false;
             }
             if (ok)
                 std::fprintf(stderr, "cow: K/V arenas: %lld QSA layers x %lld slots = %.2f GiB (INT8 streamed)\n",
@@ -989,7 +1014,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             if (!ok) {
                 std::fprintf(stderr, "cow: the K/V arenas could not be allocated: falling back to private pools\n");
                 for (CowArena& a : g_cow_arenas) {
-                    cudaFree(a.k); cudaFree(a.v); cudaFree(a.ks); cudaFree(a.vs);
+                    cudaFree(a.k); cudaFree(a.v); cudaFree(a.ks); cudaFree(a.vs); cudaFree(a.jctr);
                 }
                 g_cow_arenas.clear();
                 g_cow_arena = false;
@@ -1031,8 +1056,25 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.map.n_blocks = pages;
     st.map.n_slots = p.slots;
     st.map.slot_base = cow_sb;   // cow-m1
-    if (g_cow_arena && p.mode == 1 && st.kv_int8 && !st.kv_q4 && !g_cow_arenas.empty())
+    if (g_cow_arena && p.mode == 1 && st.kv_int8 && !st.kv_q4 && !g_cow_arenas.empty()) {
         st.map.slot_use = g_cow_arenas[(size_t) qsa_ordinal].use;   // cow-m1b: baked with the map; the sweep guard reads it. NOT keyed on cow_sb: session 0's range legitimately starts at 0
+        st.map.reg = g_cow_reg;
+        st.map.reg_n = kCowRegCap;
+        st.map.join_ctr = g_cow_arenas[(size_t) qsa_ordinal].jctr;
+    }
+    if (g_cow_reg && st.map.slot_use != nullptr) {   // cow-m1d: register this state for join-at-fetch (init only: refresh reuses this table buffer forever)
+        strata::kernels::CowPeer* pe = nullptr;
+        for (auto& q : g_cow_reg_h) if (q.pt == st.map.page_table) { pe = &q; break; }
+        if (pe == nullptr) for (auto& q : g_cow_reg_h) if (q.pt == nullptr) { pe = &q; break; }
+        if (pe != nullptr) {
+            pe->conv = -1; pe->hhead = (int32_t) std::min<int64_t>(g_cow_join_hh, p.slots / 2); pe->ord = (int32_t) qsa_ordinal; pe->base = (int32_t) cow_sb;
+            pe->n_slots = (int32_t) p.slots; pe->n_blocks = (int32_t) st.map.n_blocks;
+            pe->pt = st.map.page_table;
+            const int64_t i = (int64_t) (pe - g_cow_reg_h.data());
+            if (cudaMemcpy(g_cow_reg + i, pe, sizeof(*pe), cudaMemcpyHostToDevice) != cudaSuccess)
+                std::fprintf(stderr, "cow: could not register a state in the join registry\n");
+        }
+    }
     if (p.mode == 1) {
         st.map.slot_block = c.take<int32_t>((uint64_t) p.slots);
         st.map.slot_stamp = c.take<int32_t>((uint64_t) p.slots);

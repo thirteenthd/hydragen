@@ -63,6 +63,18 @@ inline KvHostPools kv_hybrid_v_half(const KvHostPools& h) {
 }
 
 /// The residency map of a streamed layer, all device memory at fixed addresses (the graphs bake them in).
+/// cow-m1d: one registered streamed state, scanned by resolve for join-at-fetch. Only `conv` mutates
+/// after init, and only as a single 4-byte aligned store, so a concurrent scan never sees a torn entry.
+struct CowPeer {
+    int32_t conv = -1;      ///< fork lineage; -1: not in any lineage, never joins and never joined
+    int32_t hhead = 0;      ///< join headroom: joined pins cost the FETCHER's window, so a range takes at most this many foreign joins (device-atomic; the host seeds it at init/reset)
+    int32_t ord = 0;        ///< QSA ordinal: the join target must share the layer arena
+    int32_t base = 0;       ///< slot_base of the state's arena range
+    int32_t n_slots = 0;
+    int32_t n_blocks = 0;   ///< its table's length
+    int32_t* pt = nullptr;  ///< its page table (null: entry free)
+};
+
 struct KvStreamMap {
     int32_t* page_table = nullptr;  ///< (n_blocks,) block -> slot, or -1
     int32_t* slot_block = nullptr;  ///< (n_slots,) slot -> block, or -1
@@ -79,6 +91,10 @@ struct KvStreamMap {
     /// cow-m1: (arena capacity,) refcounts over arena pages, host-managed (fork/release), device-read by
     /// the clock sweep: a slot named by another session's table (use > 1) is never taken as its owner's victim.
     int* slot_use = nullptr;
+    /// cow-m1d: join-at-fetch registry (arena-global device array, entries registered at state init).
+    CowPeer* reg = nullptr;
+    int reg_n = 0;
+    unsigned long long* join_ctr = nullptr;   ///< telemetry: joins of this arena
 };
 
 inline constexpr int kKvCtlInts = 16;   ///< [0] epoch [1] hand [2] misses [3] overflow; u64 at [4] misses, [6] lookups, [8] calls
@@ -87,6 +103,12 @@ inline uint64_t kv_stream_map_bytes(int64_t n_slots) { return (uint64_t) n_slots
 
 /// Every block evicted: page table all -1, slots free, counters zero.
 void kv_stream_reset(const KvStreamMap& m, void* stream);
+
+/// cow-m1d: after a host-side admission splice: re-hold every spliced entry whose source still names the
+/// same page (device atomicAdd, racing no host read-modify-write), revert the rest to cold. And before a
+/// map reset: drop the holds this map pins on foreign pages. Both grid-stride table scans.
+void kv_stream_cow_fork_join(const KvStreamMap& to, const KvStreamMap& from, void* stream);
+void kv_stream_cow_release(const KvStreamMap& m, void* stream);
 
 /// Make every block named by the selections of `n_q` queries resident (ids [n_q][cap], width from
 /// steps[q * kStepCount + kStepWidth]). Capturable. `n_slots` must hold the distinct blocks of one call

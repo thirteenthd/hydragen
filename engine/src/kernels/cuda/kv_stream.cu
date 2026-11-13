@@ -110,8 +110,44 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
                     m.slot_stamp[sl - m.slot_base] = epoch;
                     m.slot_ref[sl - m.slot_base] = 1;
                 }
-            } else if (sl == -1 && atomicCAS(&m.page_table[b], -1, -2) == -1) {
-                m.miss_block[atomicAdd(&s_nmiss, 1)] = b;
+            } else if (sl == -1) {
+                bool joined = false;
+                if (m.reg != nullptr && m.slot_use != nullptr) {   // cow-m1d: join a lineage sibling's resident page instead of fetching a duplicate
+                    int se = -1;
+                    for (int e = 0; e < m.reg_n && se < 0; ++e) if (m.reg[e].pt == m.page_table) se = e;
+                    if (se >= 0 && m.reg[se].conv >= 0) {
+                        for (int e = 0; e < m.reg_n && !joined; ++e) {
+                            if (e == se || m.reg[e].pt == nullptr || m.reg[e].pt == m.page_table ||
+                                m.reg[e].ord != m.reg[se].ord || m.reg[e].conv != m.reg[se].conv ||
+                                b >= m.reg[e].n_blocks) continue;
+                            volatile int32_t* vpt = m.reg[e].pt;   // L2 reads: the entry is written by another kernel, possibly another SM
+                            const int32_t s2 = vpt[b];
+                            if (s2 < 0) continue;
+                            // cow-m1d join protocol: ANY number of holders share a page, so the pin is an
+                            // unconditional add; prev >= 1 says a holder was there when we landed. An add that
+                            // hit the owner's evict window (prev == 0) takes itself back; the revalidation
+                            // catches entries that moved. A rollback landing after the owner re-published
+                            // (store use = 1) can undercount that slot forever: the sweep then can never take
+                            // it and joins to it degrade to duplicate fetches - a leak, never a corruption.
+                            // A joined pin is un-evictable by its owner, so it spends the fetcher's window:
+                            // hhead caps how many foreign joins one range accepts, keeping every window
+                            // turning. Over the cap the miss falls through to a cold fetch instead.
+                            if (atomicSub(&m.reg[e].hhead, 1) <= 0) { atomicAdd(&m.reg[e].hhead, 1); continue; }
+                            const int prev = atomicAdd(&m.slot_use[s2], 1);
+                            if (prev >= 1 && vpt[b] == s2) {
+                                m.page_table[b] = s2;
+                                joined = true;
+                                if (m.join_ctr) atomicAdd(m.join_ctr, 1ull);
+                            } else {
+                                atomicSub(&m.slot_use[s2], 1);
+                                atomicAdd(&m.reg[e].hhead, 1);
+                            }
+                        }
+                    }
+                }
+                if (!joined && atomicCAS(&m.page_table[b], -1, -2) == -1) {
+                    m.miss_block[atomicAdd(&s_nmiss, 1)] = b;
+                }
             }
         }
     }
@@ -151,12 +187,33 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
         const int b = m.miss_block[k];
         if (k >= placed) { m.page_table[b] = -1; continue; }   // overflow: never happens with a legal n_slots
         const int sl = m.miss_slot[k];
+        const int gs = sl + (int) m.slot_base;
         const int old = m.slot_block[sl];
-        if (old >= 0) m.page_table[old] = -1;
-        m.slot_block[sl] = b;
-        m.slot_stamp[sl] = epoch;
-        m.slot_ref[sl] = 1;
-        m.page_table[b] = sl + (int) m.slot_base;   // cow-m1: the table names global arena pages
+        if (m.slot_use != nullptr) {
+            // cow-m1d: take the old page's entry OFF the table, fenced, before the commit CAS: a sibling can
+            // then never latch a join onto a slot whose bytes are about to move. The CAS(1->0) contends with
+            // any join that beat us: it fails, we restore the entry exactly as it was, and the miss turns back
+            // cold (a host read-through, stall-free).
+            if (old >= 0) m.page_table[old] = -1;
+            __threadfence();
+            if (atomicCAS(&m.slot_use[gs], 1, 0) != 1) {
+                if (old >= 0) m.page_table[old] = gs;
+                m.miss_slot[k] = -1;
+                m.page_table[b] = -1;
+                continue;
+            }
+            m.slot_block[sl] = b;
+            m.slot_stamp[sl] = epoch;
+            m.slot_ref[sl] = 1;
+            m.slot_use[gs] = 1;
+            m.page_table[b] = -2;   // stays CLAIMED: the copy kernel publishes it once the bytes are in, so no sibling can join a half-copied page
+        } else {
+            if (old >= 0) m.page_table[old] = -1;
+            m.slot_block[sl] = b;
+            m.slot_stamp[sl] = epoch;
+            m.slot_ref[sl] = 1;
+            m.page_table[b] = gs;   // cow-m1: the table names global arena pages
+        }
     }
     if (threadIdx.x == 0) {
         m.ctl[0] = epoch;
@@ -175,11 +232,16 @@ __global__ void copy_kernel(KvStreamMap m, Runs r) {
     const int need = m.ctl[2];
     for (int k = blockIdx.x; k < need; k += gridDim.x) {
         const long long b = m.miss_block[k], sl = m.miss_slot[k];
+        if (b < 0 || sl < 0) continue;   // cow-m1d: an aborted victim must not have its (now foreign-owned) slot overwritten
         for (int a = 0; a < r.n; ++a) {
             const uint4* src = reinterpret_cast<const uint4*>(r.src[a] + b * r.len[a]);
             uint4* dst = reinterpret_cast<uint4*>(r.dst[a] + (sl + m.slot_base) * r.len[a]);   // cow-m1
             for (int i = threadIdx.x; i < r.len[a] / 16; i += blockDim.x) dst[i] = src[i];
         }
+        // cow-m1d: publish AFTER the bytes: an arena map left the entry at -2 (claimed); a legacy map
+        // published the same value in resolve, so this store is idempotent there.
+        __syncthreads();
+        if (threadIdx.x == 0) m.page_table[b] = (int32_t) (sl + m.slot_base);
     }
 }
 
@@ -200,6 +262,33 @@ __global__ void ring_kernel(int32_t* table, long long n_blocks, long long n_slot
         table[i] = (int32_t) (i % n_slots);
 }
 
+__global__ void cow_fork_join_kernel(KvStreamMap to, KvStreamMap from) {
+    const long long fb = from.slot_base, fn = from.n_slots;
+    for (long long b = (long long) blockIdx.x * blockDim.x + threadIdx.x; b < to.n_blocks;
+         b += (long long) gridDim.x * blockDim.x) {
+        const int32_t s = to.page_table[b];
+        if (s < fb || s >= fb + fn) continue;
+        if (from.page_table[b] == s) atomicAdd(&to.slot_use[s], 1);
+        else to.page_table[b] = -1;   // cow-m1d: the source evicted between the host splice and here: revert the entry cold
+    }
+}
+__global__ void cow_release_kernel(KvStreamMap m) {
+    const long long b0 = m.slot_base, n = m.n_slots;
+    for (long long b = (long long) blockIdx.x * blockDim.x + threadIdx.x; b < m.n_blocks;
+         b += (long long) gridDim.x * blockDim.x) {
+        const int32_t s = m.page_table[b];
+        if (s >= 0 && !(s >= b0 && s < b0 + n)) {
+            atomicSub(&m.slot_use[s], 1);
+            if (m.reg != nullptr)   // cow-m1d: this holder stops pinning the peer's page: refund its join headroom
+                for (int e = 0; e < m.reg_n; ++e)
+                    if (m.reg[e].pt != nullptr && s >= m.reg[e].base && s < m.reg[e].base + m.reg[e].n_slots) {
+                        atomicAdd(&m.reg[e].hhead, 1);
+                        break;
+                    }
+        }
+    }
+}
+
 }  // namespace
 
 uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
@@ -210,6 +299,16 @@ uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
     if (fmt == kKvQ4) return rows * kv_q4_bytes_per_head((int) s.head_dim) * 2;
     return fmt == kKvInt8 ? rows * (uint64_t) s.head_dim * 2 + rows * (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 * 2
                 : rows * (uint64_t) s.head_dim * 2 * 2;
+}
+
+void kv_stream_cow_fork_join(const KvStreamMap& to, const KvStreamMap& from, void* stream) {
+    if (to.slot_use == nullptr || from.slot_use != to.slot_use) return;
+    cow_fork_join_kernel<<<128, 512, 0, (cudaStream_t) stream>>>(to, from);
+}
+
+void kv_stream_cow_release(const KvStreamMap& m, void* stream) {
+    if (m.slot_use == nullptr) return;
+    cow_release_kernel<<<128, 512, 0, (cudaStream_t) stream>>>(m);
 }
 
 void kv_stream_reset(const KvStreamMap& m, void* stream) {
