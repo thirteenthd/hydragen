@@ -28,3 +28,10 @@
   streams finish before the shot). Never claim a UI fix from grep markers alone.
 - LAN dashboard: http://the-LAN-address:8181/ (the reference host), API key in
   strata-iq3xxs-m25-0213-ctx131k-lan-cow.json (chmod 600, vault-grade secret).
+- Cache cards: the RAM parked-cache card and the Park disk tier card sit in a
+  .cache-pair grid row (RAM left, disk right at desktop width; RAM keeps the
+  row alone when the tier is off). The old assumption that the .metrics
+  auto-fit grid pairs sibling cards is FALSE - cards there are full width.
+- /metrics park_disk comes from serve parsing the engine's stderr park-disk
+  log lines (ParkDiskLog in serve/server.py); a new engine log verb needs a
+  matching regex there, and serve must be restarted for parser changes.
