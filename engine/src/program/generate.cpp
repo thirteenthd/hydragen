@@ -39,6 +39,7 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
+#include "strata/core/conversation_park_disk.hpp"
 #include "strata/core/auto_cache.hpp"
 #include "strata/core/ple_residency.hpp"
 #include "strata/core/defaults_026.hpp"
@@ -12136,6 +12137,33 @@ int main(int argc, char** argv) {
             id.config = *config_fp;
             return true;
         };
+        // M-C3a: an optional disk tier under the parked cache (STRATA_PARK_DISK=DIR). LRU eviction spills the
+        // victim to an identity-bound STRSES file; an admission whose whole usable prefix lives on disk reads it
+        // back and restores it through the normal conversation-snapshot path. Read limits (and the RAM preflight
+        // inside them) are this engine's, exactly as the /slots disk-session path builds them below.
+        strata::core::ParkDisk park_disk;
+        if (const auto pd_opt = strata::core::ParkDisk::from_env()) {
+            park_disk.init(*pd_opt,
+                [&](strata::core::SessionFileIdentity& id, std::string& e) { return session_identity(id, e, [] {}); },
+                [&](strata::core::SessionReadLimits& lim, std::string& e) {
+                    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                    lim.admit = [floor](uint64_t need, std::string& why) {
+                        const auto mem = strata::core::sample_host_memory();
+                        const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+                        if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                        why = "not enough free RAM to read the parked image back (" + std::to_string(need >> 20) +
+                              " MiB plus a floor of " + std::to_string((long long) (floor >> 20)) + " MiB)";
+                        return false;
+                    };
+                    return strata::core::conversation_session_read_limits(
+                        lim, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                        (uint64_t) std::max(o.prompt_cache, 1), e);
+                });
+            if (park_disk.enabled() && conversations.enabled())
+                conversations.spill_hook = [&](strata::core::SavedConversation&& img) {
+                    park_disk.spill(std::move(img));
+                };
+        }
         // What a park captures: the main session's conversation (park_current) or an idle batch slot's (park_slot:
         // the reply it decoded, before an admission overwrites it).  One budget / admission / snapshot path for both.
         struct ParkSource {
@@ -16400,6 +16428,21 @@ int main(int argc, char** argv) {
                           conversations.borrows(parked);
             if (parked.tokens > std::max(resume, slot_tokens) && !borrow)
                 incoming.emplace(conversations.take(parked.index));
+            // M-C3a: no usable RAM match at all (batch-slot resume and live state always win): a spilled parked
+            // conversation comes back from the disk tier as a full take - no borrowing from disk in v1.
+            bool from_disk = false;
+            if (!incoming && !borrow && parked.tokens <= std::max(resume, slot_tokens) && park_disk.enabled()) {
+                const auto d = park_disk.best(ids, req_imgs, want_cvec);
+                if (d.tokens > std::max(resume, slot_tokens)) {
+                    std::string derr;
+                    if (auto img = park_disk.load(d, derr)) {
+                        incoming.emplace(std::move(*img));
+                        from_disk = true;
+                    } else if (!derr.empty())
+                        std::fprintf(stderr, "strata serve: park disk: load refused (%s); rereading the prompt\n",
+                                     derr.c_str());
+                }
+            }
             if (incoming || borrow) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
@@ -16460,7 +16503,10 @@ int main(int argc, char** argv) {
                                  (long long) strata::program::conv_cache::kRestoreFirstUseMib);
                     auto retry = std::move(*incoming);
                     incoming.reset();
-                    if (!conversations.put(std::move(retry)))
+                    if (from_disk)
+                        std::fprintf(stderr, "strata serve: conversation cache: disk image not restored; the file "
+                                             "stays for a later turn\n");
+                    else if (!conversations.put(std::move(retry)))
                         std::fprintf(stderr, "strata serve: conversation cache: could not return the skipped snapshot\n");
                     err.clear();
                 }

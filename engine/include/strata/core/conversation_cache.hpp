@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -248,6 +249,10 @@ public:
 
     ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0)
         : budget_(budget), slots_(slots), min_tokens_(min_tokens) {}
+    // M-C3a: optional disk tier (conversation_park_disk.hpp). When set, an image evict_oldest() throws away is
+    // handed over IN FULL before its RAM goes; the tier decides what it keeps. drop_superseded() and clear()
+    // do not spill: superseded copies are stale by construction and clear() drops poisoned state.
+    std::function<void(SavedConversation&&)> spill_hook;
     bool enabled() const { return budget_ != 0 && slots_ != 0; }
     /// `--conversation-cache-min-tokens`: whether a conversation of this length is worth one of `slots`.  Every
     /// parked conversation costs a whole slot whatever its length, so a client that interleaves short side requests
@@ -434,9 +439,11 @@ public:
         // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
-            bytes_ -= entries_[i].bytes();
+            SavedConversation victim = std::move(entries_[i]);   // M-C3a: the tier may take it before it goes
+            bytes_ -= victim.bytes();
             erase(i);
             ++evictions_;
+            if (spill_hook) spill_hook(std::move(victim));
             return true;
         }
         return false;
