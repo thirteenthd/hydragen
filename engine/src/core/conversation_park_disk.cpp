@@ -329,6 +329,9 @@ void ParkDisk::drop_oldest() {
 #else
     ::DeleteFileA(e.path.c_str());
 #endif
+    std::fprintf(stderr, "strata serve: park disk: drop %s (%.1f MiB, %zu entries, %.1f GiB on disk)\n",
+                 e.path.c_str(), (double) e.bytes / (1024.0 * 1024.0), entries_.size(),
+                 (double) bytes_ / (1024.0 * 1024.0 * 1024.0));
     // a not-yet-started write for this serial leaves the queue with it (its rename would republish the file);
     // one already in flight is caught by drain_finished(), which unlinks a file nobody indexes anymore
     std::lock_guard<std::mutex> g(mtx_);
