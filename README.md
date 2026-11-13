@@ -14,7 +14,7 @@ Demonstrated on one RTX 3080 Ti (12 GB) + 60 GB host RAM, no multi-GPU, no datac
 | `engine/` | our fork of [Strata](https://github.com/Niko1221/Strata) (MIT) — vendored at v0.2.13 with the six-commit CoW chain applied on top, full commit history inside this repo |
 | `configs/` | canonical ctx-131k serving config + launcher |
 | `bench/` | the gate suite used for every landing: battery (quality oracle), farm (concurrency ladder), park-ladders (22k and 100k depth), CoW arm runner |
-| `docs/` | final benchmark report, the 116-section program changelog, engineering laws distilled from the campaign |
+| `docs/` | final benchmark report, the 120-section program changelog, engineering laws distilled from the campaign |
 
 ## Headline results (all measured, all quality-gated)
 
@@ -50,12 +50,41 @@ chunk plans produces different KV bytes, so sharing must be lineage-based, verif
 The clock-sweep eviction guard skips ref-counted pages. Parked sessions adopt a
 donor's host K/V buffer segments as verified views — only the tail is copied.
 
-**Knobs** (all default OFF = stock behavior): `STRATA_COW_ARENA=1` +
-`STRATA_COW_ARENA_SLOTS` + `STRATA_COW_FORK=1` (VRAM fork),
-`STRATA_PARK_COW=1` (park dedup), `STRATA_COW_JOIN_HH` / `STRATA_COW_SHARED`
-(opt-in experiments, kept for roomier substrates). See `docs/laws/`.
+**Knobs.** The VRAM funding mechanisms (global arenas, admission fork with page
+ref-counting) are compiled into this engine and always on — that is the product.
+`STRATA_PARK_COW=1` turns on host-tier parked dedup — recommended, it's on in our
+canonical serving config. `STRATA_COW_JOIN_HH` / `STRATA_COW_SHARED` are the
+closed-negative experiments, kept default-off for roomier substrates. See `docs/laws/`.
 
-## Reproducing
+## Install
+
+```bash
+git clone https://github.com/thirteenthd/hydragen.git
+cd hydragen
+./install.sh    # needs NVIDIA driver + CUDA toolkit + Python 3.10+
+```
+
+`install.sh` finds the CUDA toolkit, provisions `.venv` (cmake + ninja come from pip),
+compiles the vendored engine with the upstream `cuda-compile` release flags, and writes
+`hydragen-local.json` from the canonical config. The default build arch is sm_86 — the
+3060 Ti / 3080 Ti this program was developed on; use e.g.
+`HYDRAGEN_CUDA_ARCH=89-real ./install.sh` for RTX 40-series. A source build is the only
+option: prebuilt Strata release binaries do not contain the CoW chain. Verified end-to-end:
+`install.sh` from a fresh clone of this repo builds a working engine on a 3080 Ti.
+
+**Model blobs.** The canonical config points at the quant set behind the published
+measurements: IQ3_XXS routed-expert pack, native model + PLE GGUFs (Qwen3.8-Flash-Next,
+GSQ-RCO quantization), an MTP draft adapter, and an `expert-profile.bin` routing profile
+for the adaptive cache. Point the paths in `hydragen-local.json` at your own set.
+
+**Serve:**
+
+```bash
+.venv/bin/python engine/serve/server.py --engine strata --config hydragen-local.json
+# dashboard + Monitor concurrency panel: http://127.0.0.1:8181/
+```
+
+## Reproducing the measurements
 
 ```bash
 git clone https://github.com/thirteenthd/hydragen.git
@@ -72,5 +101,5 @@ The engine is a fork of **[Strata](https://github.com/Niko1221/Strata)** (MIT, N
 vendored at v0.2.13 plus our six-commit CoW chain, with upstream commit history
 preserved under `engine/`. See `NOTICE`.
 HydraGen code is Apache-2.0 (`LICENSE`); Strata-derived engine code remains MIT.
-The full 117-section program changelog (`docs/CHANGES.md`) is the notarized record
+The full 120-section program changelog (`docs/CHANGES.md`) is the notarized record
 of every measurement → decision → commit in this campaign.
