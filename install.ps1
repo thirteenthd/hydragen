@@ -56,6 +56,13 @@ install.ps1: no MSVC C++ toolchain found. Install VS Build Tools with the VC wor
 "@
 }
 if ($vs) { Write-Host "MSVC: $vs" }
+$vcvars = if ($vs) { Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat" } else { $null }
+if ($vcvars -and (Test-Path $vcvars)) {
+  cmd /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
+    if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
+  }
+  Write-Host "MSVC environment activated (vcvars64)"
+}
 
 # ------------------------------------------------------------------ Python + venv
 $PY = $null
