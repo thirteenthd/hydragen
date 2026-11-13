@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Strata</title>
+<title>HydraGen</title>
 <link rel="icon" href="web/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="web/tokens.css">
 <link rel="stylesheet" href="web/components.css">
@@ -19,7 +19,7 @@
 </head>
 <body>
 <header class="st-header">
-  <span class="st-header__brand">Strata</span>
+  <span class="st-header__brand">HydraGen</span>
   <nav class="st-tabs" role="tablist" aria-label="Views" data-i18n-label="tab.views">
     <button class="st-tab" role="tab" id="tab-btn-chat" aria-controls="view-chat" aria-selected="true" data-tab="chat">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg><span data-i18n="tab.chat">Chat</span></button>
@@ -136,14 +136,20 @@
         <!-- filled by app.js: Speed, GPU load, VRAM, GPU temp, Power, PCIe, CPU, Disk read -->
       </div>
 
-      <div class="st-card conc-card" id="conc-card">
-        <span class="card-title">Concurrency</span>
-        <div class="conc-line">
-          <span class="conc-big" id="conc-run">–</span>
-          <span class="muted" id="conc-extra"></span>
-        </div>
-        <div class="conc-slots" id="conc-slots"></div>
-      </div>
+      <div class="st-card slots-dashboard-card" id="slots-dashboard-card">
+              <div class="slots-dashboard__head">
+                <div class="slots-dashboard__title-wrap">
+                  <span class="card-title"><svg class="st-icon st-icon--sm" aria-hidden="true"><use href="web/sprite.svg#i-layers"/></svg>Concurrency States</span>
+                </div>
+                <div class="slots-dashboard__badges" id="slots-dashboard-badges">
+                  <span class="st-badge" id="slots-state-badge">Idle</span>
+                  <span class="st-badge" id="slots-active-badge">0 / 2 Active</span>
+                </div>
+              </div>
+              <div class="slots-bars-grid" id="slots-bars-grid">
+                <!-- populated by app.js: one tile per batch slot + Queue sub-card -->
+              </div>
+            </div>
 
       <div class="monitor-row">
         <div class="st-card ctx-card">
