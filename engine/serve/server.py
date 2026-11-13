@@ -933,6 +933,100 @@ class ConvCacheLog:
         return dict(self.state)
 
 
+class ParkDiskLog:
+    """M-C3a: the parked conversations' disk tier ("STRATA_PARK_DISK"), as the engine's log tells it: the
+    "park disk: ON / spilled / restored / drop / skip / refuse" lines it writes to stderr, which is the log.
+    The engine owns the tier; the serve side only counts what its lines report."""
+    ON = re.compile(r"park disk: ON (\S+) \(index (\d+) files, ([\d.]+) GiB, (\d+) refused, rebuilt in "
+                    r"\d+ ms; budget (?:(\d+) MiB|free-space only), keep-free (\d+) MiB\)")
+    OFF = re.compile(r"park disk: DISABLED")
+    SPILL = re.compile(r"park disk: spilled (\d+) tokens, ([\d.]+) MiB in (\d+) ms "
+                       r"\((\d+) entries, ([\d.]+) GiB on disk\)")
+    READ = re.compile(r"park disk: restored (\d+) tokens, ([\d.]+) MiB read in (\d+) ms "
+                      r"\((\d+) entries, ([\d.]+) GiB on disk\)")
+    DROP = re.compile(r"park disk: drop \S+ \(([\d.]+) MiB, (\d+) entries, ([\d.]+) GiB on disk\)")
+    SKIP = re.compile(r"park disk: skip spill")
+    REFUSE = re.compile(r"park disk: (?:index )?refuse ")
+    FAIL = re.compile(r"park disk: spill failed")
+    READ_MAX = 1 << 20
+
+    def __init__(self):
+        self.key, self.pos = None, 0
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        self.state = {"enabled": False, "dir": None, "entries": 0, "bytes": 0, "budget_mib": None,
+                      "min_free_mib": None, "refused": 0, "spills": 0, "restores": 0, "drops": 0,
+                      "skips": 0, "refuses": 0, "fails": 0, "last_event": None, "last_tokens": None,
+                      "last_mib": None, "last_ms": None, "last_at": None}
+
+    def poll(self, path, start) -> dict:
+        with self.lock:
+            return self._poll(path, start)
+
+    def _poll(self, path, start) -> dict:
+        if not path or start is None:
+            return dict(self.state)
+        if self.key != (path, start):                   # another start of the engine: the tier rescans
+            self.key, self.pos = (path, start), start
+            self.reset()
+        try:
+            size = os.path.getsize(path)
+            if size < self.pos:
+                self.pos = 0
+            if size - self.pos > self.READ_MAX:
+                self.pos = size - self.READ_MAX
+            with open(path, "rb") as f:
+                f.seek(self.pos)
+                data = f.read(size - self.pos)
+        except OSError:
+            return dict(self.state)
+        end = data.rfind(b"\n") + 1
+        self.pos += end
+        now = time.time()
+        for line in data[:end].decode("utf-8", "replace").splitlines():
+            if "park disk:" not in line:
+                continue
+            st = self.state
+            m = self.ON.search(line)
+            if m:
+                st["enabled"], st["dir"] = True, m.group(1)
+                st["entries"], st["bytes"] = int(m.group(2)), round(float(m.group(3)) * (1 << 30))
+                st["refused"], st["budget_mib"] = int(m.group(4)), int(m.group(5)) if m.group(5) else None
+                st["min_free_mib"] = int(m.group(6))
+                continue
+            if self.OFF.search(line):
+                st["enabled"] = False
+                continue
+            m = self.SPILL.search(line)
+            if m:
+                st["spills"] += 1
+                st["entries"], st["bytes"] = int(m.group(4)), round(float(m.group(5)) * (1 << 30))
+                st["last_event"], st["last_tokens"] = "spilled", int(m.group(1))
+                st["last_mib"], st["last_ms"], st["last_at"] = float(m.group(2)), int(m.group(3)), now
+                continue
+            m = self.READ.search(line)
+            if m:
+                st["restores"] += 1
+                st["entries"], st["bytes"] = int(m.group(4)), round(float(m.group(5)) * (1 << 30))
+                st["last_event"], st["last_tokens"] = "restored", int(m.group(1))
+                st["last_mib"], st["last_ms"], st["last_at"] = float(m.group(2)), int(m.group(3)), now
+                continue
+            m = self.DROP.search(line)
+            if m:
+                st["drops"] += 1
+                st["entries"], st["bytes"] = int(m.group(2)), round(float(m.group(3)) * (1 << 30))
+                continue
+            if self.SKIP.search(line):
+                st["skips"] += 1
+            elif self.REFUSE.search(line):
+                st["refuses"] += 1
+            elif self.FAIL.search(line):
+                st["fails"] += 1
+        return dict(self.state)
+
+
 def conversation_slots(engine) -> int | None:
     """How many conversations the engine's cache holds: its --conversation-cache-slots argument, which is known
     before the engine has started (a lazy start has reported no INFO line yet), else the INFO line it reported."""
@@ -4745,7 +4839,8 @@ class Service:
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
-        self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
+        self.conv_log = ConvCacheLog()
+        self.pd_log = ParkDiskLog()                  # #596: the parked conversations, from the engine's log
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
@@ -5651,8 +5746,10 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        disk = self.pd_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+                "park_disk": disk,
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}

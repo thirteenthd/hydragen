@@ -368,6 +368,7 @@ function render(m) {
   if (!modelOp && !localLoad && live.queued > 0) setPill("queued", tr("pill.queued", "{n} queued", {n: live.queued}));
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
+  if (tab === "monitor") renderParkDisk(m.park_disk);
   if (tab === "about") renderAbout(eng, hw, st);
 }
 
@@ -402,6 +403,36 @@ function renderConvCache(c) {
   $("cc-note").textContent = c.enabled
     ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
     : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
+}
+
+// M-C3a: the parked conversations' disk tier ("STRATA_PARK_DISK"): what the RAM cache spilled to disk, what
+// came back, and what the folder costs.  The engine logs the truth; serve counts the lines into m.park_disk.
+function renderParkDisk(d) {
+  $("pd-card").hidden = !d;
+  if (!d) return;                                  // an older server
+  const pct = (a, b) => (b ? `${Math.min(100, (100 * a) / b)}%` : "0%");
+  $("pd-bars").hidden = !d.enabled;
+  if (d.enabled) {
+    const cap = d.budget_mib ? d.budget_mib * 1048576 : 0;
+    $("pd-mem-text").textContent = cap ? `${gb(d.bytes)} / ${gb(cap)} GB` : `${gb(d.bytes)} GB (free space only)`;
+    $("pd-mem-bar").style.width = cap ? pct(d.bytes, cap) : "100%";
+  }
+  $("pd-sum").textContent = d.enabled
+    ? `${fmt(d.entries)} conversation image${d.entries === 1 ? "" : "s"} on disk` : "off";
+  const fell = d.skips + d.refuses + d.fails;
+  const event = d.last_tokens != null
+    ? `${d.last_event === "spilled" ? "Spilled" : "Read back"} ${fmt(d.last_tokens)} tokens, ` +
+      `${fmt(d.last_mib)} MiB in ${fmt(d.last_ms)} ms, ${since(d.last_at)}` : null;
+  facts($("pd-facts"), [
+    ["Spilled / dropped", d.enabled ? `${fmt(d.spills)} / ${fmt(d.drops)}` : null],
+    ["Read back", d.enabled ? `${fmt(d.restores)}${fell ? ` · ${fmt(fell)} fell back to a prompt read` : ""}` : null],
+    ["Budget", d.enabled ? (d.budget_mib ? `${gb(d.budget_mib * 1048576)} GB` : "free space")
+      + (d.min_free_mib ? ` · keep-free ${gb(d.min_free_mib * 1048576)} GB` : "") : null],
+    ["Last switch", d.enabled ? event : null],
+  ]);
+  $("pd-note").textContent = d.enabled
+    ? "When the RAM cache has no room, a parked conversation is written whole to disk before its memory goes; a request returning to it reads the image back in a second instead of re-reading its whole prompt. The oldest files go first."
+    : "Off: a conversation that leaves the RAM cache is rebuilt from its prompt next time. To keep it on disk instead, add \"STRATA_PARK_DISK\": \"<folder>\" to the run config's env (docs/DETAILS.md).";
 }
 
 function renderTotals(t) {
