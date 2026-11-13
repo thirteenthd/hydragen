@@ -2626,3 +2626,10 @@ Per user spec, matching the pre-experimental HydraGen dashboard: slots-dashboard
 - Windows: install.ps1 (vcvars64 activation, quoted -D args, --target strata) BUILT strata.exe end-to-end on the Windows dev host. Product deployable on Linux AND Windows from a clone.
 - Public docs privacy scrub: full product history rewritten (filter-branch tree filter): hostnames->"the reference host", user paths->~, LAN IPs->"the-LAN-address", home domain->"the home LAN domain", agent nick->"the agent"; law file renamed source-build-12g-ampere.md; sweep paths env-parameterized (HG_CFG/HG_OUT). engine/ untouched (upstream blobs). LAW: every server->repo doc sync must pass the scrub mapping first.
 - OPEN: archive/experimental-main + experimental-final tags still UNSCRUBBED public refs (old bench internals + 7 drop-in zips) - awaiting owner decision.
+
+## 122. archive refs deleted from public remote
+
+- Owner decision: provenance stays local. Remote deleted: archive/experimental-main, tags experimental-final-20261112, archive/feat-* , v0.4.0 (it pointed at old-main tip 72f825d0 and kept ~150 unscrubbed commits addressable).
+- hydragen-engine fork repo: confirmed gone (GraphQL: repository not found).
+- Residual: refs/pull/1 (merged PR #1, 15 early commits, README mentions the reference host x3) is not deletable via API; contents are early src-refactor code only. Full removal = GitHub support request or private-repo toggle; noted for owner.
+- Local insurance: all deleted refs fetched under refs/tags + refs/local/pr1 in the working clone; the reference host repo retains full history.
