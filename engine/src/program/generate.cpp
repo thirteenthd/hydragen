@@ -12239,6 +12239,7 @@ int main(int argc, char** argv) {
             }();
             const strata::core::SavedConversation* anchor_img = nullptr;
             int64_t anchor_tokens = 0;
+            uint64_t anchor_serial = 0;   // the donor's identity, to survive a cache change under it
             if (park_cow && src.with_reuse && !src.ids.empty()) {
                 const auto m = conversations.common_best(src.ids, src.imgs, src.cvec);
                 if (m.tokens > 0 && m.tokens < (int64_t) src.ids.size()) {
@@ -12246,6 +12247,7 @@ int main(int argc, char** argv) {
                     if (d != nullptr && !d->kv.empty() && (int64_t) d->live.ids.size() >= m.tokens) {
                         anchor_img = d;
                         anchor_tokens = m.tokens;
+                        anchor_serial = m.serial;
                     }
                 }
                 std::fprintf(stderr, "strata serve: conversation cache: park COW anchor %s for %lld of %lld tokens\n",
@@ -12341,6 +12343,23 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor)\n",
                                  evicted, evicted == 1 ? "" : "s", additional >> 20,
                                  (long long) o.conversation_cache_min_free_mib);
+                if (anchor_serial != 0) {
+                    // M-C2 fix: make_room above and the RAM admission loop both evict, and the entry the
+                    // anchor was mounted from can leave with them - find()'s pointer dies with the entry and
+                    // the capture below would read the freed image (the park COW SIGSEGV: exit -11 right
+                    // after the "anchor mounted" line under LRU churn at the parked budget).  Re-resolve it
+                    // by identity here: gone (or geometry that no longer covers the anchor) means this park
+                    // falls back to the full verified copy instead.
+                    anchor_img = conversations.find(anchor_serial);
+                    if (anchor_img != nullptr && (anchor_img->kv.empty() ||
+                            (int64_t) anchor_img->live.ids.size() < anchor_tokens))
+                        anchor_img = nullptr;
+                    if (anchor_img == nullptr) {
+                        anchor_tokens = 0;
+                        std::fprintf(stderr, "strata serve: conversation cache: park COW anchor lost: the "
+                                             "donor left the cache while admitting this park\n");
+                    }
+                }
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
                 // STRATA_CKPT_POOL: the running state and the checkpoint copies go into dropped checkpoints' vectors
