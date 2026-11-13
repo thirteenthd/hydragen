@@ -1,0 +1,55 @@
+# CoW on kv_stream — LAWNED laws (M-C1b/c shipped on cow branch)
+
+Status: share-at-fork CoW is LIVE on the cow branch (commits cow-m1a, cow-m1bc on top of v0.2.13).
+Env knobs: STRATA_COW_ARENA=1, STRATA_COW_ARENA_SLOTS=N, STRATA_COW_SLOT_CELLS=cells, STRATA_COW_FORK=1.
+
+## Landed mechanism
+- Per-ordinal global arenas (k/v int8 + scales + `use` int32[] per arena). `KvStreamMap.slot_use` baked for EVERY arena state.
+- resolve_kernel step 2: `cow_hold = slot_use[j + slot_base] > 1` skips pinned slots; bounded sweep -> unresolved miss stays -1 -> host read-through. Stall-free by construction.
+- resolve_kernel step 1: residency stamping range-checks; forked (foreign-range) entries are never stamped/ref'd locally; owner's clock governs.
+- `qsa_cow_fork(from,to,upto)`: D2H from.table splice -> drop foreign/cold entries to -1 -> batched use++ over from range -> H2D to.table. Zero new kernels.
+- FLOOR law: fork only COMPLETE pages (`P = upto/4`). A shared partial tail page = two sessions appending different tokens into one page = corruption. Partial page stays cold (host read).
+- RELEASE law: `qsa_cow_release` in refresh_residency BEFORE kv_stream_reset; holders release their own foreign refs at their own reset; parked sessions keep pinning (resume-friendliness, bounded).
+- RANGE law: per-ordinal cumulative `g_cow_next[]` for range bases. NEVER `ctr * p.slots` — with SLOT_CELLS shrink the ranges overlap.
+- BASE-0 law: bake slot_use unconditionally for arena states; session 0's slot_base IS 0. Keying on `cow_sb != 0` silently no-ops all main-sourced forks (caught by fork telemetry log lines, not by quality).
+- Telemetry: every admission prints "cow: the admission fork points at N of P prefix pages" — READ THIS IN THE CONFIG `log` FILE (server.py sends engine stderr to cfg["log"], not the runner nohup log).
+
+## Measured (farm ladder, m25_farm5.py: 4 sessions of one 22.5k conv, 432-tok prime answers)
+| arm | expert slots | C1 | C4 co-resident | C4 wall |
+|---|---|---|---|---|
+| plainb4 | 1663 | 128.3 | 42.5-45.1 | 23.9 s |
+| forkb4 (arena 9216, SLOT_CELLS 4096) | 2136 | 151.2 | 47.1-49.9 | 18.5 s |
+CoW beats no-CoW at EVERY concurrency level and clears the b4k8 simulated floor (2109) with real sharing.
+
+## M-C1d join-at-fetch: mechanism PROVEN, economics NEGATIVE (commit cow-m1d, knob STRATA_COW_JOIN_HH default 0 = joins OFF = exact forkb4)
+- Mechanism: CowPeer device registry (conv/hhead/ord/base/n_slots/n_blocks/pt); resolve cold miss scans same-ord same-lineage peers naming block b at slot s; join = hhead gate -> unconditional atomicAdd(slot_use) prev>=1 -> revalidate peer entry -> own table points at s; rollback on stale. fork_join_kernel + cow_release_kernel on-device. Telemetry "cow: joins-at-fetch served so far: N" in cfg log. v1 CAS(use,1,2) was WRONG (single-joiner only) — use unconditional add + prev gate.
+- Measured (farm, arena 9216, SLOT_CELLS 4096): hh=256 -> C4 32.7-38.2 wall 22.9s; hh=512 (n_slots/2) -> C4 40.7-43.1 wall 19.9s; uncapped -> streams stall (19-38 tok/s, truncated, farm QC false) though battery stays green. ALL worse than forkb4 (47.1-49.9, 18.5s). Monotonic damage with cap size.
+- PIN LAW (why joins lose): a joined page is UN-EVICTABLE by its owner — clock-sweep-hold is load-bearing (a table entry naming a slot means a live cross-stream gather can read it; evicting any named slot is a corruption race, not policy). Every join steals working set from the fetcher's 1024-slot window. Joins only pay into ranges with big slack; they are poison for small streaming windows.
+- HEADROOM law: hhead refunds mid-epoch are illegal (fork pins never spent headroom; over-refund decays the cap). Budget refreshes ONLY at reset (8 B conv+hhead store).
+- JOIN IS RACE-CLEAN: 8.6k-10.9k shared cold fetches per arm, battery QC6 exact + farm prime-QC green in every capped arm — damage is always scheduling, never bytes.
+- M-C1e shared region: BUILT, race-clean, economics DEAD (commit cow-m1e / 93f218da, knob STRATA_COW_SHARED default 0 = OFF). Region at arena tail [arena_slots, +SHARED), per-lineage hint tables lin_all (16 rolling tabs, block->slot, -2 fetching), region clock sblk/sst/srf, region sweep with candidate predicate use==0 (PIN LAW boundary by construction: no namer => no gather), adoption = prev-gated add + revalidate; publish order refcount, entry, fence, hint. e1 region 4608: experts 1969, C4 39-42 wall 21.7s; e3 region 3072 at expert parity (2126): C4 40-43 wall 20.3s — BOTH lose to forkb4 (2136, 47-50, 18.5s). Smoking gun: 97.7% block reads hit VRAM, only 16.8 MiB from host RAM — duplicated fetch traffic was never the cost; resident capacity is, and you cannot buy capacity with capacity (every region slot costs one expert slot 1:1).
+- FLOOR law (generalized, M-C1e): blocks at/>= the fork floor P=upto/4 are NOT byte-identical across the lineage (diverging generated tails). EVERY sharing path (join, splice, region adoption) must be guarded by the per-entry `floor` (lowered by every fork via 4-byte offsetof stores; a whole-entry H2D would trample device-atomic hhead). M-C1d's join/splice had no guard — saved only by the farm's uniform fork shape.
+- SPLICE law (tightened): the admission splice drops EVERY foreign entry to cold; a table may only name slots the holder or fork-join kernel counted a ref for (un-pinned foreign names = eviction race).
+- WINDOW FLOOR: streamed slot windows must be >= resolve block threads (1024 slots => STRATA_COW_SLOT_CELLS >= 4096); engine refuses below (`512 slots is fewer than the resolve block (1024)`).
+- CAMPAIGN CLOSE (VRAM tier): CoW KV lands at M-C1c/forkb4 (+473 expert slots, C4 42.5-45.1->47.1-49.9, wall 23.9->18.5s). M-C1d and M-C1e stay opt-in OFF, mechanisms banked race-clean for roomier substrates.
+- SHIP DEFAULTS (recommended product config, measured in these arms only — broad stress pending): STRATA_COW_ARENA=1 + STRATA_COW_ARENA_SLOTS=9216 + STRATA_COW_SLOT_CELLS=4096 + STRATA_COW_FORK=1 (the forkb4 champion shape) plus STRATA_PARK_COW=1 (M-C2). Leave STRATA_COW_JOIN_HH and STRATA_COW_SHARED unset (OFF).
+- Admission img copy (conversation_kv_save/restore) still moves the full prefix host<->host per admission; fork covers the VRAM half only. Eliding the copied prefix bytes is the admission-latency lever.
+
+## M-C2 host-tier parked-session dedup: LANDED (commit cow-m2 / a53973bf, knob STRATA_PARK_COW=1 default OFF)
+- Park adopts the donor parked image's shared-prefix ConversationBuffer segments as refcounted VIEWS (Segment cap=0 -> bytes() bills 0; donor pays shared bytes once). Views flatten to the underlying store: view-of-view chains share one physical copy. Write visits into borrowed segments fail closed; restore/verify/disk-save read through visit() unchanged.
+- Donor search = longest-common-token-prefix scan over parked entries. ConversationCache::best() is whole-conversation-prefix by design and NEVER matches sibling conversations — do not use it for sibling dedup.
+- VERIFY-THEN-VIEW: memcmp the session pool bytes vs the donor segments over the shared range BEFORE mutation; mismatch leaves buffer untouched -> plain copy (honors §103: heads prefilled under different chunk plans differ).
+- DEVICE-GATE law: the indexer `pooled` pool is device-resident (kv_mode 0 pools too) — CPU memcmp on src[i] segfaults. Small anchors hide the bug (pooled rows = at/idx_block = 0). Adopt only when !on_device(src[i]); device-resident parts fall back to the copy path.
+- Measured (park-ladder: 6 siblings x 22,348 tokens, 14,360 shared head, batch 2 ctx 131k): per-sibling parked image 577.4MB -> 395.5MB owned (reused_kv_bytes=181,969,920 exact = tokens x 12,672 B), park wall 164-192ms -> 58-61ms (3x), ladder host-RAM delta 646MiB vs ~3.4GB naive, restore_qc_fail 0/6 under eviction churn, battery QC_DONE green, farm C1-C4 all qc_primes=True.
+- Host-tier PAYS where VRAM-tier died: zero VRAM interaction, no PIN LAW coupling. Eviction law: donor eviction frees only its own bytes; views keep stores alive by refcount (never double-free, never double-bill). Savings scale with head share; an agent fleet converges to head-once + tails.
+- Bench at PRODUCT DEPTH: park-dedup evidence must come from 100k-class siblings, not convenient 22k ones — savings ratios and the fleet-vs-cache-budget arithmetic only turn honest at product context (64k-128k harness window). Shallow gates are fine for mechanism, never for final eval.
+- Measured 100k depth (m25_parkladder100k.py: 4 siblings x 96,998 tokens, 66.5k shared head, ctx 131k, batch 2): parked image 2.19 GB -> 1.35 GB owned (-38.5%), reused_kv_bytes=842,789,376 exact (anchor 66,510 -> 66,508 aligned pages x 12,672 B); against the 6,144 MiB parked budget, dedup-off fleet = 8.8 GB cannot fit (15 LRU evictions, parked count oscillates 1-2), dedup-on fleet = 6.2 GB fits at 97%; park wall 790-810 ms -> 294-514 ms; host MemAvailable floor 2 -> 4 GiB; restore_qc_fail 0/4 both arms (~20 s restores either way = cold-page decode, not re-prefill).
+- R-PHASE law: a continuation park after its donor was restored reports `park COW anchor none for 0 of N tokens` — the donor was take()'d at borrow, so the park correctly falls back to a full verified copy. Never read that as a dedup failure.
+- Crash-debug recipe for the engine (deterministic crashes): background `gdb -p $(pgrep -x strata-host) -batch -ex continue -ex "bt 20" > /tmp/bt.out` then replay a minimal ladder; the segfault prints into bt.out with the process still attached. No gdb installed: a size-behavior matrix (which anchor sizes pass vs crash + the row-count formula, e.g. pooled rows = at/idx_block) identifies the mechanism without a backtrace.
+
+## Process laws
+- Runner must wait for `pgrep serve/server[.]py` EMPTY *and* curl 000 before bind; TERM then KILL at 20 s (drain can exceed 60 s; fuser is NOT installed on the reference host).
+- Battery + farm qc_primes are the CoW gates; fork telemetry is the mechanism gate (a silent fork no-op passes quality and fools you).
+- Bench SHAPE law: parked-session levers bench with a PARK-LADDER (N sibling conversations sharing a long head, sequential parks at next admission, restore-QC under eviction churn, host-MemAvailable deltas). m25_farm5 is the wrong shape — one conversation, no park phase, and ConversationCache::best() never matches siblings so the lever reads dead.
+- Park-ladder telemetry greps (cfg log): `park COW anchor [a-z]* for [0-9]* of [0-9]* tokens` and `conversation cache: parked ... parked=N bytes=... evictions=... snapshot_bytes=... reused_kv_bytes=...` — reused_kv_bytes is exact (aligned tokens x 12,672); snapshot_bytes is the owned-cost headline. /proc/meminfo is in kB: GiB = value // 1048576 (kB//1024 = MiB; mislabeling this misreads headroom).
+- Final eval/report convention: write the report to ~/hydragen-experimental/FINAL_REPORT.md (mission / architecture / headline concurrency / mechanism tiers with measured tables / quality regime / physics laws / ship state / verdict), every number from measured telemetry, and bank a short CHANGES.md section pointing at it.

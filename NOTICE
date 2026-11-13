@@ -1,0 +1,11 @@
+HydraGen
+Copyright 2026 thirteenthd
+
+This product includes code derived from Strata
+(https://github.com/Niko1221/Strata), Copyright (c) Niko1221,
+licensed under the MIT License. The engine/ submodule
+(https://github.com/thirteenthd/hydragen-engine) is a fork of Strata
+including modifications by thirteenthd; the fork relationship and
+upstream attribution are preserved in that repository's history.
+
+Strata-derived engine code remains MIT-licensed; see engine/LICENSE.
