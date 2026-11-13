@@ -99,7 +99,7 @@ Write-Host "Building the HydraGen engine (CUDA arch: $ARCH) ..."
   "-DCMAKE_CUDA_COMPILER=$CUDA\bin\nvcc.exe" `
   "-DCMAKE_MAKE_PROGRAM=$NINJA"
 if ($LASTEXITCODE -ne 0) { Write-Error "install.ps1: cmake configure failed" }
-& $CMAKE --build engine/build --parallel ([Environment]::ProcessorCount)
+& $CMAKE --build engine/build --target strata --parallel ([Environment]::ProcessorCount)
 if ($LASTEXITCODE -ne 0) { Write-Error "install.ps1: build failed" }
 $BIN = Join-Path $PWD "engine\build\strata.exe"
 if (-not (Test-Path $BIN)) { Write-Error "install.ps1: build finished but engine\build\strata.exe is missing" }
