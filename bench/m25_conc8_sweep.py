@@ -21,7 +21,8 @@
 # Usage: python3 m25_conc8_sweep.py --arm natural --C 4 [--target 100000] [--turns 6] [--quick]
 import argparse, json, os, random, statistics as st, sys, threading, time, urllib.request
 
-CFG_PATH = "~/hydragen-experimental/strata-iq3xxs-m25-0213-ctx131k-lan-cow.json"
+CFG_PATH = os.path.expanduser(os.environ.get(
+    "HG_CFG", "~/hydragen-experimental/strata-iq3xxs-m25-0213-ctx131k-lan-cow.json"))
 CFG = json.load(open(CFG_PATH))
 KEY = CFG.get("api_key", "")
 PORT = CFG.get("port", 8181)
@@ -206,7 +207,8 @@ def main():
     if a.quick:
         a.target = 12000; a.turns = 2
     tag = "%s_C%d" % (a.arm, a.C)
-    out_path = os.path.expanduser("~/hydragen-experimental/conc8_%s.jsonl" % tag)
+    out_path = os.path.join(os.path.expanduser(os.environ.get(
+        "HG_OUT", "~/hydragen-experimental")), "conc8_%s.jsonl" % tag)
     m0 = api_get("/metrics")
     stop = threading.Event(); g = threading.Thread(target=guard_thread, args=(stop,)); g.start()
     t_wall0 = time.time()
