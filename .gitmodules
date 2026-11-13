@@ -1,0 +1,4 @@
+[submodule "engine"]
+	path = engine
+	url = https://github.com/thirteenthd/hydragen-engine.git
+	branch = hydragen-cow
