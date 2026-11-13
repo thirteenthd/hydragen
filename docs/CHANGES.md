@@ -2576,3 +2576,8 @@ closed negative §108/§109), M-C2 (host parked dedup, LANDED). All opt-in, cano
 ## 114. dashboard concurrency panel ported to the product engine
 
 User: default Strata UI shows no concurrency. Found the old HydraGen dashboard in the archived history (tag experimental-final-20261112, serve/web/app.js: calcConcurrencyAndQueue, per-slot state cards + queue sub-card, vLLM/TRT/Strata era). New engine's /metrics already carries everything (engine.batch_slots, live.slots[state,held_tokens], running, queued, outside_slots, waiting, admitting). Ported the panel fresh onto 0.2.13 Monitor (renderConcurrency + conc-card in index/app.js/app.css), not a copy-paste (old app.js is a different lineage). Deployed to ~/hydragen-experimental/strata/serve/web by scp; static files serve from disk - no engine restart needed; verified GET /web/app.js carries renderConcurrency and / carries conc-card. Repo commit on product: serve/web concurrency panel.
+
+
+## 115. canonical switched to cow build + STRATA_PARK_COW=1 (product default ON)
+
+User approved after Letta-harness bench audit: three 100k agent turns paid 22-36 s re-prefills (LRU eviction, reused=22272 anchor) - the known COW-off parked-budget cost from 111. Canonical LAN engine now runs ~/strata-cow/build/strata with STRATA_PARK_COW=1 (forkb4 chain + parked dedup ON in serving). Config: strata-iq3xxs-m25-0213-ctx131k-lan-cow.json (exe swapped, log lan-cow, key unchanged, 600). Switch script: ~/hydragen-experimental/lan_cow_switch.sh (script-file pkill law respected). Battery lan-cow QC0-QC7 green, QC6 exact 97,101,103. expert_slots 2456 -> 2451 (noise; canonical win is host-tier parked dedup, not slot gain at b2). Env verified on strata-host proc. Battery patched to send BATT_KEY bearer header (bak at .py.bak).
