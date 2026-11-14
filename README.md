@@ -168,13 +168,14 @@ collapses.
 | C | wall (s) | warm TTFT p50 (s) | warm decode p50 | deep-warm events | re-prefill tokens |
 |---|---|---|---|---|---|
 | 4 base -> tier | 501 -> **472** | 48.0 -> **31.5** | 8.0 -> **13.1** | 5 -> 4 | 505k -> 411k |
-| 8 base -> tier | 951 -> 1019 | 41.0 -> 43.6 | 13.8 -> **29.1** | 7 -> 21* | 712k -> 716k* |
+| 8 base -> tier (full-copy, M-C3a) | 951 -> 1284 | — | 13.8 -> 22.4 | 7 -> 11 | ~716k -> ~116k real re-prefill |
+| 8 base -> tier (content-chunked dedup, M-C3b1d) | 951 -> **1038 / 904** | — | — | — | spill writes skip already-stored shared chunks (0.6 GiB/sibling on ladder) |
 
 \*Client-side classification cannot see disk restores: `cached_tokens` stays ~0
 when a returning session's image is read back off disk, so those turns are
 labeled deep-warm. The engine log shows **6 restores of 98-107k-token images
 in 0.8-3.6 s each** inside the C8 window; the genuinely recomputed tokens were
-closer to ~116k than 716k. At C8 (8-deep) the full-copy tier is currently **net-negative on wall** (951 → 1284 s, +35%), though it eliminates the deep-warm failures (8/8 needles, zero failed requests) and still lifts warm decode (13.8 → 22.4 tok/s). The tier converts ~1.1 M tokens of re-prefill into ~19 whole-image restores, but spills write whole images (141 GiB) and restores read whole images back (122 GiB) on the same volume the expert blobs stream from — at 8-deep that contention costs more than the recompute saved. Below ~6-deep the tier pays off; above it, it doesn't, until M-C3b ships segment-view files (spill only unique tail + state; restore re-adopts verified shared views instead of private full copies).
+closer to ~116k than 716k. The full-copy tier at 8-deep was net-negative on wall (951 → 1284 s): spills wrote whole images (141 GiB) and restores read whole images back (122 GiB) on the volume the expert blobs stream from — contention cost more than the recompute saved. Content-defined chunking with content-addressed blocks (M-C3b1d: gear-hash cuts, mean 2 MiB, per-region dedup) cut spill traffic per re-spilled sibling by ~32% and brought 8-deep back to parity-to-positive: two clean KD3 arms at {1038, 904} s vs baseline 951, with cold-admission TTFT — the metric agent harnesses feel most — **122 s p50 / 264 p95 vs baseline 182 / 403**. Below ~6-deep the tier pays off at every variant tested; at 8-deep it is now roughly break-even with a large cold-latency gain, pending restore-side lineage (see below).
 
 Honest summary of where this leaves 12 GB + a ~35 B-class routed MoE:
 
@@ -189,10 +190,11 @@ Honest summary of where this leaves 12 GB + a ~35 B-class routed MoE:
 - Peak single-stream decode (~70-100 tok/s at 100k depth) is unaffected by any
   cache tier; it is VRAM-capped, and closing it is the KV-window campaign.
 
-Open items tracked in `docs/CHANGES.md`: segment-view dedup on disk (M-C3b,
-shrinks images ~2x because each parked conversation carries a ~230 MB
-constant state floor), tier placement on a quieter volume, and a sweep v4
-class that credits disk restores as their own regime.
+Open items tracked in `docs/CHANGES.md`: disk-resident lineage for restores
+(parent ses files + tail-only reads; the host-RAM-donor variant M-C3b2a
+landed but measures dead at depth — at restore moment no RAM donor exists),
+tier placement on a quieter volume, and a sweep v4 class that credits disk
+restores as their own regime.
 
 ## Provenance & license
 

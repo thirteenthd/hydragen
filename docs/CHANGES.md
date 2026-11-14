@@ -5,6 +5,28 @@ Newest first; section numbers are stable, so §N always refers to the same entry
 
 
 
+## 137. run12 C8 on KD3+#224b: wall 903.7 — FIRST tier arm to beat the tier-OFF baseline at C8; no crash
+- run12 C8 harness: wall 903.7 vs baseline 951.2 (-5%), run9 KD3 1038, run6 full-copy 1284. needle 8/8, 48/48 requests, zero HTTP failures, zero engine death (no #224 sticky fault under C8 churn on the instrumented build).
+- cold TTFT p50 122.1 / p95 264 / max 554 = best C8 cold admission ever (baseline 182/403; run6 193/784). warm TTFT p50 37.4. guard floor 2.7 GiB.
+- Honest variance note: C8 wall on KD3 tiers at {1038, 904} across two arms; baseline single-sample 951. Claim kept as "tier neutral-to-positive at C8, big cold-TTFT gain", not "beats baseline" as a hard fact.
+- Store again at ceiling (31.3 GiB, 2016 chunks); dedup skipped 0.0 on tail spills (small sessions) - big skips were mid-run.
+- Crash status: 3 clean C-sweeps since forensics; #224b will name the fault if it returns.
+
+## 136. run11 C4 clean on #224b build: no crash, needle 4/4; b2a adoption DEAD again (ADOPT=0, second clean confirmation)
+- run11 C4 harness: wall 523.9 (vs baseline 501.0, run4 M-C3a 472.2 - inside noise band at C4), needle 4/4, zero engine death, guard floor 2.8 GiB.
+- No #224 sticky CUDA error fired this sweep: crash is sporadic under C-churn, not every-run; the 2125391e instrumentation will name it when it returns.
+- ADOPT=0 second clean C4 run: restore-side RAM-donor adoption is conclusively dead for deep traffic - at restore moment no RAM donor exists (siblings live-on-GPU or spilled). b2a code stays (harmless no-op, will matter for head-pinned designs) but the restore lever MUST be disk-lineage (parent chain + tail-only reads) or pinned heads.
+- KD3 spill dedup contributed ~0 at C4 (few sibling re-spills); its payoff is C8 (run9 1038 vs 1284).
+
+## 135. run10 C4 lost to engine exit 1 (same tail line as run8): park-COW path crash, NOT b2a adoption
+- Supervisor log: engine exited code 1, last line "conversation cache: park COW anchor mounted ..." at BOTH run8 and run10 crashes. b2a adoption never ran (ADOPT=0 in run10) - restore-side adoption is structurally silent in deep C traffic: at restore moment the RAM tier holds no donor (siblings live-on-GPU or spilled). Adoption starves exactly where needed.
+- Correction banked against 130: cross-session same-prefix KV bytes ARE equal (KD3 sibling skips 0.6 GiB + M-C2 "842.8 MB exact" reuse). Zero-dedup causes were boundary misalignment + chunk scale, not byte divergence.
+- Restore savings therefore need disk-lineage parents (child file + parent chain, tail-only reads) or pinned head sessions; run10 invalid (engine death mid-sweep; killed-client 400s).
+
+## 134. M-C3b2a landed: restored images re-join host-tier CoW (donor-adopted views on restore)
+- cow-m3b / be71fc77, built green. New core fn conversation_kv_share_prefix: per part, segment-walk prefix_equal verify -> adopt_shared views of the RAM-parked donor (common_best match) -> owned tail re-appended; whole pages + complete indexer rows, strict prefix; no-op on divergence. New primitive ConversationBuffer::prefix_equal.
+- Mirrors the M-C2 park-anchor rule on the RESTORE side: restored siblings own only tails; reused view bytes count 0 against the parked budget -> attacks both the MemAvailable floor and budget churn at 8-deep.
+
 ## 133. run9 C8 on KD3 (spill-side dedup only): wall 1284 -> 1038, over half of run6 regression gone
 - Three-arm C8 now: baseline 951 / run6 full-copy 1284 / run9 deduped 1038 (+9% vs baseline, -19% vs run6). Needle 8/8, zero failed requests (summary requests=48), guard mem floor 3.0 GiB (run6 2.7), cold TTFT p50 128.6 s (best of all arms; warm store carried from ladders).
 - 25 dedup lines during run9; store saturated the 32 GiB budget again (30.8 GiB deduped bytes + 92 drop lines): retention is now 1.3x deeper in sessions for the same bytes, churn persists at 8-deep -> b2a restore-skip and/or budget sizing remain the levers.
