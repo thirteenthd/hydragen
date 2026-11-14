@@ -1,0 +1,832 @@
+From c9d6fc44cab051f188fcd6aff2a4a0a99a5e7547 Mon Sep 17 00:00:00 2001
+From: Henson <henson@local>
+Date: Fri, 13 Nov 2026 20:48:07 +0000
+Subject: [PATCH 1/2] M-C3a: park-disk tier under the parked-conversation cache
+ (STRATA_PARK_DISK=DIR, off by default) - evict_oldest() hands the full victim
+ image to ParkDisk before its RAM goes; admission with no usable RAM match
+ reads the deepest disk prefix back (identity-bound STRSES v1 via
+ conversation_file.cpp: fingerprints, bounded parse, payload hashes, RAM
+ preflight, temp+rename publish) and restores it through the normal
+ conversation-snapshot take path; disk budget (STRATA_PARK_DISK_MIB) +
+ keep-free guard (STRATA_PARK_DISK_MIN_FREE_MIB default 4096) evict
+ oldest-first; folder 0700 files 0600; boot scan revalidates and deletes
+ foreign/corrupt files; pinned prefixes and the guarded donor never reach the
+ tier; drop_superseded/clear never spill; full-copy for now (M-C3b dedups via
+ segment-view files)
+
+---
+ cmake/strata_gpu_engine.cmake                 |   3 +-
+ include/strata/core/conversation_cache.hpp    |   9 +-
+ .../strata/core/conversation_park_disk.hpp    | 155 ++++++++
+ mc3_patch.py                                  | 120 ++++++
+ src/core/conversation_park_disk.cpp           | 349 ++++++++++++++++++
+ src/program/generate.cpp                      |  48 ++-
+ 6 files changed, 681 insertions(+), 3 deletions(-)
+ create mode 100644 include/strata/core/conversation_park_disk.hpp
+ create mode 100644 mc3_patch.py
+ create mode 100644 src/core/conversation_park_disk.cpp
+
+diff --git a/cmake/strata_gpu_engine.cmake b/cmake/strata_gpu_engine.cmake
+index 41da8d2d..260c5b90 100644
+--- a/cmake/strata_gpu_engine.cmake
++++ b/cmake/strata_gpu_engine.cmake
+@@ -288,7 +288,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     src/core/remote_expert_opt.cu
+     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
+     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
+-    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
++    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp
++    src/core/conversation_park_disk.cpp)
+   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
+diff --git a/include/strata/core/conversation_cache.hpp b/include/strata/core/conversation_cache.hpp
+index 7104f4e0..9c264e9e 100644
+--- a/include/strata/core/conversation_cache.hpp
++++ b/include/strata/core/conversation_cache.hpp
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <functional>
+ #include <cstddef>
+ #include <cstdint>
+ #include <deque>
+@@ -248,6 +249,10 @@ public:
+ 
+     ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0)
+         : budget_(budget), slots_(slots), min_tokens_(min_tokens) {}
++    // M-C3a: optional disk tier (conversation_park_disk.hpp). When set, an image evict_oldest() throws away is
++    // handed over IN FULL before its RAM goes; the tier decides what it keeps. drop_superseded() and clear()
++    // do not spill: superseded copies are stale by construction and clear() drops poisoned state.
++    std::function<void(SavedConversation&&)> spill_hook;
+     bool enabled() const { return budget_ != 0 && slots_ != 0; }
+     /// `--conversation-cache-min-tokens`: whether a conversation of this length is worth one of `slots`.  Every
+     /// parked conversation costs a whole slot whatever its length, so a client that interleaves short side requests
+@@ -434,9 +439,11 @@ public:
+         // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
+         for (size_t i = 0; i < entries_.size(); ++i) {
+             if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
+-            bytes_ -= entries_[i].bytes();
++            SavedConversation victim = std::move(entries_[i]);   // M-C3a: the tier may take it before it goes
++            bytes_ -= victim.bytes();
+             erase(i);
+             ++evictions_;
++            if (spill_hook) spill_hook(std::move(victim));
+             return true;
+         }
+         return false;
+diff --git a/include/strata/core/conversation_park_disk.hpp b/include/strata/core/conversation_park_disk.hpp
+new file mode 100644
+index 00000000..632732c4
+--- /dev/null
++++ b/include/strata/core/conversation_park_disk.hpp
+@@ -0,0 +1,155 @@
++// M-C3a: an optional disk tier under the parked-conversation cache (STRATA_PARK_DISK=DIR).
++//
++// The parked cache is host RAM and its LRU throws a conversation's whole image away: at 100k depth an
++// evicted sibling pays a ~44 s re-prefill (or ~20 s remount + ~1 s read once tiered). Eviction spills the
++// image to a STRSES file (conversation_file.hpp: identity-bound, hash-verified, temp-file-and-rename publish);
++// an admission that finds its best prefix on disk reads it back and restores it through the normal
++// conversation-snapshot path. Files are trusted exactly as disk sessions are: identity and payload hashes
++// decide, and any refusal falls back to reading the prompt (fail-closed, no partial state).
++//
++// The RAM cache's own rules are untouched: pinned prefixes and the guarded donor are never evicted, so they
++// never reach the tier; drop_superseded and clear() drop without spilling (stale copies / poisoned state).
++// A spilled image is a FULL copy: M-C2 segment views serialize to their logical bytes, and a restored
++// conversation re-anchors against the RAM cache the next time it parks (M-C3b replaces this with deduped
++// segment-view files).
++#pragma once
++
++#include "strata/core/conversation_cache.hpp"
++#include "strata/core/conversation_file.hpp"
++
++#include <algorithm>
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <deque>
++#include <functional>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace strata::core {
++
++class ParkDisk {
++public:
++    struct Options {
++        std::string dir;            // created (0700) if missing; the tier is off when empty
++        size_t budget = 0;          // STRATA_PARK_DISK_MIB; 0: no cap, the free-space guard alone
++        uint64_t min_free = 0;      // STRATA_PARK_DISK_MIN_FREE_MIB: keep this much disk free
++    };
++
++    // The knob triple, from the environment. nullopt when the tier is off.
++    static std::optional<Options> from_env();
++
++    // `identity`: what files are bound to (model + resolved config fingerprints; cached after the first call
++    // under one lock, because the spill worker and serve-thread loads both reach it).
++    // `limits`: this engine's read limits (geometry, layer range, per-part bounds) INCLUDING the RAM preflight,
++    // so a 1.35 GB image passes the same gate the RAM cache uses before it is ever allocated. Called on the
++    // serve thread only (init and load).
++    using IdentityFn = std::function<bool(SessionFileIdentity&, std::string&)>;
++    using LimitsFn = std::function<bool(SessionReadLimits&, std::string&)>;
++
++    // Creates the folder, rebuilds the index from files already there (full validated reads: mismatches and
++    // corruption are refused and the file deleted), and starts the writer. Called once, before serving.
++    void init(const Options& o, IdentityFn identity, LimitsFn limits);
++
++    ~ParkDisk();   // drains queued spills, then joins the writer
++
++    bool enabled() const { return !dir_.empty(); }
++
++    // A RAM-cache victim goes here (conversation_cache.hpp spill_hook). The image is queued for the writer;
++    // its bytes count against the disk budget from the moment it is queued, and it becomes matchable when
++    // its rename lands. Disk room (budget + free guard) is enforced here, oldest entry first.
++    void spill(SavedConversation&& image);
++
++    struct Match {
++        uint64_t serial = 0;    // entries leave through the writer's failure drain as well, so an index would
++                                // shift under a pending load; a serial never does
++        int64_t tokens = 0;     // the shared token prefix length
++    };
++
++    // The deepest disk prefix reaching this prompt. Fail-closed like common_best: picture-carrying requests
++    // never match (their entries' pictures would have to re-verify), and cvec must agree. An entry LONGER
++    // than the prompt can still be a match: a parked sibling that grew past this prompt shares its head.
++    template<class Token>
++    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const {
++        Match best;
++        if (dir_.empty() || prompt.empty() || !images.empty()) return best;   // pictures: fail closed
++        for (const auto& e : entries_) {
++            if (!e.done || e.cvec != cvec) continue;
++            const size_t m = std::min(e.ids.size(), prompt.size());
++            int64_t n = 0;
++            while (n < (int64_t) m && (int64_t) e.ids[(size_t) n] == (int64_t) prompt[(size_t) n]) ++n;
++            if (n > best.tokens) best = {e.serial, n};
++        }
++        return best;
++    }
++
++    // Re-reads the matched file (identity, limits, payload hash - all of it). Null on any failure; a file that
++    // fails VALIDATION is deleted from the tier, a file that merely could not be read (RAM preflight, io) is
++    // kept for a later turn. The caller restores the image through conversation_snapshot_validate/restore.
++    std::optional<SavedConversation> load(Match m, std::string& error);
++
++    // The matched entry's tokens: for the caller's own covers/prefix arithmetic.
++    std::vector<int32_t> ids(uint64_t serial) const;
++
++    size_t entries() const { return entries_.size(); }
++    size_t bytes() const { return bytes_; }
++    uint64_t spills() const { return spills_; }
++    uint64_t loads() const { return loads_; }
++    uint64_t drops() const { return drops_; }
++
++private:
++    struct Entry {
++        uint64_t serial = 0;
++        std::string path;
++        size_t bytes = 0;
++        std::vector<int32_t> ids;   // the spilled live state's tokens: the prefix-match key
++        bool cvec = true;
++        bool done = false;          // the rename landed: matchable
++        std::chrono::steady_clock::time_point spilled_at;
++    };
++
++    struct Write {                  // one queued spill: path paired at spill time (entries_ is serve-side only)
++        uint64_t serial = 0;
++        std::string path;
++        SavedConversation image;
++    };
++
++    struct Finished {               // the writer reports every write here; the serve thread applies it
++        uint64_t serial = 0;
++        bool ok = false;
++        std::string error;
++        double ms = 0;
++    };
++
++    void drain_finished();          // mark done / drop failed, at the top of every serve-thread call
++    void writer();                  // one file at a time; serialized for LRU truth and disk bandwidth
++    bool free_guard_ok(size_t incoming) const;   // statvfs against min_free
++    void drop_oldest();             // free disk room (file + index + any still-queued image)
++    std::optional<SessionFileIdentity> identity_cached(std::string& error);
++
++    std::string dir_;
++    size_t budget_ = 0;
++    uint64_t min_free_ = 0;
++    IdentityFn identity_fn_;
++    LimitsFn limits_fn_;
++
++    std::vector<Entry> entries_;    // serve thread: spill(), best(), load(), drain_finished()
++    size_t bytes_ = 0;              // queued + written bytes on disk
++    uint64_t next_serial_ = 1;
++    uint64_t spills_ = 0, loads_ = 0, drops_ = 0;
++
++    std::mutex write_mtx_;          // identity cache only (worker + load)
++    std::optional<SessionFileIdentity> identity_;
++
++    std::mutex mtx_;
++    std::condition_variable cv_;
++    std::deque<Write> queued_;
++    std::deque<Finished> finished_;
++    std::thread worker_;
++    bool stop_ = false;
++};
++
++} // namespace strata::core
+diff --git a/mc3_patch.py b/mc3_patch.py
+new file mode 100644
+index 00000000..ba175521
+--- /dev/null
++++ b/mc3_patch.py
+@@ -0,0 +1,120 @@
++import sys
++
++def edit(path, pairs):
++    with open(path) as f:
++        s = f.read()
++    for old, new in pairs:
++        if s.count(old) != 1:
++            raise SystemExit(f"ANCHOR {path} count={s.count(old)}: {old[:80]!r}")
++        s = s.replace(old, new)
++    with open(path, "w") as f:
++        f.write(s)
++    print("OK", path)
++
++# 1) conversation_cache.hpp: spill hook + evict_oldest hands the victim over before its RAM goes
++edit("include/strata/core/conversation_cache.hpp", [
++    ('#include <array>',
++     '#include <array>\n#include <functional>'),
++    ('''    ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0)
++        : budget_(budget), slots_(slots), min_tokens_(min_tokens) {}''',
++     '''    ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0)
++        : budget_(budget), slots_(slots), min_tokens_(min_tokens) {}
++    // M-C3a: optional disk tier (conversation_park_disk.hpp). When set, an image evict_oldest() throws away is
++    // handed over IN FULL before its RAM goes; the tier decides what it keeps. drop_superseded() and clear()
++    // do not spill: superseded copies are stale by construction and clear() drops poisoned state.
++    std::function<void(SavedConversation&&)> spill_hook;'''),
++    ('''            if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
++            bytes_ -= entries_[i].bytes();
++            erase(i);
++            ++evictions_;
++            return true;''',
++     '''            if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
++            SavedConversation victim = std::move(entries_[i]);   // M-C3a: the tier may take it before it goes
++            bytes_ -= victim.bytes();
++            erase(i);
++            ++evictions_;
++            if (spill_hook) spill_hook(std::move(victim));
++            return true;'''),
++])
++
++# 2) generate.cpp: include + tier init + admission restore + skip-restore keeps the file
++edit("src/program/generate.cpp", [
++    ('#include "strata/core/conversation_memory.hpp"',
++     '#include "strata/core/conversation_memory.hpp"\n#include "strata/core/conversation_park_disk.hpp"'),
++    ('''            id.model = *model_fp;
++            id.config = *config_fp;
++            return true;
++        };
++        // What a park captures:''',
++     '''            id.model = *model_fp;
++            id.config = *config_fp;
++            return true;
++        };
++        // M-C3a: an optional disk tier under the parked cache (STRATA_PARK_DISK=DIR). LRU eviction spills the
++        // victim to an identity-bound STRSES file; an admission whose whole usable prefix lives on disk reads it
++        // back and restores it through the normal conversation-snapshot path. Read limits (and the RAM preflight
++        // inside them) are this engine's, exactly as the /slots disk-session path builds them below.
++        strata::core::ParkDisk park_disk;
++        if (const auto pd_opt = strata::core::ParkDisk::from_env()) {
++            park_disk.init(*pd_opt,
++                [&](strata::core::SessionFileIdentity& id, std::string& e) { return session_identity(id, e, [] {}); },
++                [&](strata::core::SessionReadLimits& lim, std::string& e) {
++                    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
++                    lim.admit = [floor](uint64_t need, std::string& why) {
++                        const auto mem = strata::core::sample_host_memory();
++                        const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
++                        if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
++                        why = "not enough free RAM to read the parked image back (" + std::to_string(need >> 20) +
++                              " MiB plus a floor of " + std::to_string((long long) (floor >> 20)) + " MiB)";
++                        return false;
++                    };
++                    return strata::core::conversation_session_read_limits(
++                        lim, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
++                        (uint64_t) std::max(o.prompt_cache, 1), e);
++                });
++            if (park_disk.enabled() && conversations.enabled())
++                conversations.spill_hook = [&](strata::core::SavedConversation&& img) {
++                    park_disk.spill(std::move(img));
++                };
++        }
++        // What a park captures:'''),
++    ('''            if (parked.tokens > std::max(resume, slot_tokens) && !borrow)
++                incoming.emplace(conversations.take(parked.index));
++            if (incoming || borrow) slot_source = -1;''',
++     '''            if (parked.tokens > std::max(resume, slot_tokens) && !borrow)
++                incoming.emplace(conversations.take(parked.index));
++            // M-C3a: no usable RAM match at all (batch-slot resume and live state always win): a spilled parked
++            // conversation comes back from the disk tier as a full take - no borrowing from disk in v1.
++            bool from_disk = false;
++            if (!incoming && !borrow && parked.tokens <= std::max(resume, slot_tokens) && park_disk.enabled()) {
++                const auto d = park_disk.best(ids, req_imgs, want_cvec);
++                if (d.tokens > std::max(resume, slot_tokens)) {
++                    std::string derr;
++                    if (auto img = park_disk.load(d, derr)) {
++                        incoming.emplace(std::move(*img));
++                        from_disk = true;
++                    } else if (!derr.empty())
++                        std::fprintf(stderr, "strata serve: park disk: load refused (%s); rereading the prompt\\n",
++                                     derr.c_str());
++                }
++            }
++            if (incoming || borrow) slot_source = -1;'''),
++    ('''                    auto retry = std::move(*incoming);
++                    incoming.reset();
++                    if (!conversations.put(std::move(retry)))
++                        std::fprintf(stderr, "strata serve: conversation cache: could not return the skipped snapshot\\n");''',
++     '''                    auto retry = std::move(*incoming);
++                    incoming.reset();
++                    if (from_disk)
++                        std::fprintf(stderr, "strata serve: conversation cache: disk image not restored; the file "
++                                             "stays for a later turn\\n");
++                    else if (!conversations.put(std::move(retry)))
++                        std::fprintf(stderr, "strata serve: conversation cache: could not return the skipped snapshot\\n");'''),
++])
++
++# 3) build: the new TU links into strata_engine
++edit("cmake/strata_gpu_engine.cmake", [
++    ('src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)',
++     'src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp\n    src/core/conversation_park_disk.cpp)'),
++])
++print("PATCHES_DONE")
+diff --git a/src/core/conversation_park_disk.cpp b/src/core/conversation_park_disk.cpp
+new file mode 100644
+index 00000000..21859005
+--- /dev/null
++++ b/src/core/conversation_park_disk.cpp
+@@ -0,0 +1,349 @@
++// M-C3a implementation. All file I/O goes through conversation_file.cpp (STRSES v1): identity binding,
++// bounded parse, payload hashes, temp-file-and-rename publish, mode 0600 files under a 0700 folder.
++#include "strata/core/conversation_park_disk.hpp"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++#ifndef _WIN32
++#include <cerrno>
++#include <dirent.h>
++#include <sys/stat.h>
++#include <sys/statvfs.h>
++#include <unistd.h>
++#else
++#include <windows.h>
++#endif
++
++namespace strata::core {
++
++namespace {
++
++std::optional<uint64_t> pd_env_u64(const char* name) {
++    const char* v = std::getenv(name);
++    if (!v || !*v) return std::nullopt;
++    char* end = nullptr;
++    const unsigned long long n = std::strtoull(v, &end, 10);
++    if (end == v) return std::nullopt;
++    return n;
++}
++
++std::string pd_tier_path(const std::string& dir, uint64_t serial) {
++    // fixed-width serial: a lexicographic folder scan then keeps spill (LRU) order across a restart
++    char buf[24];
++    std::snprintf(buf, sizeof buf, "/park-%09llu.ses", (unsigned long long) serial);
++    return dir + buf;
++}
++
++} // namespace
++
++std::optional<ParkDisk::Options> ParkDisk::from_env() {
++    const char* dir = std::getenv("STRATA_PARK_DISK");
++    if (!dir || !*dir) return std::nullopt;
++    Options o;
++    o.dir = dir;
++    o.budget = (size_t) pd_env_u64("STRATA_PARK_DISK_MIB").value_or(0) * 1024 * 1024;
++    o.min_free = pd_env_u64("STRATA_PARK_DISK_MIN_FREE_MIB").value_or(4096) * 1024ull * 1024ull;
++    return o;
++}
++
++void ParkDisk::init(const Options& o, IdentityFn identity, LimitsFn limits) {
++    dir_ = o.dir;
++    budget_ = o.budget;
++    min_free_ = o.min_free;
++    identity_fn_ = std::move(identity);
++    limits_fn_ = std::move(limits);
++    std::string error;
++#ifndef _WIN32
++    if (mkdir(dir_.c_str(), 0700) != 0 && errno != EEXIST) {
++        std::fprintf(stderr, "strata serve: park disk: DISABLED: mkdir %s: %s\n",
++                     dir_.c_str(), std::strerror(errno));
++        dir_.clear();
++        return;
++    }
++#else
++    if (!CreateDirectoryA(dir_.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
++        std::fprintf(stderr, "strata serve: park disk: DISABLED: CreateDirectory %s\n", dir_.c_str());
++        dir_.clear();
++        return;
++    }
++#endif
++    // Rebuild the index: every file already in the folder is fully validated (identity, this engine's read
++    // limits INCLUDING the RAM preflight, payload hash) by the read itself; the image is then dropped except
++    // its token key. A read that REFUSES the file (foreign, corrupt, over-limits) deletes it: fail-closed, a
++    // bad file must never sit there for a later turn to retry forever. A read that merely could not run
++    // (RAM preflight right now, io) keeps it and stops the scan rather than churn.
++    const auto t0 = std::chrono::steady_clock::now();
++    size_t found = 0, refused = 0;
++    std::vector<std::string> paths;
++#ifndef _WIN32
++    if (DIR* d = opendir(dir_.c_str())) {
++        while (const dirent* e = readdir(d)) {
++            const std::string name = e->d_name;
++            if (name.rfind("park-", 0) == 0 && name.size() > 4 && name.compare(name.size() - 4, 4, ".ses") == 0)
++                paths.push_back(dir_ + "/" + name);
++        }
++        closedir(d);
++    }
++#else
++    WIN32_FIND_DATAA fd;
++    if (HANDLE h = FindFirstFileA((dir_ + "\\park-*.ses").c_str(), &fd); h != INVALID_HANDLE_VALUE) {
++        do paths.push_back(dir_ + "\\" + fd.cFileName); while (FindNextFileA(h, &fd));
++        FindClose(h);
++    }
++#endif
++    std::sort(paths.begin(), paths.end());   // serial order: the LRU keeps its spill order across a restart
++    for (const auto& path : paths) {
++        const auto id = identity_cached(error);   // the fingerprint is computed once; a failure is permanent
++        if (!id) { ++refused; break; }
++        SavedConversation image;
++        size_t bytes = 0;
++        SessionReadLimits limits;
++        if (limits_fn_ && !limits_fn_(limits, error)) {
++            std::fprintf(stderr, "strata serve: park disk: index stop at %s (%s)\n", path.c_str(), error.c_str());
++            break;
++        }
++        SessionStatus st;
++        if (!session_file_read(path, *id, image, bytes, error, limits, &st)) {
++            std::fprintf(stderr, "strata serve: park disk: index refuse %s (%s)\n", path.c_str(), error.c_str());
++            if (st.error == SessionError::invalid) {
++#ifndef _WIN32
++                ::unlink(path.c_str());
++#else
++                ::DeleteFileA(path.c_str());
++#endif
++            } else {
++                ++refused;
++                break;   // io/memory right now: the rest waits for a later boot rather than churn the disk
++            }
++            ++refused;
++            continue;
++        }
++        if (image.live.ids.empty() || image.kv.empty()) {   // nothing restorable to key on
++            ++refused;
++            continue;
++        }
++        Entry en;
++        en.serial = next_serial_++;
++        en.path = path;
++        en.bytes = bytes;
++        en.ids = std::move(image.live.ids);
++        en.cvec = image.cvec;
++        en.done = true;
++        en.spilled_at = std::chrono::steady_clock::now();
++        bytes_ += en.bytes;
++        entries_.push_back(std::move(en));
++        ++found;
++    }
++    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++    const std::string budget_note = budget_ ? std::to_string(budget_ >> 20) + " MiB" : std::string("free-space only");
++    std::fprintf(stderr, "strata serve: park disk: ON %s (index %zu files, %.1f GiB, %zu refused, rebuilt in "
++                         "%.0f ms; budget %s, keep-free %llu MiB)\n",
++                 dir_.c_str(), found, (double) bytes_ / (1024.0 * 1024.0 * 1024.0), refused, ms,
++                 budget_note.c_str(),
++                 (unsigned long long) (min_free_ >> 20));
++    worker_ = std::thread([this] { writer(); });
++}
++
++ParkDisk::~ParkDisk() {
++    if (!worker_.joinable()) return;
++    {
++        std::lock_guard<std::mutex> g(mtx_);
++        stop_ = true;
++    }
++    cv_.notify_all();
++    worker_.join();   // the writer finishes everything already queued before it leaves
++}
++
++void ParkDisk::spill(SavedConversation&& image) {
++    if (dir_.empty()) return;
++    drain_finished();
++    const size_t n = image.bytes();
++    if (n == 0) return;
++    // Room on disk: budget first, then the keep-free guard (oldest entries leave until the incoming fits).
++    while (budget_ != 0 && bytes_ + n > budget_ && !entries_.empty()) drop_oldest();
++    while (!entries_.empty() && !free_guard_ok(n)) drop_oldest();
++    if (!free_guard_ok(n)) {
++        std::fprintf(stderr, "strata serve: park disk: skip spill of %zu tokens, %.1f MiB: the free space minus "
++                             "the %llu MiB keep-free guard cannot hold it\n",
++                     image.live.ids.size(), (double) n / (1024.0 * 1024.0), (unsigned long long) (min_free_ >> 20));
++        return;
++    }
++    Entry en;
++    en.serial = next_serial_++;
++    en.path = pd_tier_path(dir_, en.serial);
++    en.bytes = n;
++    en.ids = image.live.ids;      // the key stays serve-side; the worker owns its own copy of the image
++    en.cvec = image.cvec;
++    en.spilled_at = std::chrono::steady_clock::now();
++    bytes_ += n;
++    spills_ += 1;
++    Write w;
++    w.serial = en.serial;
++    w.path = en.path;
++    w.image = std::move(image);
++    entries_.push_back(std::move(en));
++    {
++        std::lock_guard<std::mutex> g(mtx_);
++        queued_.push_back(std::move(w));
++    }
++    cv_.notify_one();
++}
++
++std::vector<int32_t> ParkDisk::ids(uint64_t serial) const {
++    for (const auto& e : entries_)
++        if (e.serial == serial) return e.ids;
++    return {};
++}
++
++std::optional<SavedConversation> ParkDisk::load(Match m, std::string& error) {
++    drain_finished();
++    const auto it = std::find_if(entries_.begin(), entries_.end(),
++                                 [&](const Entry& e) { return e.serial == m.serial && e.done; });
++    if (it == entries_.end()) return std::nullopt;
++    const auto id = identity_cached(error);
++    if (!id) return std::nullopt;
++    SavedConversation image;
++    size_t bytes = 0;
++    SessionReadLimits limits;
++    if (limits_fn_ && !limits_fn_(limits, error)) {   // RAM preflight inside: the file stays for a later turn
++        error = "read refused: " + error;
++        return std::nullopt;
++    }
++    SessionStatus st;
++    const auto t0 = std::chrono::steady_clock::now();
++    if (!session_file_read(it->path, *id, image, bytes, error, limits, &st)) {
++        if (st.error == SessionError::invalid) {   // corrupt or foreign: never again
++            std::fprintf(stderr, "strata serve: park disk: refuse %s (%s); file deleted\n",
++                         it->path.c_str(), error.c_str());
++            bytes_ -= it->bytes;
++            entries_.erase(it);
++            ++drops_;
++        }
++        return std::nullopt;                        // io/memory: the file stays, a later turn retries
++    }
++    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++    loads_ += 1;
++    bytes_ += bytes - it->bytes;
++    it->bytes = bytes;
++    std::fprintf(stderr, "strata serve: park disk: restored %zu tokens, %.1f MiB read in %.0f ms "
++                         "(%zu entries, %.1f GiB on disk)\n",
++                 image.live.ids.size(), (double) bytes / (1024.0 * 1024.0), ms,
++                 entries_.size(), (double) bytes_ / (1024.0 * 1024.0 * 1024.0));
++    return image;
++}
++
++void ParkDisk::drain_finished() {
++    std::deque<Finished> done;
++    {
++        std::lock_guard<std::mutex> g(mtx_);
++        done.swap(finished_);
++    }
++    for (const auto& f : done) {
++        const auto it = std::find_if(entries_.begin(), entries_.end(),
++                                     [&](const Entry& e) { return e.serial == f.serial; });
++        if (it == entries_.end()) {
++            // dropped while its write ran (room loop): the rename may still have published a file nobody
++            // indexes - take it back (a boot scan would otherwise resurrect the stale copy)
++            if (f.ok) {
++#ifndef _WIN32
++                ::unlink(pd_tier_path(dir_, f.serial).c_str());
++#else
++                ::DeleteFileA(pd_tier_path(dir_, f.serial).c_str());
++#endif
++            }
++            continue;
++        }
++        if (f.ok) {
++            it->done = true;
++            std::fprintf(stderr, "strata serve: park disk: spilled %zu tokens, %.1f MiB in %.0f ms "
++                                 "(%zu entries, %.1f GiB on disk)\n",
++                         it->ids.size(), (double) it->bytes / (1024.0 * 1024.0), f.ms,
++                         entries_.size(), (double) bytes_ / (1024.0 * 1024.0 * 1024.0));
++        } else {
++            std::fprintf(stderr, "strata serve: park disk: spill failed for %zu tokens (%s)\n",
++                         it->ids.size(), f.error.c_str());
++            bytes_ -= it->bytes;
++            entries_.erase(it);
++            ++drops_;
++        }
++    }
++}
++
++void ParkDisk::writer() {
++    for (;;) {
++        Write w;
++        {
++            std::unique_lock<std::mutex> g(mtx_);
++            cv_.wait(g, [this] { return stop_ || !queued_.empty(); });
++            if (queued_.empty()) return;   // stop_ with nothing left: everything queued got written
++            w = std::move(queued_.front());
++            queued_.pop_front();
++        }
++        const auto t0 = std::chrono::steady_clock::now();
++        Finished f;
++        f.serial = w.serial;
++        const auto id = identity_cached(f.error);
++        if (!id) {
++            f.error = "identity: " + f.error;
++        } else {
++            SessionWriteOptions wo;
++            wo.min_free_bytes = min_free_;
++            SessionStatus st;
++            size_t bytes = 0;
++            if (!session_file_write(w.path, w.image, *id, bytes, f.error, wo, &st) && !st.published) {
++                if (f.error.empty()) f.error = "write failed";
++            } else {
++                f.ok = true;   // st.published with a folder-flush failure: the file is there; the next boot checks it
++            }
++        }
++        f.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++        std::lock_guard<std::mutex> g(mtx_);
++        finished_.push_back(std::move(f));
++    }
++}
++
++bool ParkDisk::free_guard_ok(size_t incoming) const {
++#ifdef _WIN32
++    ULARGE_INTEGER avail;
++    if (!GetDiskFreeSpaceExA(dir_.c_str(), &avail, nullptr, nullptr)) return true;   // unknown: the write's own preflight guards
++    return avail.QuadPart >= (unsigned long long) min_free_ + incoming;
++#else
++    struct statvfs st;
++    if (statvfs(dir_.c_str(), &st) != 0) return true;   // unknown: the write's own preflight guards
++    return (uint64_t) st.f_bavail * st.f_frsize >= min_free_ + incoming;
++#endif
++}
++
++void ParkDisk::drop_oldest() {
++    if (entries_.empty()) return;
++    const Entry e = std::move(entries_.front());
++    entries_.erase(entries_.begin());
++    bytes_ -= e.bytes;
++    ++drops_;
++#ifndef _WIN32
++    ::unlink(e.path.c_str());
++#else
++    ::DeleteFileA(e.path.c_str());
++#endif
++    // a not-yet-started write for this serial leaves the queue with it (its rename would republish the file);
++    // one already in flight is caught by drain_finished(), which unlinks a file nobody indexes anymore
++    std::lock_guard<std::mutex> g(mtx_);
++    for (auto q = queued_.begin(); q != queued_.end(); ++q)
++        if (q->serial == e.serial) { queued_.erase(q); break; }
++}
++
++std::optional<SessionFileIdentity> ParkDisk::identity_cached(std::string& error) {
++    std::lock_guard<std::mutex> g(write_mtx_);
++    if (!identity_) {
++        SessionFileIdentity id;
++        if (!identity_fn_ || !identity_fn_(id, error)) return std::nullopt;
++        identity_ = id;
++    }
++    return identity_;
++}
++
++} // namespace strata::core
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index a012bdca..5b9639d8 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -39,6 +39,7 @@
+ #include "strata/core/conversation_file.hpp"
+ #include "strata/core/session_save_reclaim.hpp"
+ #include "strata/core/conversation_memory.hpp"
++#include "strata/core/conversation_park_disk.hpp"
+ #include "strata/core/auto_cache.hpp"
+ #include "strata/core/ple_residency.hpp"
+ #include "strata/core/defaults_026.hpp"
+@@ -12136,6 +12137,33 @@ int main(int argc, char** argv) {
+             id.config = *config_fp;
+             return true;
+         };
++        // M-C3a: an optional disk tier under the parked cache (STRATA_PARK_DISK=DIR). LRU eviction spills the
++        // victim to an identity-bound STRSES file; an admission whose whole usable prefix lives on disk reads it
++        // back and restores it through the normal conversation-snapshot path. Read limits (and the RAM preflight
++        // inside them) are this engine's, exactly as the /slots disk-session path builds them below.
++        strata::core::ParkDisk park_disk;
++        if (const auto pd_opt = strata::core::ParkDisk::from_env()) {
++            park_disk.init(*pd_opt,
++                [&](strata::core::SessionFileIdentity& id, std::string& e) { return session_identity(id, e, [] {}); },
++                [&](strata::core::SessionReadLimits& lim, std::string& e) {
++                    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
++                    lim.admit = [floor](uint64_t need, std::string& why) {
++                        const auto mem = strata::core::sample_host_memory();
++                        const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
++                        if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
++                        why = "not enough free RAM to read the parked image back (" + std::to_string(need >> 20) +
++                              " MiB plus a floor of " + std::to_string((long long) (floor >> 20)) + " MiB)";
++                        return false;
++                    };
++                    return strata::core::conversation_session_read_limits(
++                        lim, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
++                        (uint64_t) std::max(o.prompt_cache, 1), e);
++                });
++            if (park_disk.enabled() && conversations.enabled())
++                conversations.spill_hook = [&](strata::core::SavedConversation&& img) {
++                    park_disk.spill(std::move(img));
++                };
++        }
+         // What a park captures: the main session's conversation (park_current) or an idle batch slot's (park_slot:
+         // the reply it decoded, before an admission overwrites it).  One budget / admission / snapshot path for both.
+         struct ParkSource {
+@@ -16400,6 +16428,21 @@ int main(int argc, char** argv) {
+                           conversations.borrows(parked);
+             if (parked.tokens > std::max(resume, slot_tokens) && !borrow)
+                 incoming.emplace(conversations.take(parked.index));
++            // M-C3a: no usable RAM match at all (batch-slot resume and live state always win): a spilled parked
++            // conversation comes back from the disk tier as a full take - no borrowing from disk in v1.
++            bool from_disk = false;
++            if (!incoming && !borrow && parked.tokens <= std::max(resume, slot_tokens) && park_disk.enabled()) {
++                const auto d = park_disk.best(ids, req_imgs, want_cvec);
++                if (d.tokens > std::max(resume, slot_tokens)) {
++                    std::string derr;
++                    if (auto img = park_disk.load(d, derr)) {
++                        incoming.emplace(std::move(*img));
++                        from_disk = true;
++                    } else if (!derr.empty())
++                        std::fprintf(stderr, "strata serve: park disk: load refused (%s); rereading the prompt\n",
++                                     derr.c_str());
++                }
++            }
+             if (incoming || borrow) slot_source = -1;
+             // Reject the entire image before parking/overwriting the outgoing
+             // state. Invalid entries can safely fall back to its existing prefix.
+@@ -16460,7 +16503,10 @@ int main(int argc, char** argv) {
+                                  (long long) strata::program::conv_cache::kRestoreFirstUseMib);
+                     auto retry = std::move(*incoming);
+                     incoming.reset();
+-                    if (!conversations.put(std::move(retry)))
++                    if (from_disk)
++                        std::fprintf(stderr, "strata serve: conversation cache: disk image not restored; the file "
++                                             "stays for a later turn\n");
++                    else if (!conversations.put(std::move(retry)))
+                         std::fprintf(stderr, "strata serve: conversation cache: could not return the skipped snapshot\n");
+                     err.clear();
+                 }
+-- 
+2.53.0
+
+
+From 1b1d40012c1ac8b0908aed3cca63dc34fde9642b Mon Sep 17 00:00:00 2001
+From: Henson <henson@local>
+Date: Fri, 13 Nov 2026 21:35:14 +0000
+Subject: [PATCH 2/2] park disk: one log line per budget/keep-free file drop
+ (path, MiB, remaining entries and GiB) so the dashboard tier card can count
+ drops without inferring them from deltas
+
+---
+ src/core/conversation_park_disk.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/core/conversation_park_disk.cpp b/src/core/conversation_park_disk.cpp
+index 21859005..e485414c 100644
+--- a/src/core/conversation_park_disk.cpp
++++ b/src/core/conversation_park_disk.cpp
+@@ -329,6 +329,9 @@ void ParkDisk::drop_oldest() {
+ #else
+     ::DeleteFileA(e.path.c_str());
+ #endif
++    std::fprintf(stderr, "strata serve: park disk: drop %s (%.1f MiB, %zu entries, %.1f GiB on disk)\n",
++                 e.path.c_str(), (double) e.bytes / (1024.0 * 1024.0), entries_.size(),
++                 (double) bytes_ / (1024.0 * 1024.0 * 1024.0));
+     // a not-yet-started write for this serial leaves the queue with it (its rename would republish the file);
+     // one already in flight is caught by drain_finished(), which unlinks a file nobody indexes anymore
+     std::lock_guard<std::mutex> g(mtx_);
+-- 
+2.53.0
+

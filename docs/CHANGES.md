@@ -3,6 +3,46 @@
 Chronological record of every measurement → decision → commit in the program.
 Newest first; section numbers are stable, so §N always refers to the same entry.
 
+## 130. PARK DEDUP VERDICT: content-addressed chunking is dead for this workload; lineage/donor views are the path (parkladder N=6 evidence)
+- parkladder100k N=6 (shared 66.5k head, 6 siblings ~99k, ladder auth patched for the LAN key):
+  ingest 6/6 QC green, restore 6/6 QC green, no engine crash (CDC binary), disk restores fired
+  (restored 96-100k tokens, parked 3->0).
+- Every sibling spill added ~110 NEW chunks, 0 skipped, under BOTH fixed-grid and CDC chunkers,
+  cross-sibling AND cross-generation. The KV bytes for the same prefix tokens are NOT byte-equal:
+  separate prefill geometries (chunk boundaries, co-read batching) produce numerically different
+  rows, and int8 quantization amplifies that to full-byte divergence. This is exactly why M-C2
+  dedups by token-prefix match with memcmp verify, never by content hash (closed in M-C0).
+- Consequence: M-C3b1/b1c (content chunking) cannot deliver byte savings on a real engine.
+  The chunk machinery is correct (readers/refcounts/fail-closed verified) but dedups nothing here.
+  It remains as store hygiene (identical generations DO dedup when content is truly equal, e.g.
+  restored-unchanged sessions re-spilled) - measurable, small.
+- The fix for the full-copy disk cost is M-C3b2 as designed: restore-time donor-view adoption
+  (token-prefix match into a live RAM session, M-C2 matcher) so a restored sibling mounts the
+  shared head from the donor and reads only its tail from disk, AND donor-referenced spills
+  (a spilled session with a live CoW donor serializes only segments it owns). Restore then
+  preserves the RAM CoW accounting (fixes the MemAvailable 4.3 -> 2.7 GiB collapse).
+- Park COW anchor: "none for 0 of 96598" when no sibling is resident (all spilled - expected);
+  "mounted for 65895 of 102340" when a donor exists (run8). Mechanism works; only it moves bytes.
+
+## 129. M-C3b1 fixed-grid dedup structurally missed; content-defined chunking landed (cow-m3b); run7/run8 invalidated by process accidents
+- run7 (fixed-grid V2, 142 spills): 0 dedup skips, 0 saved. Root cause: the payload
+  grows internally (ids list, per-layer KV rows), so fixed 16 MiB grid boundaries shift
+  on every re-park and no chunk key is ever seen twice. Fixed-grid v2 is retired from
+  the benchmark narrative (it is format-correct: readers, refcounts, fail-closed all worked).
+- M-C3b1c: content-defined chunking (gear hash, bounded window, check from 2 MiB,
+  mean 4 MiB via 22-bit mask, 16 MiB forced ceiling) landed on cow-m3b, built green,
+  committed. Battery lan-89/lan-90 green on the CDC binary.
+- run7 and run8 are INVALID for wall comparison: run7 had an accidental second sweep
+  (redaction-mangled runner auth) and run8 an engine crash mid-sweep (exit 1, last line
+  "park COW anchor mounted for 65895 of 102340 tokens") plus supervisor restart picking
+  up the freshly built binary. run5/run6 remain the only clean tier pairs.
+- Two engine boot scans refused every v2 file present ("a chunk file is missing or
+  truncated") and fail-closed deleted ses + chunks (2091 swept). Not yet root-caused;
+  the boot-refuse storm is the #1 suspect for any future tier loss and must be
+  reproduced in a lab (fresh tier dir) before the next sweep.
+- Decisive experiment running: parkladder100k N=6 (4->6 siblings, shared 66.5k head)
+  forces cross-sibling disk dedup. If dedup works, siblings 2..N skip ~1 GiB each.
+
 ## 128. M-C3b1 landed: deduped block files for the park-disk tier (STRATA_PARK_DISK_V2)
 cow-m3b / 10f90c7e, built green (356/356). The tier now writes a STRP/KD2 envelope whose payload is
 exactly the STRSES v1 byte stream: session_payload_blocks walks put_payload through host buffers and
