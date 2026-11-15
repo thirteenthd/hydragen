@@ -1,5 +1,5 @@
 {
- "exe": "~/strata-0213/build/strata",
+ "exe": "~/hydragen/engine/build/hydragen",
  "args": [
   "--pack",
   "~/.models_backup/Strata-data/packs/iq3_xxs",

@@ -20,7 +20,7 @@ Linux:
 ```bash
 git clone https://github.com/thirteenthd/hydragen.git && cd hydragen
 ./install.sh
-.venv/bin/python engine/serve/server.py --engine strata --config hydragen-local.json
+.venv/bin/python engine/serve/server.py --engine hydragen --config hydragen-local.json
 ```
 
 Windows (PowerShell):
@@ -28,7 +28,7 @@ Windows (PowerShell):
 ```powershell
 git clone https://github.com/thirteenthd/hydragen.git; cd hydragen
 .\install.ps1
-.venv\Scripts\python.exe engine\serve\server.py --engine strata --config hydragen-local.json
+.venv\Scripts\python.exe engine\serve\server.py --engine hydragen --config hydragen-local.json
 ```
 
 OpenAI-compatible API + live concurrency dashboard → `http://127.0.0.1:8181/`
@@ -133,6 +133,20 @@ Strata setup can fetch, verify (SHA-256, resumable) and process everything for
 that directory in one command. Full sources and commands:
 [docs/MODELS.md](docs/MODELS.md). The expert-routing profile already ships in
 this repo.
+
+**Living beside upstream Strata.** HydraGen's engine is a fork of Strata, and it
+is built to coexist with an upstream install on the same machine. The binary
+installs as `engine/build/hydragen` (`hydragen.exe`), not `strata`, so `ps`,
+PATH and task managers never go ambiguous; the serve layer accepts both
+`--engine strata` and `--engine hydragen`. Nothing runtime is shared: configs,
+logs and the park-disk tier all live inside this repo's folder. Only *model
+data* is shareable — the quant packs follow Strata's data-dir layout, so a
+`--model-dir` (or `--gguf-dir`) pointing at an existing Strata data folder
+reuses its files without re-downloading. One port rule: both dashboards
+default to 8181, so run the second with `--port 8182`. The `STRATA_*`
+environment variables and everything inside `engine/` keep their upstream
+names on purpose — that is what keeps the fork mergeable with Strata and keeps
+provenance legible (see Provenance & license).
 
 ## Provenance & license
 

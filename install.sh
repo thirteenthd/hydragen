@@ -82,8 +82,8 @@ echo "Building the HydraGen engine (CUDA arch: $ARCH) ..."
   -DCMAKE_CUDA_COMPILER="$CUDA/bin/nvcc" \
   -DCMAKE_MAKE_PROGRAM="$PWD/.venv/bin/ninja"
 ".venv/bin/cmake" --build engine/build -j "$(nproc)"
-BIN="$PWD/engine/build/strata"
-[ -x "$BIN" ] || { echo "install.sh: build finished but engine/build/strata is missing" >&2; exit 1; }
+BIN="$PWD/engine/build/hydragen"
+[ -x "$BIN" ] || { echo "install.sh: build finished but engine/build/hydragen is missing" >&2; exit 1; }
 echo "engine OK: $BIN"
 
 # ------------------------------------------------------------------ local config
@@ -139,7 +139,7 @@ Next steps
      Source table and licenses: docs/MODELS.md. The expert-routing profile is already
      in this repo (engine/data/expert-profile.bin) - nothing to download for it.
   2. Serve:
-       .venv/bin/python engine/serve/server.py --engine strata --config hydragen-local.json
+       .venv/bin/python engine/serve/server.py --engine hydragen --config hydragen-local.json
      Dashboard + Monitor (concurrency panel): http://127.0.0.1:8181/
      LAN serving: set "host": "0.0.0.0" and "api_key" in the config (the key gates the
      API; the dashboard page itself is open, so keep it on a trusted network).

@@ -101,8 +101,8 @@ Write-Host "Building the HydraGen engine (CUDA arch: $ARCH) ..."
 if ($LASTEXITCODE -ne 0) { Write-Error "install.ps1: cmake configure failed" }
 & $CMAKE --build engine/build --target strata --parallel ([Environment]::ProcessorCount)
 if ($LASTEXITCODE -ne 0) { Write-Error "install.ps1: build failed" }
-$BIN = Join-Path $PWD "engine\build\strata.exe"
-if (-not (Test-Path $BIN)) { Write-Error "install.ps1: build finished but engine\build\strata.exe is missing" }
+$BIN = Join-Path $PWD "engine\build\hydragen.exe"
+if (-not (Test-Path $BIN)) { Write-Error "install.ps1: build finished but engine\build\hydragen.exe is missing" }
 Write-Host "engine OK: $BIN"
 
 # ------------------------------------------------------------------ local config
@@ -120,7 +120,7 @@ $blobTargets = @{
 }
 if (-not (Test-Path hydragen-local.json)) {
   $cfg = Get-Content configs/strata-iq3xxs-m25-0213-ctx131k.json -Raw | ConvertFrom-Json
-  $cfg.exe = (Join-Path $PWD "engine\build\strata.exe") -replace '\\','/'
+  $cfg.exe = (Join-Path $PWD "engine\build\hydragen.exe") -replace '\\','/'
   $cfg.log = (Join-Path $PWD "logs\strata.log") -replace '\\','/'
   foreach ($d in @("logs", "park-disk")) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
   $cfg.env | Add-Member -Force -NotePropertyMembers @{
@@ -149,7 +149,7 @@ Write-Host "       cmd /c engine\SETUP.bat --model IQ3_XXS --data-dir `"$ModelDi
 Write-Host "     (Strata's own downloader: resumable, SHA-256-checked; builds the pack and fetches MTP)."
 Write-Host "     Or: uvx hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF --include `"IQ3_XXS/*`" --local-dir DIR"
 Write-Host "         then engine\SETUP.bat --gguf-dir DIR"
-Write-Host "  2. .venv\Scripts\python.exe engine\serve\server.py --engine strata --config hydragen-local.json --port 8181"
+Write-Host "  2. .venv\Scripts\python.exe engine\serve\server.py --engine hydragen --config hydragen-local.json --port 8181"
 Write-Host "  3. dashboard + Monitor: http://127.0.0.1:8181/"
 Write-Host "  4. the canonical stack is pre-wired: STRATA_PARK_COW=1, park-disk v2 tier (park-disk\),"
 Write-Host "     STRATA_RESUME_DEEPEST=1, --prompt-cache-tail (budget: STRATA_PARK_DISK_MIB, default 160 GiB)"
