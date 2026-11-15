@@ -14,7 +14,7 @@ Demonstrated on one RTX 3080 Ti (12 GB) + 60 GB host RAM, no multi-GPU, no datac
 | `engine/` | our fork of [Strata](https://github.com/Niko1221/Strata) (MIT) — vendored at v0.2.13 with the six-commit CoW chain applied on top, full commit history inside this repo |
 | `configs/` | canonical ctx-131k serving config + launcher |
 | `bench/` | the gate suite used for every landing: battery (quality oracle), farm (concurrency ladder), park-ladders (22k and 100k depth), CoW arm runner |
-| `docs/` | final benchmark report, the 120-section program changelog, engineering laws distilled from the campaign |
+| `docs/` | final benchmark report, the 160+-section program changelog, engineering laws distilled from the campaign |
 
 ## Headline results (all measured, all quality-gated)
 
