@@ -12,7 +12,7 @@ layout below; you choose the root (`./install.sh --model-dir DIR` /
 | `--native` | `models/IQ3_XXS/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf` | ~47 GB | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), `IQ3_XXS/` (routed-expert weights shard) |
 | `--ple-gguf` | `models/IQ3_XXS/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf` | ~29 GB | same repo (n-gram/PLE table shard — streamed from disk, not loaded into RAM) |
 | `--pack` | `packs/iq3_xxs/` | ~75 GB | built by Strata's setup from those GGUFs (`engine/tools/iq_pack.py`) — not a standalone download |
-| `--mtp` | `mtp/rt/` | ~2 GB | fetched by Strata's setup (`engine/tools/mtp_fetch.py`) |
+| `--mtp` | `mtp/rt/` | ~5 GB | fetched by Strata's setup (`engine/tools/mtp_fetch.py`; range-reads the MTP tensors from the BF16 checkpoint, SHA-256-verified) |
 | `--expert-profile` | — | 196 KB | **ships in this repo**: `engine/data/expert-profile.bin` (adaptive-cache routing profile; nothing to download) |
 
 ## Easiest path: let Strata's setup fetch and verify everything
