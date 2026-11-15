@@ -54,9 +54,14 @@ donor's host K/V buffer segments as verified views — only the tail is copied.
 
 **Knobs.** The VRAM funding mechanisms (global arenas, admission fork with page
 ref-counting) are compiled into this engine and always on — that is the product.
-`STRATA_PARK_COW=1` turns on host-tier parked dedup — recommended, it's on in our
-canonical serving config. `STRATA_COW_JOIN_HH` / `STRATA_COW_SHARED` are the
-closed-negative experiments, kept default-off for roomier substrates. See `docs/laws/`.
+The canonical serving stack is wired by the installer into `hydragen-local.json`:
+`STRATA_PARK_COW=1` (host-tier parked dedup, CoW parks), a park-disk v2 tier
+(`STRATA_PARK_DISK=<dir>` + `STRATA_PARK_DISK_V2=1`) that keeps parked sessions
+cross-boot at view-mount cost, and `STRATA_RESUME_DEEPEST=1` + the
+`--prompt-cache-tail` arg so a parked session resumes at its own deepest
+checkpoint instead of re-reading its tail. `STRATA_COW_JOIN_HH` /
+`STRATA_COW_SHARED` are the closed-negative experiments, kept default-off for
+roomier substrates. See `docs/laws/`.
 
 ## Install
 

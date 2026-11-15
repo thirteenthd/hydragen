@@ -42,7 +42,10 @@
   "8",
   "--batch",
   "2",
-  "--batch-mtp"
+  "--batch-mtp",
+  "--conversation-cache-min-free-mib",
+  "512",
+  "--prompt-cache-tail"
  ],
  "cwd": "~/hydragen-experimental/strata",
  "tokenizer": "~/.models_backup/Strata-data/packs/iq3_xxs/tokenizer",

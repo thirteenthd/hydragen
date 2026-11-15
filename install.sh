@@ -2,7 +2,9 @@
 # HydraGen installer (Linux, NVIDIA).
 # Builds the vendored engine FROM SOURCE - prebuilt Strata release binaries do not contain
 # HydraGen's CoW chain (expert-slot refcounting + admission fork, host-tier parked-session
-# dedup; see docs/FINAL_REPORT.md) - and sets up the Python venv for the serving front.
+# dedup, park-disk v2 lineage tier + deep resume; see docs/FINAL_REPORT.md) - and sets up the
+# Python venv for the serving front. The vendored engine is the canonical cow-m3b branch
+# (M-C1c..M-C10c): this build IS the canonical engine, no arm switches.
 #
 # Needs: an NVIDIA driver, a CUDA toolkit (nvcc), a C++ toolchain, Python 3.10+.
 #        CUDA toolkit: https://developer.nvidia.com/cuda-downloads
@@ -74,8 +76,25 @@ if [ ! -f hydragen-local.json ]; then
   sed -e "s#\"exe\": \"[^\"]*\"#\"exe\": \"$BIN\"#" \
       -e "s#\"log\": \"[^\"]*\"#\"log\": \"$PWD/logs/strata.log\"#" \
       configs/strata-iq3xxs-m25-0213-ctx131k.json > hydragen-local.json
-  mkdir -p logs
-  echo "config created: hydragen-local.json (localhost:8181)"
+  mkdir -p logs park-disk
+  PARK_DISK_DIR="$PWD/park-disk" .venv/bin/python - <<'PYEOF'
+import json, os
+p = "hydragen-local.json"
+cfg = json.load(open(p))
+env = cfg.setdefault("env", {})
+env["STRATA_PARK_COW"] = "1"
+env["STRATA_PARK_DISK"] = os.environ["PARK_DISK_DIR"]
+env.setdefault("STRATA_PARK_DISK_MIB", "163840")
+env["STRATA_PARK_DISK_V2"] = "1"
+env["STRATA_RESUME_DEEPEST"] = "1"
+args = cfg["args"]
+if "--conversation-cache-min-free-mib" not in args:
+    args += ["--conversation-cache-min-free-mib", "512"]
+if "--prompt-cache-tail" not in args:
+    args += ["--prompt-cache-tail"]
+json.dump(cfg, open(p, "w"), indent=1)
+PYEOF
+  echo "config created: hydragen-local.json (localhost:8181, canonical cow stack wired)"
 fi
 
 cat <<'EON'
@@ -89,11 +108,17 @@ Next steps
      Dashboard + Monitor (concurrency panel): http://127.0.0.1:8181/
      LAN serving: set "host": "0.0.0.0" and "api_key" in the config (the key gates the
      API; the dashboard page itself is open, so keep it on a trusted network).
-  3. Concurrency levers (env, or the config's "env" map):
-       STRATA_PARK_COW=1        host-tier parked-session dedup - recommended for agent
-                                workloads (long histories: ~40% less parked RAM, no more
-                                multi-GB re-prefills; docs/FINAL_REPORT.md)
-       admission fork (M-C1c)   inside the engine, always on: bigger expert cache under
-                                batch load - no knob
-       STRATA_COW_JOIN_HH, STRATA_COW_SHARED   closed-negative experiments; leave off
+  3. The canonical serving stack is already wired into hydragen-local.json:
+       STRATA_PARK_COW=1        host-tier parked-session dedup (CoW parks) - ~40% less
+                                parked RAM on agent workloads (docs/FINAL_REPORT.md)
+       STRATA_PARK_DISK=DIR     the cross-boot park-disk tier under it (a park-disk/ dir
+                                was created here); STRATA_PARK_DISK_MIB caps its budget
+                                (default 163840 = 160 GiB - lower it on small disks)
+       STRATA_PARK_DISK_V2=1    v2 writer + lineage-aware two-phase boot rebuild
+       STRATA_RESUME_DEEPEST=1  a parked session resumes at its own deepest checkpoint,
+                                together with the --prompt-cache-tail engine arg now in
+                                the config's args list
+       STRATA_COW_JOIN_HH, STRATA_COW_SHARED are closed-negative experiments; leave off.
+     Merge gates (optional, from this tree): build with -DSTRATA_BUILD_TESTS=ON and run
+     the conversation_cache_test and park_disk_boot_test targets.
 EON

@@ -110,8 +110,16 @@ if (-not (Test-Path hydragen-local.json)) {
   $cfg = Get-Content configs/strata-iq3xxs-m25-0213-ctx131k.json -Raw | ConvertFrom-Json
   $cfg.exe = (Join-Path $PWD "engine\build\strata.exe") -replace '\\','/'
   $cfg.log = (Join-Path $PWD "logs\strata.log") -replace '\\','/'
+  foreach ($d in @("logs", "park-disk")) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+  $cfg.env | Add-Member -Force -NotePropertyMembers @{
+    STRATA_PARK_COW = "1"; STRATA_PARK_DISK_V2 = "1"; STRATA_PARK_DISK_MIB = "163840";
+    STRATA_RESUME_DEEPEST = "1";
+    STRATA_PARK_DISK = (Join-Path $PWD "park-disk") -replace '\\','/'
+  }
+  if ($cfg.args -notcontains "--conversation-cache-min-free-mib") { $cfg.args += @("--conversation-cache-min-free-mib", "512") }
+  if ($cfg.args -notcontains "--prompt-cache-tail") { $cfg.args += "--prompt-cache-tail" }
   ($cfg | ConvertTo-Json -Depth 6) | Set-Content hydragen-local.json
-  Write-Host "created hydragen-local.json - EDIT the model/pack paths (they default to the developer's Linux layout) before serving."
+  Write-Host "created hydragen-local.json (canonical cow stack wired) - EDIT the model/pack paths (they default to the developer's Linux layout) before serving."
 } else {
   Write-Host "hydragen-local.json already exists; leaving it alone."
 }
@@ -119,5 +127,7 @@ if (-not (Test-Path hydragen-local.json)) {
 Write-Host ""
 Write-Host "Install complete. Next:"
 Write-Host "  1. edit hydragen-local.json: point --native/--ple-gguf/--pack at your model files"
-Write-Host "  2. .venv\Scripts\python.exe engine\serve\server.py hydragen-local.json"
-Write-Host "  3. dashboard: http://127.0.0.1:8095/   (first page load sets the API key)"
+Write-Host "  2. .venv\Scripts\python.exe engine\serve\server.py --engine strata --config hydragen-local.json --port 8181"
+Write-Host "  3. dashboard + Monitor: http://127.0.0.1:8181/"
+Write-Host "  4. the canonical stack is pre-wired: STRATA_PARK_COW=1, park-disk v2 tier (park-disk\),"
+Write-Host "     STRATA_RESUME_DEEPEST=1, --prompt-cache-tail (budget: STRATA_PARK_DISK_MIB, default 160 GiB)"
