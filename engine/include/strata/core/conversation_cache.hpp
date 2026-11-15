@@ -173,6 +173,9 @@ inline bool conversation_checkpoints_merge(ConversationCheckpointSplit&& split, 
 }
 
 struct SavedConversation {
+    // M-C3b3: the parked image views this RAM-cache slot's K/V prefixes (park CoW anchor); -1: none.
+    // Memory-only bookkeeping: never serialized, never part of any hash.
+    int64_t view_donor = -1;
     // Runtime compatibility only; NOT a model/weights identity or disk schema.
     std::array<int64_t, 18> geometry{};
     // The session's layer carve the image was captured from ([0, n_layers) on one GPU); restore requires the same.
@@ -252,7 +255,7 @@ public:
     // M-C3a: optional disk tier (conversation_park_disk.hpp). When set, an image evict_oldest() throws away is
     // handed over IN FULL before its RAM goes; the tier decides what it keeps. drop_superseded() and clear()
     // do not spill: superseded copies are stale by construction and clear() drops poisoned state.
-    std::function<void(SavedConversation&&)> spill_hook;
+    std::function<void(SavedConversation&&, int64_t slot_serial)> spill_hook;   // M-C3b3: the slot serial rides along for lineage
     bool enabled() const { return budget_ != 0 && slots_ != 0; }
     /// `--conversation-cache-min-tokens`: whether a conversation of this length is worth one of `slots`.  Every
     /// parked conversation costs a whole slot whatever its length, so a client that interleaves short side requests
@@ -407,11 +410,23 @@ public:
     size_t borrowed() const { return borrowed_; }
     void count_borrow() { ++borrowed_; }
 
+    // M-C10: while an anchored child (view_donor) is resident, its donor stays evictable-in-name-only:
+    // selection skips it. Borrowed segments ref-count the store so no read can dangle, but a donor
+    // evicted under admission pressure kills the anchor mid-park and forces the child's own park to
+    // recopy a prefix it had already verified byte-identical (run61: 3 anchor losses in one pass).
+    // Direct slot drops still take donors when the children themselves go (evict_slot's cascade).
+    bool is_view_donor(size_t i) const {
+        for (size_t j = 0; j < entries_.size(); ++j)
+            if (j != i && entries_[j].view_donor >= 0 &&
+                entries_[j].view_donor == (int64_t) serials_[i]) return true;
+        return false;
+    }
+
     // Reserve before allocating a snapshot. held is an incoming image removed
     // with take() but still alive during the exchange; count it against RAM too.
     bool make_room(size_t incoming, size_t held = 0) {
         if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
-        auto stays = [&](size_t i) { return entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_); };
+        auto stays = [&](size_t i) { return entries_[i].pinned() || is_view_donor(i) || (guarded_ != 0 && serials_[i] == guarded_); };
         if (guarded_ != 0 && index_of(guarded_) != SIZE_MAX) {
             // with everything else gone, would it fit beside the entries that stay (the guarded donor and any pinned
             // shared prefix)?  If not, evict nothing
@@ -438,15 +453,45 @@ public:
     bool evict_oldest() {
         // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
         for (size_t i = 0; i < entries_.size(); ++i) {
-            if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
-            SavedConversation victim = std::move(entries_[i]);   // M-C3a: the tier may take it before it goes
-            bytes_ -= victim.bytes();
-            erase(i);
-            ++evictions_;
-            if (spill_hook) spill_hook(std::move(victim));
-            return true;
+            // M-C10: a donor whose anchored child is still resident is not a candidate
+            if (entries_[i].pinned() || is_view_donor(i) || (guarded_ != 0 && serials_[i] == guarded_)) continue;
+            return evict_slot(i, 0);
         }
         return false;
+    }
+
+    // M-C3b3: evict one known slot. A park anchored on a donor VIEWS the donor's K/V prefixes, and a spilled
+    // child's file names the parent's DISK file - so the donor must reach the tier BEFORE this slot (chain
+    // depth-capped at 3: deeper links spill inline). A pinned donor (in use) just breaks the chain: the child
+    // spills self-contained, its view bytes inline, exactly as before this milestone.
+    bool evict_slot(size_t i, int depth) {
+        const uint64_t target = serials_[i];
+        if (depth < 3 && entries_[i].view_donor >= 0) {
+            for (size_t j = 0; j < entries_.size(); ++j) {
+                if (j == i || (int64_t) serials_[j] != entries_[i].view_donor) continue;
+                // M-C10: only cascade the donor out when this child was its LAST anchored child;
+                // taking a shared donor down with one child would strand the siblings mid-park.
+                bool other_child = false;
+                for (size_t k = 0; k < entries_.size(); ++k)
+                    if (k != i && k != j && entries_[k].view_donor >= 0 &&
+                        entries_[k].view_donor == (int64_t) serials_[j]) { other_child = true; break; }
+                if (!other_child && !entries_[j].pinned() && !(guarded_ != 0 && serials_[j] == guarded_)) evict_slot(j, depth + 1);
+                break;
+            }
+        }
+        // M-C10b: the cascade above erased slots that can sit AHEAD of i, and erasing a
+        // deque index shifts every later entry down into the hole: a stale i then reads
+        // (and moves) entries_[i] past the end - the run56 SIGSEGV, frame: move-assign
+        // inside deque::_M_erase on a child -> donor -> grand-donor eviction chain.
+        // Re-resolve this slot by serial after the recursion instead of trusting the index.
+        const size_t k = index_of(target);
+        if (k == SIZE_MAX) return true;   // the cascade already took this slot down
+        SavedConversation victim = std::move(entries_[k]);   // M-C3a: the tier may take it before it goes
+        bytes_ -= victim.bytes();
+        erase(k);
+        ++evictions_;
+        if (spill_hook) spill_hook(std::move(victim), (int64_t) target);
+        return true;
     }
 
     // #879: every parked conversation (pinned ones too) and the retained K/V go - after non-finite logits any of them

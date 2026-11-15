@@ -19,6 +19,19 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& state, const Mo
                           int64_t upto, bool include_index, std::string& error,
                           int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr,
                           const ConversationKv* anchor = nullptr, int64_t anchor_tokens = 0);
+
+// M-C3b2a: a disk-restored image re-joins the RAM tier's CoW: where a parked donor shares the leading
+// `tokens` (the caller matched token prefixes), each part's byte-identical aligned prefix becomes VIEWS
+// of the donor's buffers (verify-then-view, whole pages and complete indexer rows only, strict prefix).
+// Returns false when nothing could be shared (geometry mismatch / byte divergence); partial success
+// keeps sharing the parts that verified. `reused_bytes` counts adopted view bytes.
+// M-C3b3b: same verify-then-view rule as the token-prefix form, but the keep lengths come from the DISK
+// table's view entries (per layer, per part), not from token alignment: a spilled child's viewed regions
+// are exactly the donor segments it borrowed at spill time.
+bool conversation_kv_share_views(SavedConversation& img, const SavedConversation& donor,
+                                 const std::vector<std::array<size_t, 5>>& keep, size_t* reused_bytes);
+bool conversation_kv_share_prefix(SavedConversation& img, const SavedConversation& donor,
+                                  int64_t tokens, size_t* reused_bytes);
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                                    int64_t upto, bool include_index, size_t& bytes, std::string& error);
 // No CUDA calls or destination writes. Used for whole-session prevalidation.

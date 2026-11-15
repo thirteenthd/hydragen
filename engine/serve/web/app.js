@@ -426,6 +426,7 @@ function renderParkDisk(d) {
   facts($("pd-facts"), [
     ["Spilled / dropped", d.enabled ? `${fmt(d.spills)} / ${fmt(d.drops)}` : null],
     ["Read back", d.enabled ? `${fmt(d.restores)}${fell ? ` · ${fmt(fell)} fell back to a prompt read` : ""}` : null],
+    ["Block store", d.enabled && d.v2 ? `${fmt(d.chunks)} chunks · ${gb(d.chunk_bytes)} GB · ${gb(d.saved_mib * 1048576)} GB saved` : null],
     ["Budget", d.enabled ? (d.budget_mib ? `${gb(d.budget_mib * 1048576)} GB` : "free space")
       + (d.min_free_mib ? ` · keep-free ${gb(d.min_free_mib * 1048576)} GB` : "") : null],
     ["Last switch", d.enabled ? event : null],

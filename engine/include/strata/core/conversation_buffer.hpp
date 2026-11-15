@@ -132,6 +132,22 @@ public:
     // Verify-then-view: if `mine` is given, the adopted range must be byte-identical to it BEFORE
     // anything mutates (siblings that prefilled a shared head under different chunk plans hold
     // different bytes); a mismatch leaves this buffer untouched and the caller copies instead.
+    // M-C3b2a: compare my leading n bytes to another buffer's, segment-walk, no copies.
+    bool prefix_equal(const ConversationBuffer& other, size_t n) const {
+        if (n > size_ || n > other.size_) return false;
+        size_t want = n, si = 0, soff = 0, oi = 0, ooff = 0;
+        while (want) {
+            if (si >= segments_.size() || oi >= other.segments_.size()) return false;
+            const auto& a = segments_[si]; const auto& b = other.segments_[oi];
+            const size_t take = std::min(std::min(a.len - soff, b.len - ooff), want);
+            if (std::memcmp(a.store->data() + a.off + soff, b.store->data() + b.off + ooff, take) != 0) return false;
+            want -= take; soff += take; ooff += take;
+            if (soff == a.len) { ++si; soff = 0; }
+            if (ooff == b.len) { ++oi; ooff = 0; }
+        }
+        return true;
+    }
+
     bool adopt_shared(const ConversationBuffer& src, size_t n, const uint8_t* mine = nullptr) {
         if (n > src.size_) return false;
         std::vector<std::pair<const Segment*, size_t>> plan;
@@ -173,6 +189,15 @@ public:
     }
     template<class Fn> bool visit(size_t offset, size_t count, Fn fn) const {
         return visit_impl(*this, offset, count, fn);
+    }
+    // M-C3b3: the leading run of BORROWED segments: fn(pointer, len), stopped at the first owned segment.
+    // For a park-anchored image this is exactly its view of the donor's prefix in this buffer - the disk
+    // tier turns those runs into view entries instead of a second copy of the donor's bytes.
+    template<class Fn> void head_spans(Fn fn) const {
+        for (const auto& s : segments_) {
+            if (!s.borrowed()) break;
+            fn(s.data(), s.len);
+        }
     }
     bool read(void* target, size_t offset, size_t count) const {
         return visit(offset, count, [&](const uint8_t* p, size_t n, size_t at) {

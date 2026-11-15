@@ -12160,8 +12160,8 @@ int main(int argc, char** argv) {
                         (uint64_t) std::max(o.prompt_cache, 1), e);
                 });
             if (park_disk.enabled() && conversations.enabled())
-                conversations.spill_hook = [&](strata::core::SavedConversation&& img) {
-                    park_disk.spill(std::move(img));
+                conversations.spill_hook = [&](strata::core::SavedConversation&& img, int64_t slot_serial) {
+                    park_disk.spill(std::move(img), slot_serial);
                 };
         }
         // What a park captures: the main session's conversation (park_current) or an idle batch slot's (park_slot:
@@ -12282,6 +12282,18 @@ int main(int argc, char** argv) {
                              anchor_img != nullptr ? "mounted" : "none",
                              (long long) anchor_tokens, (long long) src.ids.size());
             }
+            // M-C10c: hold the mount with the cache's own guard until this park is in. An in-flight
+            // park is not yet an entry the selectors (evict_oldest, the donor cascade) can see, so a
+            // REGISTERED child leaving could cascade the donor out as its "last child" and the fresh
+            // park's mount dies mid-admission (run63: 3 anchor losses per 3 passes with M-C10+M-C10b
+            // loaded - donors with no registered children at all). The guard is single-slot by design;
+            // parking and restoring never interleave in this loop.
+            struct ParkAnchorGuard {
+                strata::core::ConversationCache& c; bool on;
+                ~ParkAnchorGuard() { if (on) c.unguard(); }
+            };
+            ParkAnchorGuard anchor_guard_at_end{conversations, anchor_img != nullptr};
+            if (anchor_img != nullptr) conversations.guard(anchor_serial);
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
             stage_reuse.resize(n_st);
             reuse.stages.clear();
@@ -12414,6 +12426,7 @@ int main(int argc, char** argv) {
                         moved.empty() ? nullptr : &moved, anchor_img, anchor_tokens);
                 for (ConvCheckpoint& c : storage) ckpt_pool.give(std::move(c));
                 if (!saved) return false;
+                if (anchor_img != nullptr) image.view_donor = (int64_t) anchor_serial;   // M-C3b3: name the park donor for lineage spills
                 pool_topup();   // what the park took (and what moved out) is allocated again, in the background
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
@@ -16419,23 +16432,58 @@ int main(int argc, char** argv) {
             }
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
             std::optional<strata::core::SavedConversation> incoming;
+            // M-C9: the disk tier used to be consulted only when RAM offered nothing; a shallow RAM
+            // sibling (the shared-head prefix of a sister conversation) then pinned every replay to
+            // its depth while the conversation's own spilled image - covering its whole prompt, its
+            // checkpoint chain running to its end - sat unread (run55: sibling match 71,424, own
+            // image ignored, ~29k re-read per request; and a depth-0 resume that loaded an image in
+            // 1.4 s, threw it away with session_zero and re-read all 100k in 38.7 s). With
+            // STRATA_RESUME_DEEPEST the tiers compete: the deeper prefix wins, and the winner's own
+            // checkpoints set the resume depth (mounted, not reread-from).
+            static const bool deep_resume = std::getenv("STRATA_RESUME_DEEPEST") != nullptr;
+            decltype(park_disk.best(ids, req_imgs, want_cvec)) disk_best;
+            if (deep_resume && park_disk.enabled())
+                disk_best = park_disk.best(ids, req_imgs, want_cvec);
             // A checkpoint inside ANOTHER parked conversation (a sibling subagent's system prompt and tools, say) is
             // borrowed: its K/V up to there and the checkpoint come over, and that conversation stays parked for its
             // own next turn (ConversationCache::borrows).  Everything else is taken whole, as before.
             // (a layer split restores whole stage images only, so it never borrows; a batch slot that holds a longer
             // start of this prompt wins as before)
-            bool borrow = stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
+            const int64_t ram_or_slot = std::max(resume, slot_tokens);
+            const bool disk_wins = deep_resume && disk_best.tokens > parked.tokens &&
+                                   disk_best.tokens > ram_or_slot;   // M-C9
+            bool borrow = stages.empty() && parked.tokens > ram_or_slot && !disk_wins &&
                           conversations.borrows(parked);
-            if (parked.tokens > std::max(resume, slot_tokens) && !borrow)
+            if (parked.tokens > ram_or_slot && !borrow && !disk_wins)
                 incoming.emplace(conversations.take(parked.index));
             // M-C3a: no usable RAM match at all (batch-slot resume and live state always win): a spilled parked
             // conversation comes back from the disk tier as a full take - no borrowing from disk in v1.
             bool from_disk = false;
-            if (!incoming && !borrow && parked.tokens <= std::max(resume, slot_tokens) && park_disk.enabled()) {
-                const auto d = park_disk.best(ids, req_imgs, want_cvec);
-                if (d.tokens > std::max(resume, slot_tokens)) {
+            const int64_t disk_gate = deep_resume ? std::max(ram_or_slot, parked.tokens) : ram_or_slot;
+            if (!incoming && !borrow && (deep_resume || parked.tokens <= ram_or_slot) && park_disk.enabled()) {
+                const auto d = deep_resume ? disk_best : park_disk.best(ids, req_imgs, want_cvec);
+                if (d.tokens > disk_gate) {
                     std::string derr;
                     if (auto img = park_disk.load(d, derr)) {
+                        // M-C3b2a: the restored image re-joins the RAM tier's CoW immediately: a parked
+                        // donor with a longer shared token prefix turns the byte-identical aligned prefix
+                        // into views (verify-then-view), so the fleet keeps owning only its tails.
+                        static const bool pd_cow = [] {
+                            const char* v = std::getenv("STRATA_PARK_COW");
+                            return v != nullptr && v[0] == '1';
+                        }();
+                        if (pd_cow) {
+                            const auto m = conversations.common_best(ids, req_imgs, want_cvec);
+                            if (m.tokens > 0 && m.tokens < (int64_t) ids.size()) {
+                                if (const auto* dn = conversations.find(m.serial)) {
+                                    size_t reused = 0;
+                                    if (strata::core::conversation_kv_share_prefix(*img, *dn, m.tokens, &reused) && reused)
+                                        std::fprintf(stderr, "strata serve: park disk: donor-adopted %.1f MiB of the "
+                                                     "restored image as views (%lld shared tokens)\n",
+                                                     (double) reused / 1048576.0, (long long) m.tokens);
+                                }
+                            }
+                        }
                         incoming.emplace(std::move(*img));
                         from_disk = true;
                     } else if (!derr.empty())
@@ -16755,6 +16803,32 @@ int main(int argc, char** argv) {
                 cvec_cached = incoming->cvec;
                 resume = parked.tokens;
                 from_live = parked.live;
+                if (deep_resume && from_disk) {
+                    // The disk image's own chain is the only one its restored K/V backs: mount strictly
+                    // at its depths (a RAM match's depth may sit between two of them, and the live
+                    // label belongs to a copy that was never taken). The scan below picks the deepest
+                    // checkpoint this prompt actually starts with; everything under it the restored
+                    // K/V already holds, and only the recurrent state rewinds through the checkpoint.
+                    resume = 0;
+                    from_live = false;
+                }
+                if (deep_resume && !from_live) {
+                    int64_t best_d = resume;
+                    for (ConvCheckpoint& k : checks) {
+                        const int64_t L = (int64_t) k.ids.size();
+                        if (L <= best_d || L > (int64_t) ids.size()) continue;
+                        if (!req_imgs.empty() || !k.imgs.empty()) continue;   // pictures: fail closed
+                        bool same = true;
+                        for (int64_t i = 0; i < L; ++i)
+                            if ((int32_t) ids[(size_t) i] != k.ids[(size_t) i]) { same = false; break; }
+                        if (same) best_d = L;
+                    }
+                    if (best_d > resume) {
+                        std::fprintf(stderr, "strata serve: M-C9: resume deepened %lld -> %lld (%zd checkpoints scanned)\n",
+                                     (long long) resume, (long long) best_d, checks.size());
+                        resume = best_d;
+                    }
+                }
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
@@ -18209,6 +18283,10 @@ int main(int argc, char** argv) {
                         // #224: a CUDA fault (an illegal address) poisons the context for the whole process, and
                         // unwinding the destructors on it could hang until the 60 s watchdog: leave at once
                         if (cudaPeekAtLastError() != cudaSuccess) {
+                            // #224b: name the sticky error before leaving: without this the supervisor log only
+                            // ever shows the empty engine error and the fault class is invisible
+                            std::fprintf(stderr, "strata serve: #224 sticky CUDA error at prompt-read failure: %s\n",
+                                         cudaGetErrorString(cudaPeekAtLastError()));
                             std::fflush(stdout);
                             std::fflush(stderr);
                             std::_Exit(1);

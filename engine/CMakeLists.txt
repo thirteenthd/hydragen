@@ -215,6 +215,13 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(session_save_reclaim_test src/core/session_save_reclaim_test.cpp src/core/conversation_file.cpp)
   target_include_directories(session_save_reclaim_test PRIVATE include)
   add_test(NAME session_save_reclaim_test COMMAND session_save_reclaim_test)
+  # M-C5: park-disk boot rebuild: foreign files quarantine, cross-boot restore, the sweep gates
+  add_executable(park_disk_boot_test src/core/park_disk_boot_test.cpp src/core/conversation_file.cpp src/core/conversation_park_disk.cpp)
+  target_include_directories(park_disk_boot_test PRIVATE include)
+  if(EXISTS /usr/local/cuda-13.1/include)   # the park-disk TU reaches session.hpp (cuda_runtime.h) through the cache headers
+    target_include_directories(park_disk_boot_test PRIVATE /usr/local/cuda-13.1/include)
+  endif()
+  add_test(NAME park_disk_boot_test COMMAND park_disk_boot_test)
 endif()
 
 if(STRATA_HIP_GFX906)
