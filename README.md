@@ -105,6 +105,7 @@ duplication. The full layer map: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md).
 |---|---|
 | [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) | the layers, the knobs, the eviction rules |
 | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | methodology, every measurement table, how to reproduce them |
+| [docs/MODELS.md](docs/MODELS.md) | model files: what to get, where it comes from, one-command fetch via Strata setup |
 | [docs/CHANGES.md](docs/CHANGES.md) | the journey: 164 notarized entries, newest first — reads bottom-up from day one |
 | [docs/FINAL_REPORT.md](docs/FINAL_REPORT.md) | the Nov-12 program snapshot (pre-disk-tier era) |
 | [docs/laws/](docs/laws/) | engineering laws distilled the hard way |
@@ -124,10 +125,14 @@ Strata release binaries do not contain this engine's chain. Verified
 end-to-end: both installers from a fresh clone build a working engine on a
 3080 Ti.
 
-**Model blobs.** The canonical config expects an IQ3_XXS routed-expert pack,
-native model + PLE GGUFs (Qwen3.8-Flash-Next, GSQ-RCO quantization), an MTP
-draft adapter, and an `expert-profile.bin` routing profile for the adaptive
-cache — point the paths in `hydragen-local.json` at your own set.
+**Model blobs.** The canonical config serves Qwen3.8-Flash-Next with
+ISTA-DASLab's GSQ-RCO IQ3_XXS quant (~76 GB GGUFs + a built expert pack;
+license: Qwen Community). The installer rewrites all model paths to a
+directory you choose (`--model-dir DIR` / `-ModelDir DIR`), and the vendored
+Strata setup can fetch, verify (SHA-256, resumable) and process everything for
+that directory in one command. Full sources and commands:
+[docs/MODELS.md](docs/MODELS.md). The expert-routing profile already ships in
+this repo.
 
 ## Provenance & license
 

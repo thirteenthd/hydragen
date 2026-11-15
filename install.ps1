@@ -13,7 +13,7 @@
 #   $env:HYDRAGEN_CUDA_ARCH="89-real"; .\install.ps1     # RTX 40-series
 #   $env:HYDRAGEN_CUDA_ARCH="86-real;89-real"; .\install.ps1
 
-param()
+param([string]$ModelDir)
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
@@ -106,6 +106,18 @@ if (-not (Test-Path $BIN)) { Write-Error "install.ps1: build finished but engine
 Write-Host "engine OK: $BIN"
 
 # ------------------------------------------------------------------ local config
+if (-not $ModelDir) { $ModelDir = Join-Path $PWD "models" }
+if (-not [System.IO.Path]::IsPathRooted($ModelDir)) { $ModelDir = Join-Path $PWD $ModelDir }
+foreach ($d in @("packs", "models", "mtp")) { New-Item -ItemType Directory -Force -Path (Join-Path $ModelDir $d) | Out-Null }
+$mdFwd = $ModelDir -replace '\\','/'
+$ggufDir = "$mdFwd/models/IQ3_XXS/IQ3_XXS"
+$blobTargets = @{
+  "--pack" = "$mdFwd/packs/iq3_xxs";
+  "--native" = "$ggufDir/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf";
+  "--ple-gguf" = "$ggufDir/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf";
+  "--expert-profile" = ((Join-Path $PWD "engine\data\expert-profile.bin") -replace '\\','/');
+  "--mtp" = "$mdFwd/mtp/rt"
+}
 if (-not (Test-Path hydragen-local.json)) {
   $cfg = Get-Content configs/strata-iq3xxs-m25-0213-ctx131k.json -Raw | ConvertFrom-Json
   $cfg.exe = (Join-Path $PWD "engine\build\strata.exe") -replace '\\','/'
@@ -116,17 +128,27 @@ if (-not (Test-Path hydragen-local.json)) {
     STRATA_RESUME_DEEPEST = "1";
     STRATA_PARK_DISK = (Join-Path $PWD "park-disk") -replace '\\','/'
   }
+  for ($i = 0; $i -lt $cfg.args.Count; $i++) {
+    if ($blobTargets.ContainsKey($cfg.args[$i]) -and $i + 1 -lt $cfg.args.Count) {
+      $cfg.args[$i + 1] = $blobTargets[$cfg.args[$i]]
+    }
+  }
   if ($cfg.args -notcontains "--conversation-cache-min-free-mib") { $cfg.args += @("--conversation-cache-min-free-mib", "512") }
   if ($cfg.args -notcontains "--prompt-cache-tail") { $cfg.args += "--prompt-cache-tail" }
   ($cfg | ConvertTo-Json -Depth 6) | Set-Content hydragen-local.json
-  Write-Host "created hydragen-local.json (canonical cow stack wired) - EDIT the model/pack paths (they default to the developer's Linux layout) before serving."
+  Write-Host "created hydragen-local.json (canonical cow stack wired) - model paths point under $ModelDir (override: .\install.ps1 -ModelDir D:\models)."
+  Write-Host "  the expert-routing profile is already in this repo (engine\data\expert-profile.bin); the GGUFs/pack/MTP come next."
 } else {
   Write-Host "hydragen-local.json already exists; leaving it alone."
 }
 
 Write-Host ""
 Write-Host "Install complete. Next:"
-Write-Host "  1. edit hydragen-local.json: point --native/--ple-gguf/--pack at your model files"
+Write-Host "  1. model blobs (~76 GB IQ3_XXS set), sources and layout: docs\MODELS.md. Easiest:"
+Write-Host "       cmd /c engine\SETUP.bat --model IQ3_XXS --data-dir `"$ModelDir`""
+Write-Host "     (Strata's own downloader: resumable, SHA-256-checked; builds the pack and fetches MTP)."
+Write-Host "     Or: uvx hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF --include `"IQ3_XXS/*`" --local-dir DIR"
+Write-Host "         then engine\SETUP.bat --gguf-dir DIR"
 Write-Host "  2. .venv\Scripts\python.exe engine\serve\server.py --engine strata --config hydragen-local.json --port 8181"
 Write-Host "  3. dashboard + Monitor: http://127.0.0.1:8181/"
 Write-Host "  4. the canonical stack is pre-wired: STRATA_PARK_COW=1, park-disk v2 tier (park-disk\),"

@@ -18,6 +18,21 @@ cd "$(dirname "$0")"
 
 ARCH="${HYDRAGEN_CUDA_ARCH:-86-real}"
 
+# Model blob location: --model-dir DIR (default: <this repo>/models). The generated
+# config's --pack/--native/--ple-gguf/--mtp paths are rewritten to live under DIR.
+# The expert-routing profile needs no download - it ships in this repo at
+# engine/data/expert-profile.bin. See docs/MODELS.md for sources and the
+# vendored Strata downloader (engine/setup.sh / engine/SETUP.bat).
+MODEL_DIR=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model-dir) MODEL_DIR="${2:?--model-dir needs a directory}"; shift 2 ;;
+    *) echo "install.sh: unknown argument: $1 (try --model-dir DIR)" >&2; exit 2 ;;
+  esac
+done
+[ -n "$MODEL_DIR" ] || MODEL_DIR="$PWD/models"
+case "$MODEL_DIR" in /*) ;; *) MODEL_DIR="$PWD/$MODEL_DIR" ;; esac
+
 # ------------------------------------------------------------------ CUDA
 CUDA=""
 for c in $(ls -d /usr/local/cuda /usr/local/cuda-* /opt/cuda 2>/dev/null | sort -V) "${CUDA_HOME:-}"; do
@@ -76,18 +91,30 @@ if [ ! -f hydragen-local.json ]; then
   sed -e "s#\"exe\": \"[^\"]*\"#\"exe\": \"$BIN\"#" \
       -e "s#\"log\": \"[^\"]*\"#\"log\": \"$PWD/logs/strata.log\"#" \
       configs/strata-iq3xxs-m25-0213-ctx131k.json > hydragen-local.json
-  mkdir -p logs park-disk
-  PARK_DISK_DIR="$PWD/park-disk" .venv/bin/python - <<'PYEOF'
+  mkdir -p logs park-disk "$MODEL_DIR/packs" "$MODEL_DIR/models" "$MODEL_DIR/mtp"
+  PARK_DISK_DIR="$PWD/park-disk" MODEL_DIR="$MODEL_DIR" REPO_DIR="$PWD" .venv/bin/python - <<'PYEOF'
 import json, os
 p = "hydragen-local.json"
 cfg = json.load(open(p))
+md, repo = os.environ["MODEL_DIR"], os.environ["REPO_DIR"]
+gguf = os.path.join(md, "models", "IQ3_XXS", "IQ3_XXS")
+targets = {
+    "--pack": os.path.join(md, "packs", "iq3_xxs"),
+    "--native": os.path.join(gguf, "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf"),
+    "--ple-gguf": os.path.join(gguf, "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf"),
+    "--expert-profile": os.path.join(repo, "engine", "data", "expert-profile.bin"),
+    "--mtp": os.path.join(md, "mtp", "rt"),
+}
+args = cfg["args"]
+for i, tok in enumerate(args):
+    if tok in targets and i + 1 < len(args):
+        args[i + 1] = targets[tok]
 env = cfg.setdefault("env", {})
 env["STRATA_PARK_COW"] = "1"
 env["STRATA_PARK_DISK"] = os.environ["PARK_DISK_DIR"]
 env.setdefault("STRATA_PARK_DISK_MIB", "163840")
 env["STRATA_PARK_DISK_V2"] = "1"
 env["STRATA_RESUME_DEEPEST"] = "1"
-args = cfg["args"]
 if "--conversation-cache-min-free-mib" not in args:
     args += ["--conversation-cache-min-free-mib", "512"]
 if "--prompt-cache-tail" not in args:
@@ -95,14 +122,22 @@ if "--prompt-cache-tail" not in args:
 json.dump(cfg, open(p, "w"), indent=1)
 PYEOF
   echo "config created: hydragen-local.json (localhost:8181, canonical cow stack wired)"
+  echo "model paths point under: $MODEL_DIR (override location: ./install.sh --model-dir DIR)"
 fi
 
 cat <<'EON'
 
 Next steps
-  1. Model blobs. hydragen-local.json still points at the IQ3_XXS expert pack, native
-     model GGUFs, PLE GGUF and MTP draft used for the published measurements - download
-     them (README.md, Model blobs) or edit the paths in hydragen-local.json to your own.
+  1. Model blobs (~76 GB IQ3_XXS set). hydragen-local.json now expects them under the
+     model dir printed above. Easiest is the vendored Strata setup - it downloads the
+     pinned GGUFs (resumable, SHA-256-checked), builds the expert pack and fetches the
+     MTP draft into that dir:
+         bash engine/setup.sh --model IQ3_XXS --data-dir <model-dir>
+     Or fetch them yourself and let setup reuse them:
+         uvx hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF --include "IQ3_XXS/*" --local-dir DIR
+         bash engine/setup.sh --gguf-dir DIR
+     Source table and licenses: docs/MODELS.md. The expert-routing profile is already
+     in this repo (engine/data/expert-profile.bin) - nothing to download for it.
   2. Serve:
        .venv/bin/python engine/serve/server.py --engine strata --config hydragen-local.json
      Dashboard + Monitor (concurrency panel): http://127.0.0.1:8181/
