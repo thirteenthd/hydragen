@@ -5,6 +5,35 @@ Newest first; section numbers are stable, so §N always refers to the same entry
 
 
 
+## §160 Public engine sync: vendored tree -> the canonical cow-m3b tip; the branch main opens; canonical installer stack (2026-11-15)
+
+docs/CHANGES 138-159 described code the vendored engine/ never carried - the snapshot
+was stuck at the M-C3a era of the cow-m3b branch. The snapshot is replaced with the
+cow-m3b tip: M-C5 two-phase boot rebuild + quarantine, M-C6a/M-C6b lineage-parser
+reset and boot-rebuild parent pins, M-C7 disk-published view parents only, M-C8
+adoption-span boot SEGV fix, M-C9 deepest-checkpoint resume (STRATA_RESUME_DEEPEST),
+and the M-C10/M-C10b/M-C10c RAM-tier park-anchor donor lifetime trilogy. The serve
+front becomes the canonical runtime dashboard (park-disk card + the ON-line regex
+that survives the quarantined counter). Net change-set: 11 code files updated,
+park_disk_boot_test added, one stray build-file copy from the branch excluded;
+CRLF blobs under engine tests/tools normalized to LF per the repo's eol policy.
+
+Both installers now generate hydragen-local.json pre-wired to the measured canonical
+stack: STRATA_PARK_COW=1, a park-disk v2 tier under the repo (STRATA_PARK_DISK dir
+created by the installer, STRATA_PARK_DISK_V2=1, budget STRATA_PARK_DISK_MIB default
+163840), STRATA_RESUME_DEEPEST=1, and the args --conversation-cache-min-free-mib 512
++ --prompt-cache-tail; configs/strata-iq3xxs-m25-0213-ctx131k.json gains the same
+two args. The build target is this engine itself (release flags unchanged). The
+branch main opens from the product tip (39a07db2) as the merge target.
+
+Verification on the reference host (fresh clone of the new branch, end-to-end
+install.sh): engine builds green; strata --help exit 0 with --prompt-cache-tail
+present; the generated hydragen-local.json carries every canonical env key and arg;
+conversation_cache_test 4842 checks passed and park_disk_boot_test 38 checks passed
+off the shipped tree (-DSTRATA_BUILD_CONVERSATION_TESTS=ON). A case-insensitive
+whole-tree privacy audit (engine paths included) leaves only the 192.168.* literals
+inside the engine's upstream-provenance exemption, by design.
+
 ## §159 c4/c8 deep re-bench on the canonical M-C9+M-C10c stack (run conc8_run10, 2026-11-15)
 
 Fresh boot (sw12, seed hygiene: prior ladder parks flushed), all four arms in one
