@@ -119,6 +119,6 @@ Next steps
                                 together with the --prompt-cache-tail engine arg now in
                                 the config's args list
        STRATA_COW_JOIN_HH, STRATA_COW_SHARED are closed-negative experiments; leave off.
-     Merge gates (optional, from this tree): build with -DSTRATA_BUILD_TESTS=ON and run
+     Merge gates (optional, from this tree): build with -DSTRATA_BUILD_CONVERSATION_TESTS=ON and run
      the conversation_cache_test and park_disk_boot_test targets.
 EON
