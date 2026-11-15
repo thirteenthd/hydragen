@@ -2,8 +2,10 @@
 
 MoE inference on consumer Ampere hardware (RTX 3060 Ti / 3080 Ti, 12 GB VRAM):
 file-backed IQ3_XXS routed experts with an adaptive LRU VRAM cache, a static C++
-execution worker, copy-on-write KV funding, and host-tier parked-session dedup —
-serving a ~125B-A15B-class MoE at **131k context** with true decode concurrency.
+execution worker, copy-on-write KV funding, host-tier parked-session dedup, and
+a disk tier that keeps idle conversations alive across restarts at shared-view
+cost — serving a ~125B-A15B-class MoE at **131k context** with true decode
+concurrency.
 
 Demonstrated on one RTX 3080 Ti (12 GB) + 60 GB host RAM, no multi-GPU, no datacenter card.
 
@@ -54,10 +56,10 @@ reads bottom-to-top.
 
 | Path | Contents |
 |---|---|
-| `engine/` | our fork of [Strata](https://github.com/Niko1221/Strata) (MIT) — vendored at v0.2.13 with the six-commit CoW chain applied on top, full commit history inside this repo |
+| `engine/` | our fork of [Strata](https://github.com/Niko1221/Strata) (MIT) — vendored at v0.2.13 with the full M-C1→M-C10 fork/dedup/disk-tier chain applied on top (tip: M-C10c), commit history preserved under `engine/` |
 | `configs/` | canonical ctx-131k serving config + launcher |
 | `bench/` | the gate suite used for every landing: battery (quality oracle), farm (concurrency ladder), park-ladders (22k and 100k depth), CoW arm runner |
-| `docs/` | final benchmark report, the 160+-section program changelog, engineering laws distilled from the campaign |
+| `docs/` | benchmark report (Nov-12 program snapshot; current numbers live in the README below), the 160+-section program changelog, engineering laws distilled from the campaign |
 
 ## Headline results (all measured, all quality-gated)
 
@@ -292,8 +294,9 @@ dedup[^m-c2].
 ## Provenance & license
 
 The engine is a fork of **[Strata](https://github.com/Niko1221/Strata)** (MIT, Niko1221) —
-vendored at v0.2.13 plus our six-commit CoW chain, with upstream commit history
+vendored at v0.2.13 plus our full M-C1→M-C10 fork/dedup/disk-tier chain (tip:
+M-C10c), with upstream commit history
 preserved under `engine/`. See `NOTICE`.
 HydraGen code is Apache-2.0 (`LICENSE`); Strata-derived engine code remains MIT.
-The full 120-section program changelog (`docs/CHANGES.md`) is the notarized record
+The full 160+-section program changelog (`docs/CHANGES.md`) is the notarized record
 of every measurement → decision → commit in this campaign.

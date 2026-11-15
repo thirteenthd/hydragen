@@ -3,6 +3,15 @@
 **Host:** `the reference host` (RTX 3080 Ti, 12 GB VRAM, 60 GB host RAM) · **Model:** Qwen3.8-Flash-Next (MoE, 122B-class routed experts)
 **Program window:** 2026-11-04 → 2026-11-12 · **Change log:** `~/hydragen-experimental/CHANGES.md` (115 notarized sections)
 
+> **Status note (2026-11-15):** this report snapshots the program through Nov-12.
+> Everything after it — cross-boot disk-tier durability, 0.1 MiB shared-view
+> restores (vs ~2 GiB full copies), deep-checkpoint resume, and the M-C10
+> zero-loss CoW parks — materially improved the deep-concurrency numbers:
+> harness C4 wall 501 s → 317 s, C8 951 s → 548 s, warm-turn TTFT 7x lower at
+> C4. Current numbers live in the README ("Measured expectations"); the
+> continuing record is `docs/CHANGES.md` (now 160+ sections, §138 onward is
+> post-report).
+
 ---
 
 ## 1. Mission

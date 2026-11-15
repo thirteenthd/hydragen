@@ -1,6 +1,6 @@
 # M-C3 investigation: disk-tier the parked conversation cache, with dedup
 
-Status: M-C3a LANDED (cow-m3 / c9d6fc44, change log §123); M-C3b (deduped segment-view files) open. Date 2026-11-13, the reference host, cow build + STRATA_PARK_COW=1.
+Status (updated 2026-11-15): M-C3a LANDED (cow-m3 / c9d6fc44, change log §123) and M-C3b SHIPPED as the dedup/lineage chain (§128-§143: block-file V2 store, content-defined chunking, spill-side lineage, view-mounted restore); the store now also survives restarts (M-C5, §154; boot fixes §156) and the ~20 s state remount below became a ~2 s deep resume (§157). Original note, 2026-11-13, the reference host, cow build + STRATA_PARK_COW=1.
 Knobs: STRATA_PARK_DISK=DIR (default OFF), STRATA_PARK_DISK_MIB (tier budget), STRATA_PARK_DISK_MIN_FREE_MIB (keep-free guard, default 4096).
 Measured: spill ~3 s per 100k-token image (~300-600 MB/s on the test volume), read-back ~1 s, then the usual ~20 s state remount; vs ~44 s cold re-prefill at 100k depth.
 
