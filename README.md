@@ -179,9 +179,22 @@ changes: warm turns stay 2-3 s TTFT at 60-94 tok/s decode.
 | Per 100k-token parked image, engine-side | Nov-14 tier | Current tier |
 |---|---|---|
 | bytes read from NVMe on restore | ~2,083 MiB (full copy) | **0.1 MiB** (shared-view mount) |
-| restore time | 1.2-1.6 s | 1.1-3.2 s at 98-106k tokens |
+| host RAM staged per restore | ~2 GiB straight out of MemAvailable | **~0** |
 | resume depth after restore | save-time checkpoint (often 0 reused) | **deepest checkpoint ≤ prompt** |
 | re-park cost when the fleet churns | full image copy | shared KV, owned tail only |
+| **real cost to recover a lost session to first token** | **~25-40 s**: restore 1.2-1.6 s, then 20-40 s re-prefill because the shallow resume threw most of the restored KV away | **~2-5 s**: restore 1.1-3.2 s + ~2 s resume, nothing thrown away |
+
+The raw restore times overlap (1.2-1.6 s vs 1.1-3.2 s), and that column alone
+would make the new tier look slower — two artifacts, both honest to state: the
+Nov-14 range comes from quiet ladder tests, the Nov-15 range is measured inside
+live C8 sweeps where restores and spill writes contend for the same NVMe. What
+actually moves wall time is the bottom row: the old restore was a fast read of
+a whole image that then got discarded down to a shallow checkpoint while its 2
+GiB of staging pushed the host toward eviction cascades — so turns kept losing
+their prefixes (7 of 40 at C=8) and each loss cost a full re-prefill. The
+current tier reads 20,000x fewer bytes, stages no RAM, and keeps what it
+restores, which is why lost-prefix turns went 7/40 → 1/48 and C=8 wall went
+951 s → 548 s.
 
 Four mechanisms, landed as separate milestones in that order:
 
