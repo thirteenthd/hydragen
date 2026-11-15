@@ -22,7 +22,7 @@ git clone https://github.com/thirteenthd/hydragen.git && cd hydragen
 # OpenAI-compatible API + live concurrency dashboard → http://127.0.0.1:8181/
 ```
 
-## The honest headline
+## The headline
 
 One fleet of agent sessions, each holding a ~100k-token conversation, on one
 RTX 3080 Ti (12 GB). Same benchmark, two stacks: *Nov-14* is the standard
@@ -45,7 +45,7 @@ What that means in practice, at ~100k-token depth on a 12 GB card:
   the same arm cost ~48 s per warm turn a week ago.
 - **Eight deep sessions: workable.** ~21 s warm turns (queue-bound at this
   depth), ~18 tok/s decode. Cold admission in an 8-way burst still costs
-  ~100 s — that is prefill physics, and we say so out loud.
+  ~100 s — that is prefill physics, not a cache failure.
 - Peak single-stream decode (~70-100 tok/s at 100k depth) is unaffected by any
   tier machinery.
 - Append-only history is the contract: edit mid-history and you pay the full

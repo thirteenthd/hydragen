@@ -74,7 +74,7 @@ the first sweep[^sweep1]; C=4/8 from the Nov-15 re-bench[^run10].
 | **real cost to recover a lost session to first token** | **~25-40 s**: restore 1.2-1.6 s, then 20-40 s re-prefill because the shallow resume threw most of the restored KV away | **~2-5 s**: restore 1.1-3.2 s + ~2 s resume, nothing thrown away |
 
 The raw restore times overlap (1.2-1.6 s vs 1.1-3.2 s), and that column alone
-would make the new tier look slower — two artifacts, both honest to state: the
+would make the new tier look slower — two artifacts, both worth stating: the
 Nov-14 range comes from quiet ladder tests, the Nov-15 range is measured inside
 live C8 sweeps where restores and spill writes contend for the same NVMe. What
 actually moves wall time is the bottom row: the old restore was a fast read of
