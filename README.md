@@ -24,6 +24,7 @@ Demonstrated on one RTX 3080 Ti (12 GB) + 60 GB host RAM, no multi-GPU, no datac
 | VRAM CoW fork (M-C1c) | +473 expert slots (1663 → 2136), 4-way same-conversation decode 47–50 tok/s each, wall 23.9s → 18.5s |
 | Parked-session dedup (M-C2) | 100k-token parked image 2.19 GB → 1.35 GB host RAM (−38.5%); a 4×99k sibling fleet that **does not fit** the parked budget without dedup **fits at 97%** with it; restore 0/4 fail |
 | Park-disk tier (M-C3a) | parked conversations survive RAM-cache eviction: 100k-token image read back in ~1 s vs ~44 s re-prefill; 4-deep harness wall 501→472 s, warm decode 8.0→13.1 tok/s |
+| Deep resume + CoW parks (M-C9/M-C10) | 100k-token harness sessions resume warm turns in 1.7-2.5 s engine-side (100,219 of 102,344 tokens reused); harness C4 wall 501->317 s, C8 951->548 s; disk-tier restores land as shared-view mounts reading 0.1 MiB vs ~2 GiB full copies |
 | Funding architecture | Strata C++ worker replaces the Python runtime, eliminating allocator static-fraction overhead entirely |
 
 Every change passed: battery quality oracle (QC1–QC8, exact-answer checks), farm
@@ -111,30 +112,31 @@ bash bench/m25iso3.sh canon                # boot canonical
 python3 bench/battery_quality_m25.py canon # quality oracle
 python3 bench/m25_farm5.py canon           # concurrency ladder
 python3 bench/m25_parkladder100k.py 4 canon # park-dedup fleet
-python3 bench/m25_conc8_sweep.py --arm natural --C 2  # deep-ctx sweep (client-side timing)
-python3 bench/letta_sim_bench.py --C 4 --turns 6      # agent-harness traffic sim
+python3 bench/m25_conc8_sweep.py --arm natural --C 4  # deep-ctx sweep (client-side timing)
+python3 bench/m25_conc8_sweep.py --arm harness --C 8   # agent-harness traffic shape
 ```
 
 ## Measured expectations on one 12 GB Ampere card
 
 Deep-context concurrency sweep on the canonical stack (IQ3_XXS qwen4_exp, C++
-worker, batch 2, park CoW on, 131k ctx). All timings are **client-side**
-(TTFT = first streamed token; decode rate from piece arrival timestamps), and
-every arm passed a needle-completeness QC (the model must echo an embedded
-unique code). Two traffic shapes: *natural* (C simultaneous unique ~100k-token
-requests, zero shared prefix) and *harness* (C sessions x 6 incremental turns
-over a shared 66k-token head, like an agent loop). Reproduce with
-`bench/m25_conc8_sweep.py`.
+worker, batch 2, park CoW + park-disk v2 tier + deep-checkpoint resume, 131k
+ctx). All timings are **client-side** (TTFT = first streamed token; decode rate
+from piece arrival timestamps), and every arm passed a needle-completeness QC
+(the model must echo an embedded unique code). Two traffic shapes: *natural*
+(C simultaneous unique ~100k-token requests, zero shared prefix) and *harness*
+(C sessions x 6 incremental turns over a shared 66k-token head, like an agent
+loop). Reproduce with `bench/m25_conc8_sweep.py --arm natural --C 4` and
+`--arm harness --C 8`.
 
 Each request is classified from exact reuse counts (`usage`'s
 `prompt_tokens_details.cached_tokens`), because aggregate medians hide the
 regimes:
 
 - **cold** — turn 1 of a session: the whole ~66-100k prompt is prefilled.
-- **warm** — a later turn whose parked prefix survived: only the new
-  ~2k tokens are prefilled.
-- **deep_warm_reprefill** — a later turn that lost its parked prefix and paid
-  (nearly) the whole history again. This is the eviction tax.
+- **warm** — a later turn whose parked prefix survived (RAM cache or disk
+  tier): only the new ~2k tokens are prefilled.
+- **deep_warm_reprefill** — a later turn that lost its parked prefix on both
+  tiers and paid (nearly) the whole history again. This is the eviction tax.
 
 ### Natural traffic (worst case: zero prefix sharing)
 
@@ -142,59 +144,50 @@ regimes:
 |---|---|---|---|
 | 1 | 50 | 37.0 / 37.0 | 72.1 |
 | 2 | 65 | 36.9 / 36.9 | 43.5 |
-| 4 | 233 | 125.2 / 212.7 | 16.8 |
-| 8 | 466 | 244.1 / 447.4 | 14.7 |
+| 4 | 245 | 168.8 / 225.0 | 15.1 |
+| 8 | 496 | 293.5 / 477.3 | 14.4 |
 
 Every ~100k cold prompt costs ~37 s of prefill; above C=2 the arm is
-prefill-serialized (8 arms = 802k prefill tokens in 466 s ~= 1.7k tok/s
-aggregate), and TTFT p95 is queue depth, not engine speed.
+prefill-serialized (8 arms = 802k prefill tokens in 496 s ~= 1.6k tok/s
+aggregate), and TTFT p95 is queue depth, not engine speed. The C=1/2 rows are
+from the Nov-14 run; the cold path is unchanged since.
 
-### Harness traffic, per class (park CoW, RAM parked cache only)
+### Harness traffic, per class
 
 | C | wall (s) | cold TTFT p50 (s) | warm TTFT p50 (s) | warm decode p50 | deep-warm events | tokens wasted on re-prefill |
 |---|---|---|---|---|---|---|
 | 1 | 130 | 35.9 | 2.1 | 94.0 | 0 | 0 |
 | 2 | 148 | 44.4 | 2.6 | 61.6 | 0 | 0 |
-| 4 | 501 | 64.9 | 48.0 | 8.0 | 5 of 20 | 505k |
-| 8 | 951 | 156.9 | 41.0 | 13.8 | 7 of 40 | 712k |
+| 4 | 317 | 84.9 | 6.9 | 24.6 | 1 of 20 | ~180k |
+| 8 | 548 | 104.8 | 21.2 | 17.9 | 1 of 48 | ~200k |
 
-C=1..2 is the product sweet spot today: warm turns start in ~2-3 s and decode
-60-94 tok/s per stream. At C=4/8 the parked RAM cache (8 GiB) can no longer
-hold the fleet, eviction turns look like deep-warm re-prefills, and warm decode
-collapses.
-
-### Same arms with the park-disk tier on (M-C3a, `STRATA_PARK_DISK`)
-
-| C | wall (s) | warm TTFT p50 (s) | warm decode p50 | deep-warm events | re-prefill tokens |
-|---|---|---|---|---|---|
-| 4 base -> tier | 501 -> **472** | 48.0 -> **31.5** | 8.0 -> **13.1** | 5 -> 4 | 505k -> 411k |
-| 8 base -> tier (full-copy, M-C3a) | 951 -> 1284 | — | 13.8 -> 22.4 | 7 -> 11 | ~716k -> ~116k real re-prefill |
-| 8 base -> tier (content-chunked dedup, M-C3b1d) | 951 -> **1038 / 904** | — | — | — | spill writes skip already-stored shared chunks (0.6 GiB/sibling on ladder) |
-
-\*Client-side classification cannot see disk restores: `cached_tokens` stays ~0
-when a returning session's image is read back off disk, so those turns are
-labeled deep-warm. The engine log shows **6 restores of 98-107k-token images
-in 0.8-3.6 s each** inside the C8 window; the genuinely recomputed tokens were
-closer to ~116k than 716k. The full-copy tier at 8-deep was net-negative on wall (951 → 1284 s): spills wrote whole images (141 GiB) and restores read whole images back (122 GiB) on the volume the expert blobs stream from — contention cost more than the recompute saved. Content-defined chunking with content-addressed blocks (M-C3b1d: gear-hash cuts, mean 2 MiB, per-region dedup) cut spill traffic per re-spilled sibling by ~32% and brought 8-deep back to parity-to-positive: two clean KD3 arms at {1038, 904} s vs baseline 951, with cold-admission TTFT — the metric agent harnesses feel most — **122 s p50 / 264 p95 vs baseline 182 / 403**. Below ~6-deep the tier pays off at every variant tested; at 8-deep it is now roughly break-even with a large cold-latency gain, pending restore-side lineage (see below).
+The C=4/8 rows were re-run Nov-15 on the current stack. The same arms on the
+pre-Nov-15 stack: C4 {501 s wall, 48.0 s warm TTFT, 5/20 evictions, 505k tokens
+wasted}, C8 {951 s, 41.0 s, 7/40, 712k}. Warm TTFT at C8 is dominated by queue
+wait — the engine itself resumes a 100k-deep session in 1.7-2.5 s
+(`prompt 102344 tokens = 100219 reused + 2125 read in 2474 ms`), and that
+reuse shows up in the client's `cached_tokens`, so the two classifications
+agree. In the same log window the tier served 66 restores, **every one a
+shared-view mount: 0.1 MiB read for a 98-106k-token image in 1.1-3.2 s**, where
+the pre-dedup tier copied ~2 GiB per restore.
 
 Honest summary of where this leaves 12 GB + a ~35 B-class routed MoE:
 
 - **One to two deep agent sessions at ~100k context: comfortable.** Warm turns
-  2-3 s, decode 60-94 tok/s. Append-only history is mandatory: one inserted
-  line mid-history breaks exact prefix reuse and you pay the full ~40 s.
-- **Four deep sessions: workable, not interactive.** Warm turns ~30 s TTFT,
-  ~13 tok/s decode; the disk tier cuts the eviction tax ~19% and doubles warm
-  decode here.
-- **Eight deep sessions: capacity physics, tier or no tier.** Prefill demand
-  (~1.2M tokens/arm) saturates the card; treat long tails as patient batch.
+  2-3 s, decode 60-94 tok/s per stream. Append-only history is mandatory: one
+  inserted line mid-history breaks exact prefix reuse and you pay the full
+  ~40 s.
+- **Four deep sessions: interactive.** Warm turns ~7 s TTFT at ~25 tok/s
+  decode — a week ago the same arm cost ~48 s TTFT and half the decode.
+- **Eight deep sessions: workable.** Warm turns ~21 s TTFT (queue-bound at
+  this depth), ~18 tok/s decode; cold admission in an 8-way burst still costs
+  ~100 s p50 — that is prefill physics, not the cache. Treat long tails as
+  patient batch.
 - Peak single-stream decode (~70-100 tok/s at 100k depth) is unaffected by any
-  cache tier; it is VRAM-capped, and closing it is the KV-window campaign.
-
-Open items tracked in `docs/CHANGES.md`: disk-resident lineage for restores
-(parent ses files + tail-only reads; the host-RAM-donor variant M-C3b2a
-landed but measures dead at depth — at restore moment no RAM donor exists),
-tier placement on a quieter volume, and a sweep v4 class that credits disk
-restores as their own regime.
+  tier machinery.
+- These are measurements on one hardware class (12 GB Ampere, single NVMe) and
+  one quant mix, not a product promise: your mileage scales with prefill
+  bandwidth and falls off if history is edited instead of appended.
 
 ## Provenance & license
 

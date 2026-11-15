@@ -1,7 +1,7 @@
 # Building the Strata engine from source (the reference host, 2026-11-06)
 
 Notarized for co-editing agents at `~/hydragen-experimental/CHANGES.md`
-(mirrored pointers: `hydragen/NOTE-HENSON-EXPERIMENTAL.md`, `strata/NOTE-HENSON-EXPERIMENTAL.md`).
+(with mirrored per-clone handoff notes).
 
 ## Layout that survives a fresh session
 
@@ -79,5 +79,5 @@ Run via a **systemd user unit** (`~/.config/systemd/user/hydragen-exp.service`, 
 Never leave experiment knobs in a tracked file: `hydragen.json` was restored with
 `git checkout --` and the experiment config moved to `hydragen.exp.local057.json`. Keep
 `git status --porcelain` free of tracked modifications, add an untracked
-`NOTE-HENSON-*.md` pointer in each clone, and write the full notarization at the workspace root
+handoff note in each clone, and write the full notarization at the workspace root
 (where it cannot cause a merge conflict). Never run both engines at once on one 12 GB card.
