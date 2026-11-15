@@ -109,6 +109,8 @@ args = cfg["args"]
 for i, tok in enumerate(args):
     if tok in targets and i + 1 < len(args):
         args[i + 1] = targets[tok]
+cfg["cwd"] = repo
+cfg["tokenizer"] = os.path.join(md, "packs", "iq3_xxs", "tokenizer")
 env = cfg.setdefault("env", {})
 env["STRATA_PARK_COW"] = "1"
 env["STRATA_PARK_DISK"] = os.environ["PARK_DISK_DIR"]

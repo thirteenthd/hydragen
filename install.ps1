@@ -133,6 +133,8 @@ if (-not (Test-Path hydragen-local.json)) {
       $cfg.args[$i + 1] = $blobTargets[$cfg.args[$i]]
     }
   }
+  $cfg.cwd = ($PWD -replace '\\','/')
+  $cfg.tokenizer = "$mdFwd/packs/iq3_xxs/tokenizer"
   if ($cfg.args -notcontains "--conversation-cache-min-free-mib") { $cfg.args += @("--conversation-cache-min-free-mib", "512") }
   if ($cfg.args -notcontains "--prompt-cache-tail") { $cfg.args += "--prompt-cache-tail" }
   ($cfg | ConvertTo-Json -Depth 6) | Set-Content hydragen-local.json
