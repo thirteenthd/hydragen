@@ -7,6 +7,49 @@ serving a ~125B-A15B-class MoE at **131k context** with true decode concurrency.
 
 Demonstrated on one RTX 3080 Ti (12 GB) + 60 GB host RAM, no multi-GPU, no datacenter card.
 
+## Why this exists
+
+**The design goal is more simultaneous conversations, not one faster request.**
+Many users (or many cooperating agents) each keeping a long, growing chat —
+tens of thousands of tokens deep — on one small consumer graphics card. The
+datacenter answer (buy a bigger card, or several) is off the table by design.
+
+**Why it's hard.** A model of this class doesn't fit in 12 GB to begin with —
+that half is already solved by streaming model pieces in from disk as they are
+needed. The real squeeze is *conversation memory*: every active chat keeps a
+running record of everything said so far in fast memory, and one 100k-token
+chat wants about 2 GB of it. A dozen such chats want over 20 GB; the card has
+12 GB total, shared with the model itself.
+
+**Our answer: never duplicate what you already have.**
+
+- Chats that share content — the same instructions, the same agent's earlier
+  turns, a forked conversation — **share** that stored memory instead of
+  paying for it once per chat.
+- Idle chats get **put away**: first into ordinary system memory, then onto
+  disk, stored as a small delta that points at what they have in common with
+  their siblings instead of as full copies.
+- A returning chat **comes back cheap** — 0.1 MiB of disk reading instead of
+  ~2 GB — because its shared parts were never actually thrown away.
+- And it **resumes where it actually left off**: at the deepest point it had
+  remembered, not by rereading its own history.
+
+Those rules are what turn "this fleet does not fit" into "this fleet fits at
+97%", and what make four and eight deep chats usable rather than impossible
+(numbers below, all measured and quality-checked).
+
+**What this adds on top of Strata.** The upstream [Strata](https://github.com/Niko1221/Strata)
+engine already streams disk-backed MoE experts and runs long contexts from one
+efficient worker. Our contribution is *concurrency funded by deleting
+duplication*: session forks that share memory pages, parked-chat dedup, a disk
+tier that keeps conversations alive across server restarts, restores that
+re-attach shared parts instead of copying, resuming at the deepest remembered
+point, and eviction rules that refuse to throw away anything still in use by
+someone else. Every step of getting here — including the ideas that measured
+badly and were reverted — is recorded in [docs/CHANGES.md](docs/CHANGES.md):
+160+ entries from day one to the latest re-bench, newest first, so the journey
+reads bottom-to-top.
+
 ## What's in this repo
 
 | Path | Contents |
