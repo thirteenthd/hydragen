@@ -25,24 +25,26 @@ git clone https://github.com/thirteenthd/hydragen.git && cd hydragen
 ## The headline
 
 One fleet of agent sessions, each holding a ~100k-token conversation, on one
-RTX 3080 Ti (12 GB). Same benchmark, two stacks: *Nov-14* is the standard
-approach; *Current* is HydraGen's stack. Every number client-side, every arm
-needle-checked[^run10].
+RTX 3080 Ti (12 GB). Same benchmark, run **before** and **after** HydraGen's
+concurrency features: *Before* is the stock approach (RAM cache + full-copy
+disk tier, shallow resume); *After* is this repo's stack (park-disk tier +
+shared-view restores + deep resume + CoW parks). Every number client-side,
+every arm needle-checked[^run10].
 
-| Metric | C=4 | C=8 |
-|---|---|---|
-| wall time | 501 s → **317 s** | 951 s → **548 s** |
-| warm turn TTFT p50 | 48.0 s → **6.9 s** | 41.0 s → **21.2 s** |
-| warm decode p50 | 8.0 → **24.6** tok/s | 13.8 → **17.9** tok/s |
-| turns losing their parked prefix | 5 of 20 → **1 of 20** | 7 of 40 → **1 of 48** |
-| tokens wasted re-prefilling lost history | 505k → **~180k** | 712k → **~200k** |
+| Metric | C=4 before | C=4 after | C=8 before | C=8 after |
+|---|---|---|---|---|
+| wall time | 501 s | **317 s** | 951 s | **548 s** |
+| warm turn TTFT p50 | 48.0 s | **6.9 s** | 41.0 s | **21.2 s** |
+| warm decode p50 | 8.0 tok/s | **24.6 tok/s** | 13.8 tok/s | **17.9 tok/s** |
+| turns losing their parked prefix | 5 of 20 | **1 of 20** | 7 of 40 | **1 of 48** |
+| tokens wasted re-prefilling lost history | 505k | **~180k** | 712k | **~200k** |
 
 What that means in practice, at ~100k-token depth on a 12 GB card:
 
 - **One to two deep agent sessions: comfortable.** Warm turns 2-3 s, decode
   60-94 tok/s per stream.
 - **Four deep sessions: interactive.** ~7 s warm turns at ~25 tok/s decode —
-  the same arm cost ~48 s per warm turn a week ago.
+  the same arm cost ~48 s per warm turn before these features landed.
 - **Eight deep sessions: workable.** ~21 s warm turns (queue-bound at this
   depth), ~18 tok/s decode. Cold admission in an 8-way burst still costs
   ~100 s — that is prefill physics, not a cache failure.
@@ -124,4 +126,4 @@ code is Apache-2.0 (`LICENSE`); Strata-derived engine code remains MIT. The
 measurement → decision → commit in this campaign — including the ideas that
 measured badly and were reverted.
 
-[^run10]: [§159](docs/CHANGES.md#159-c4c8-deep-re-bench-on-the-canonical-m-c9m-c10c-stack-run-conc8_run10-2026-11-15) — Nov-15 c4/c8 re-bench on the current stack; source of both columns of the table above.
+[^run10]: [§159](docs/CHANGES.md#159-c4c8-deep-re-bench-on-the-canonical-m-c9m-c10c-stack-run-conc8_run10-2026-11-15) — Nov-15 c4/c8 re-bench; source of the *after* columns, with the *before* columns from the pre-feature run it compares against.

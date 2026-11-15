@@ -65,7 +65,7 @@ the first sweep[^sweep1]; C=4/8 from the Nov-15 re-bench[^run10].
 
 ## The physics behind the delta
 
-| Per 100k-token parked image, engine-side | Nov-14 tier | Current tier |
+| Per 100k-token parked image, engine-side | Before (stock tier) | After (HydraGen tier) |
 |---|---|---|
 | bytes read from NVMe on restore | ~2,083 MiB (full copy) | **0.1 MiB** (shared-view mount) |
 | host RAM staged per restore | ~2 GiB straight out of MemAvailable | **~0** |
@@ -113,7 +113,7 @@ same-conversation batch decode[^m-c1c] and host-tier parked-session
 dedup[^m-c2].
 
 [^sweep1]: [§121](CHANGES.md#121-conc8-deep-sweep-complete-windows-installps1-fully-verified-public-docs-privacy-scrub) — first full sweep; source of the C=1/2 rows.
-[^run10]: [§159](CHANGES.md#159-c4c8-deep-re-bench-on-the-canonical-m-c9m-c10c-stack-run-conc8_run10-2026-11-15) — Nov-15 c4/c8 re-bench on the current stack; source of both columns of the README comparison table.
+[^run10]: [§159](CHANGES.md#159-c4c8-deep-re-bench-on-the-canonical-m-c9m-c10c-stack-run-conc8_run10-2026-11-15) — Nov-15 c4/c8 re-bench; source of the README *after* columns, with the *before* columns from the pre-feature run it compares against.
 [^parkdisk]: [§123](CHANGES.md#123-m-c3a-landed-park-disk-tier-under-the-parked-cache-cow-m3--c9d6fc44) — tier lands. Content-chunked v2 store: [§128](CHANGES.md#128-m-c3b1-landed-deduped-block-files-for-the-park-disk-tier-strata_park_disk_v2), [§132](CHANGES.md#132-m-c3b1d-dedup-fire-on-real-kv-06-gib-skipped-per-sibling-spill--the-chunker-was-mis-scaled-not-dead).
 [^lineage]: [§139](CHANGES.md#139-m-c3b3a-landed-lineage-spill--view-table-entries-kd4---child-files-carry-only-owned-bytes) — lineage spill. [§143](CHANGES.md#143-m-c3b3b-landed-view-mounted-adoption-on-restore-5f1ae5a6---steady-state-ram-for-n-siblings-of-one-head--parent--n-tails) — view-mounted restore. End-to-end proofs: [§153](CHANGES.md#153-run28-proves-the-disk-tier-end-to-end-cross-boot-lineage-restores---13x-275k-token-images-read-01-mib-each-in-260-470-ms-restore_qc_fail0-on-both-ladders-rest-95-108-first-new-restores-since-kd3-landed), [§155](CHANGES.md#155-vm-proved-view-mounted-cow-adoption-works-cross-boot-m-c6a-run33-37-saga--dashboard-regex-desync-fix).
 [^xdur]: [§154](CHANGES.md#154-m-c5-two-phase-boot-rebuild-shipped-cow-m3b-7fdb1eff-and-the-cross-restart-gate-passes-the-store-survives-its-own-restart---5657-files-indexed-1-refused-zero-cascade-38-cross-boot-restore-lines-on-boot-b-12-ladder-images-24k-tokens-read-01-mib-each-in-368-435-ms-restore_qc_fail0-both-ladders-battery-green-sescheck-9494) — M-C5 boot rebuild. [§156](CHANGES.md#156-the-boot-segv-saga-v2-default-poisoned-stores-and-m-c8-run42-run53-2026-11-15) — boot SEGV saga and M-C8.
