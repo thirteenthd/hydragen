@@ -1,5 +1,5 @@
 From c9d6fc44cab051f188fcd6aff2a4a0a99a5e7547 Mon Sep 17 00:00:00 2001
-From: Henson <henson@local>
+From: the operator <operator@local>
 Date: Fri, 13 Nov 2026 20:48:07 +0000
 Subject: [PATCH 1/2] M-C3a: park-disk tier under the parked-conversation cache
  (STRATA_PARK_DISK=DIR, off by default) - evict_oldest() hands the full victim
@@ -803,7 +803,7 @@ index a012bdca..5b9639d8 100644
 
 
 From 1b1d40012c1ac8b0908aed3cca63dc34fde9642b Mon Sep 17 00:00:00 2001
-From: Henson <henson@local>
+From: the operator <operator@local>
 Date: Fri, 13 Nov 2026 21:35:14 +0000
 Subject: [PATCH 2/2] park disk: one log line per budget/keep-free file drop
  (path, MiB, remaining entries and GiB) so the dashboard tier card can count
