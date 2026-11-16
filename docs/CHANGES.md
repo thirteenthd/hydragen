@@ -33,6 +33,25 @@ surfaces (all overridable by env):
 `bash -n` and the PowerShell AST parser both clean; the written env block was
 key-checked against a rewritten `hydragen-local.json`.
 
+## §170 milestone decoder doc: docs/MILESTONES.md — every marker defined with intended outcome and progression (2026-11-16)
+
+Milestone codes (M-C10c, cow-m3b, forkb4, b3a, KD4, run56, c4/c8) were used
+across every document with no single page decoding them. Added
+docs/MILESTONES.md: the full inventory in four eras — the substrate ladder
+(M1→M11 + the dense-IQ search), the per-step / speculative-decode / KV
+funding era (M12→M25, including the Strata C++ worker adoption that became
+this product's substrate), the Strata-fork behavior campaigns, and the KV
+copy-on-write campaign (M-C0→M-C10c with every sub-arm's intent, verdict and
+notarization pointer) — plus a glossary of the supporting conventions
+(§NNN, runNN, trNN, KD2-4, c4/c8, b2a/b3a/b3b, the cow-mX branch names,
+forkb4, CN, HTIER, quant classes).
+
+The entries were mined from the server-side change log's 174 section headers
+and cross-checked against the milestone commit messages in the vendored
+engine chain; no new claims - every row points at an existing notarized
+entry. README docs map gained the link, and UPSTREAM_DELTA now resolves its
+markers through the new page.
+
 ## §169 fork knobs renamed to HG_*: fork-only env names read HG_ first, STRATA_ spelling falls back (2026-11-16)
 
 Per §168's inventory, the thirteen env names introduced by this campaign

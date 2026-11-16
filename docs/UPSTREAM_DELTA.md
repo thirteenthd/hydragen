@@ -3,7 +3,8 @@
 The engine in `engine/` is a fork of [Strata](https://github.com/Niko1221/Strata)
 (MIT), vendored at its **v0.2.13** release, plus this campaign's chain. This
 page classifies every difference against that baseline; the per-arm narrative
-with measurements lives in [CHANGES.md](CHANGES.md).
+with measurements lives in [CHANGES.md](CHANGES.md), and every milestone
+marker it mentions is defined in [MILESTONES.md](MILESTONES.md).
 
 ## Net-new subsystems (nothing like them in upstream v0.2.13)
 
