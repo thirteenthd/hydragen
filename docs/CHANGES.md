@@ -33,6 +33,25 @@ surfaces (all overridable by env):
 `bash -n` and the PowerShell AST parser both clean; the written env block was
 key-checked against a rewritten `hydragen-local.json`.
 
+## §167 README truncation post-mortem: 85 bottom-half lines lost in the §163 edit, restored from git (2026-11-16)
+
+Caught while adding the §166 auto-sizing blurb: the README stood at 39/41
+lines, not ~160. The §163 notarization commit (0c5be807b) had accidentally deleted
+README lines 38-122 - everything after the first "## The headline" sentence:
+the before/after headline table, the "what that means in practice" bullets,
+"Why this exists", the docs map, the model-blobs blurb, the fork-coexistence
+section, and the [^run10] footnote. The intended §163 README edit was only
+the counter bump.
+
+Restored the intact 161-line version from the last clean commit (7beb2eba4, already
+scrubbed, no leak exposure), re-applied the later legit edits (counter bumps,
+the §166 try-it sentence), and verified the restored sections: table, docs
+map, coexistence note, footnote. Counter now 172.
+
+Law adopted: before any notarization commit, check `git diff --stat` - a docs
+commit whose README hunk deletes more than the intended edit is malformed,
+not notarization.
+
 ## §166 installer environment auto-sizing: GPU identity, RAM-sized tier budget, disk advisory (2026-11-16)
 
 `install.sh` and `install.ps1` now detect the machine before writing configs:
