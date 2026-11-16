@@ -2,7 +2,7 @@
 
 ### Eight deep conversations. 131,000 tokens each. On the GPU already in your desktop.
 
-![context per chat: 131k tokens](https://img.shields.io/badge/context_per_chat-131k_tokens-2f81f7) ![concurrent 100k-token chats: 8](https://img.shields.io/badge/concurrent_100k_chats-8_measured-2f81f7) ![warm resume at 100k depth: ~2 s](https://img.shields.io/badge/warm_resume_at_100k-~2_s-2f81f7) ![idle chat return: 0.1 MiB](https://img.shields.io/badge/idle_chat_return-0.1_MiB-2f81f7) [![notarized experiments: 172](https://img.shields.io/badge/notarized_experiments-172_incl._failures-6e7681)](docs/CHANGES.md)
+![context per chat: 131k tokens](https://img.shields.io/badge/context_per_chat-131k_tokens-2f81f7) ![concurrent 100k-token chats: 8](https://img.shields.io/badge/concurrent_100k_chats-8_measured-2f81f7) ![warm resume at 100k depth: ~2 s](https://img.shields.io/badge/warm_resume_at_100k-~2_s-2f81f7) ![idle chat return: 0.1 MiB](https://img.shields.io/badge/idle_chat_return-0.1_MiB-2f81f7) [![notarized experiments: 173](https://img.shields.io/badge/notarized_experiments-173_incl._failures-6e7681)](docs/CHANGES.md)
 
 Every number measured on one RTX 3080 Ti and quality-gated before it counted;
 the naive tier moves ~2 GiB to return an idle chat. No multi-GPU. No
@@ -108,10 +108,11 @@ duplication. The full layer map: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md).
 | [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) | the layers, the knobs, the eviction rules |
 | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | methodology, every measurement table, how to reproduce them |
 | [docs/MODELS.md](docs/MODELS.md) | model files: what to get, where it comes from, one-command fetch via Strata setup |
-| [docs/CHANGES.md](docs/CHANGES.md) | the journey: 167 notarized entries, newest first — reads bottom-up from day one |
+| [docs/CHANGES.md](docs/CHANGES.md) | the journey: 168 notarized entries, newest first — reads bottom-up from day one |
 | [docs/FINAL_REPORT.md](docs/FINAL_REPORT.md) | the Nov-12 program snapshot (pre-disk-tier era) |
 | [docs/laws/](docs/laws/) | engineering laws distilled the hard way |
-| `engine/` | our fork of [Strata](https://github.com/Niko1221/Strata) (MIT): v0.2.13 + the full M-C1→M-C10 chain (tip: M-C10c), commit history preserved |
+| `engine/` | our fork of [Strata](https://github.com/Niko1221/Strata) (MIT): v0.2.13 + the full M-C1→M-C10 chain (tip: M-C10c); per-piece classification in [docs/UPSTREAM_DELTA.md](docs/UPSTREAM_DELTA.md) |
+| [docs/UPSTREAM_DELTA.md](docs/UPSTREAM_DELTA.md) | what we re-engineered, what is net-new vs upstream Strata, and which shipped defaults are upstream features we measured and enabled |
 | `configs/` + `bench/` | canonical ctx-131k serving config + launcher, and the gate suite every landing must pass (quality battery, concurrency ladder, park-ladders) |
 
 ## Install notes

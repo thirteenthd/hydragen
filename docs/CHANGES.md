@@ -33,6 +33,31 @@ surfaces (all overridable by env):
 `bash -n` and the PowerShell AST parser both clean; the written env block was
 key-checked against a rewritten `hydragen-local.json`.
 
+## §168 upstream-delta inventory: every v0.2.13 difference classified; lever knobs found to be upstream features (2026-11-16)
+
+The repo carried the delta as history (vendored base merge, 16 individually
+named chain commits, one tip sync) and as narrative (CHANGES), but no
+consolidated inventory. Added docs/UPSTREAM_DELTA.md: net-new subsystems
+(park-disk tier, parked-session CoW dedup, deep checkpoint resume -
+identifier-count evidence: STRATA_PARK_DISK / ParkDisk / STRATA_PARK_COW /
+RESUME_DEEPEST / CowPeer all 0 hits in the vendored v0.2.13 tree),
+re-engineered internals (slot arenas + slot_base indirection, eviction
+handoff, store boot rebuild, dashboard arms), shipped-but-off failed
+experiments (join-at-fetch CowPeer registry, per-lineage shared region), and
+upstream features this campaign measured and enabled.
+
+Finding worth stating plainly: the §164 lever knobs
+(STRATA_ADMIT_SHORT_FIRST / STRATA_ADMIT_MAX_WAIT_S, --prompt-cache-tail,
+COALESCE_TOKENS, STRATA_CRASH_BT) exist in upstream v0.2.13 (18/18/17/2/14
+identifier hits at the vendored base, unchanged across our chain). The
+campaign A/B-quantified them, sized them, and ships them on by default; it
+did not author them.
+
+Also corrected the README engine line: the M-C3b->M-C10c chain lands as one
+vendored-engine sync snapshot (single-parent commit), so granular attribution
+covers the early chain and serve/web arms; the per-arm ledger for everything
+else lives in this change log.
+
 ## §167 README truncation post-mortem: 85 bottom-half lines lost in the §163 edit, restored from git (2026-11-16)
 
 Caught while adding the §166 auto-sizing blurb: the README stood at 39/41
