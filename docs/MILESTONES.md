@@ -100,7 +100,7 @@ This is the chain the shipped product stack stands on.
 | M-C5 | two-phase lineage-aware boot rebuild + stable on-disk serials | SHIPPED; cross-restart gate passes §154 |
 | M-C6a | view-mounted CoW adoption proven cross-boot (VM PROVED) | run33–37 saga + dashboard visibility fix §155 |
 | M-C6b | parent-pin on view-stamping so re-materialization can't drift | run38: parent pinned, restore_qc_fail=0 at 234 restores |
-| M-C7 | defensive published-parent guard during eviction cascades | banked defensive fix, §156 era |
+| M-C7 | `write_v2` may only emit a view entry when its parent is disk-published (unpublished spans fall through to content-defined chunks) | verified commit `df09ca77`; ended the refuse+sweep family poisoning seen in run39/41/42 forensics, §156 era |
 | M-C8 | boot-rebuild SEGV at true 100k depth | root cause: empty slot vector indexed in read_v2; fix + clean walk (5 files, 7.9 GiB, 0 refused) §156 |
 | M-C9 | deep-checkpoint retention + resume: disk image competes with the RAM match and mounts the deepest checkpoint, not the last-saved one | deep warm 100k replays at 2–3 s wall (was ~39 s re-prefill) §157 |
 | M-C10 / b / c | RAM-tier park-anchor donor lifetime: donors stop being eviction candidates while an anchored child is resident; stale deque index in the eviction cascade fixed (the run56 SIGSEGV); park holds the anchor through the cache's single-slot guard | run64: 3x4 deep 100k replays under CoW parks, zero anchors lost, zero QC fails §158 |

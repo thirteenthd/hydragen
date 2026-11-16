@@ -7,6 +7,14 @@ the vendored `engine/` fork of Strata plus the Python serve layer around it.
 micro-bursts from bounded pinned host RAM. Dense/shared weights are native IQ packs.
 Experts are read-only — shared across all sessions by construction.
 
+**Expert routing learns on your traffic.** The shipped `engine/data/expert-profile.bin`
+is only the boot seed; the VRAM tier re-ranks experts from live accesses while serving.
+The installers wire `--expert-profile-save` so that learned ranking persists (written
+every `expert_profile_save_min` minutes, default 10) and the next boot re-seeds from
+it. The save file is keyed by the model blob name (`expert-profile-learned-<hash>.bin`),
+so switching model artifacts can never load a foreign ranking — a profile whose
+layer/expert counts don't match the model aborts startup by design upstream.
+
 **Execution.** A static C++ worker (`engine/`) owns the whole decode loop: CUDA-graph
 captured steps, MTP coupled-draft speculative decode, batched MTP across streams.
 No Python in the decode path.

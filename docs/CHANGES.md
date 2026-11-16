@@ -12,6 +12,67 @@ Newest first; section numbers are stable, so §N always refers to the same entry
 
 
 
+1|## §172 — integrity oddities closed; expert-profile learns and persists across boots; the second box container rebuilt on the HG engine (2026-11-16)
+2|
+3|Three long-standing integrity oddities were walked back to root cause with the
+4|forensics retained on-box (store snapshots + per-era logs):
+5|
+6|- `park-000000003.ses` `session blocks: payload checksum mismatch` (x3) and
+7|  `park-000000004.ses` `chunk file is missing or truncated` (x14) +
+8|  `not a single-linked regular file` (x1): all signatures live in the pre-M-C5 /
+9|  disk-V2-default-bug window. Pre-M-C5 boot sweeps were single-pass, so chunk
+10|  files still referenced by living entries could be unlinked under them; on the
+11|  v1 single-file format the same damage surfaces as a payload-checksum mismatch.
+12|  The retained snapshots settle the mutation question: park-3's bytes are
+13|  byte-identical between the run23-era backup and the junk-store backup — a
+14|  published session file was never rewritten after publish; only its referenced
+15|  chunks were eaten. The run53c line `verify-fail parent=4 keeps=13` was the
+16|  walk re-reading that old scar (parent already gone), and the 13 kept children
+17|  are the published-parent guard's content-chunk fallback doing its job.
+18|  Since the fix chain (two-phase reference-protected boot walk, published-parent
+19|  guard, read_v2 fix, V2 default fix): three consecutive clean boots including
+20|  the boot after a hard power cut — store verified 91/91, refused 0,
+21|  quarantined 0.
+22|- M-C7's marker was verified against git history (`df09ca77`); the milestone
+23|  decoder row was corrected from a vague "banked defensive fix" to the actual
+24|  mechanism: a view entry may only name a parent that is already disk-published.
+25|- The run57 `park COW anchor` marker under a `PARK_COW=0` env reading was a
+26|  probe artifact: the marker print is strictly inside the `PARK_COW=1` gate in
+27|  every era of the source, and the probe read a different (newer) PID during a
+28|  back-to-back restart race while the previous boot's engine still owned the
+29|  GPU. The append-only shared log interleaves both boots and produced the
+30|  apparent contradiction.
+31|
+32|The expert-routing profile now learns on the machine's own traffic and survives
+33|restarts. The shipped profile is a boot seed; the VRAM tier re-ranks experts
+34|from live accesses at runtime. The installers now wire `--expert-profile-save`
+35|so that ranking is persisted (every `expert_profile_save_min`, default 10 min)
+36|and the next boot re-seeds from it instead of the generic upstream ranking. The
+37|save file is keyed by the model blob name, so switching model artifacts can
+38|never load a foreign ranking — an explicitly-given profile that fails its
+39|layer/expert-count check aborts startup by design upstream, and the artifact
+40|key makes that path unreachable. Coalesce defaults were left untouched: they
+41|are read once at serve import (no runtime retune) and their win zone is
+42|bursts of short requests, not deep sessions.
+43|
+44|The second reference box moved onto the rebuilt serving image: current engine
+45|chain, fork-only env names (`HG_*`), and the learned-profile loop wired through
+46|its persistent data mount (`--expert-profile-save` with the model-keyed file
+47|verified on the engine cmdline). Boot rebuild indexed 69 accepted entries
+48|(159.1 GiB) and refused 43 files stamped by the previous image's engine
+49|(`park v2: bound to another model or configuration`) — those went to
+50|quarantine-in-place, which keeps the files and shields the chunk keys they
+51|name, the designed cross-version data-safety behavior. That behavior also
+52|retires an older bookkeeping oddity on that box: `refused=43` alongside a
+53|large retained `chunks/` count was quarantine-in-place, not a counter desync.
+54|
+55|One public claim corrected by the same reading: the tier budget is a save-side
+56|gate (`drop_oldest` fires in the spill-admission path); a lower cap does not
+57|delete files at boot. §164's "boot performs the pruning pass automatically"
+58|was wrong — on the reference host the 159 -> 64 GiB reduction happened as
+59|save-side drops during that sweep, and the second box's idle 160 GiB tier
+60|simply waited for its next spill, exactly as the code says.
+
 ## §171 prebuilt CUDA binaries via GitHub Releases; Windows park-disk compile guards (2026-11-16)
 
 The installers now install a prebuilt engine first and compile from source only
@@ -188,7 +249,9 @@ variable. Levers A1 (64 GiB cap + STRATA_ADMIT_SHORT_FIRST=8192, MAX_WAIT defaul
   (noise-level). Needle QC green all arms.
 - Cost as designed: cold TTFT p50 at C8 163 -> 211 s - short turns take the control line;
   a long prompt counts as short after 30 s, so nothing starves.
-- Boot with the lower cap performs the pruning pass automatically (tier 159 -> 64 GiB);
+- The budget gate is save-side: the first spills after the cap change drop older
+  entries until the active set fits (tier 159 -> 64 GiB during that sweep); a lower
+  cap does not delete files at boot (corrected in §172 after reading the code);
   RAM 57/60 GiB used through the sweep, guard pauses 0, min memavail 1.5 GiB.
 
 Attribution: cap drives the stall/wall recovery (page-cache pressure from tier + pack

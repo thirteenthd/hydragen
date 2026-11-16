@@ -177,10 +177,24 @@ targets = {
     "--expert-profile": os.path.join(repo, "engine", "data", "expert-profile.bin"),
     "--mtp": os.path.join(md, "mtp", "rt"),
 }
+# per-artifact learned-profile loop: the adaptive tier re-ranks experts from live traffic
+# at runtime; --expert-profile-save persists that ranking so the next boot re-seeds from
+# what THIS machine's traffic actually learned. The save file is keyed by the model blob
+# name: change the artifact and the key changes, so a stale ranking can never abort the
+# boot (an explicitly-given profile that fails to load is fatal upstream by design).
+import hashlib
+_pkey = hashlib.sha256(os.path.basename(targets["--native"]).encode()).hexdigest()[:10]
+_learned = os.path.join(repo, f"expert-profile-learned-{_pkey}.bin")
+if os.path.exists(_learned):
+    targets["--expert-profile"] = _learned
 args = cfg["args"]
 for i, tok in enumerate(args):
     if tok in targets and i + 1 < len(args):
         args[i + 1] = targets[tok]
+for i, tok in enumerate(args):
+    if tok == "--expert-profile" and "--expert-profile-save" not in args:
+        args[i + 2 : i + 2] = ["--expert-profile-save", _learned]
+        break
 cfg["cwd"] = repo
 cfg["tokenizer"] = os.path.join(md, "packs", "iq3_xxs", "tokenizer")
 env = cfg.setdefault("env", {})

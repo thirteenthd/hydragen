@@ -190,6 +190,12 @@ $blobTargets = @{
   "--expert-profile" = ((Join-Path $PWD "engine\data\expert-profile.bin") -replace '\\','/');
   "--mtp" = "$mdFwd/mtp/rt"
 }
+# per-artifact learned-profile loop (mirrors install.sh): --expert-profile-save persists the
+# adaptive tier's live ranking; the file is keyed by the model blob name so a stale ranking
+# from a different artifact can never abort the next boot.
+$_pkey = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes("Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf"))).Replace("-","").Substring(0,10).ToLower()
+$learned = (Join-Path $PWD "expert-profile-learned-$_pkey.bin") -replace '\\','/'
+if (Test-Path $learned) { $blobTargets["--expert-profile"] = $learned }
 if (-not (Test-Path hydragen-local.json)) {
   $cfg = Get-Content configs/strata-iq3xxs-m25-0213-ctx131k.json -Raw | ConvertFrom-Json
   $cfg.exe = ($BIN -replace '\\','/')
@@ -208,6 +214,7 @@ if (-not (Test-Path hydragen-local.json)) {
   }
   $cfg.cwd = ($PWD -replace '\\','/')
   $cfg.tokenizer = "$mdFwd/packs/iq3_xxs/tokenizer"
+  if ($cfg.args -notcontains "--expert-profile-save") { $cfg.args += @("--expert-profile-save", $learned) }
   if ($cfg.args -notcontains "--conversation-cache-min-free-mib") { $cfg.args += @("--conversation-cache-min-free-mib", "512") }
   if ($cfg.args -notcontains "--prompt-cache-tail") { $cfg.args += "--prompt-cache-tail" }
   ($cfg | ConvertTo-Json -Depth 6) | Set-Content hydragen-local.json

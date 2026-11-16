@@ -2,7 +2,7 @@
 
 ### Eight deep conversations. 131,000 tokens each. On the GPU already in your desktop.
 
-![context per chat: 131k tokens](https://img.shields.io/badge/context_per_chat-131k_tokens-2f81f7) ![concurrent 100k-token chats: 8](https://img.shields.io/badge/concurrent_100k_chats-8_measured-2f81f7) ![warm resume at 100k depth: ~2 s](https://img.shields.io/badge/warm_resume_at_100k-~2_s-2f81f7) ![idle chat return: 0.1 MiB](https://img.shields.io/badge/idle_chat_return-0.1_MiB-2f81f7) [![notarized experiments: 176](https://img.shields.io/badge/notarized_experiments-176_incl._failures-6e7681)](docs/CHANGES.md)
+![context per chat: 131k tokens](https://img.shields.io/badge/context_per_chat-131k_tokens-2f81f7) ![concurrent 100k-token chats: 8](https://img.shields.io/badge/concurrent_100k_chats-8_measured-2f81f7) ![warm resume at 100k depth: ~2 s](https://img.shields.io/badge/warm_resume_at_100k-~2_s-2f81f7) ![idle chat return: 0.1 MiB](https://img.shields.io/badge/idle_chat_return-0.1_MiB-2f81f7) [![notarized experiments: 177](https://img.shields.io/badge/notarized_experiments-177_incl._failures-6e7681)](docs/CHANGES.md)
 
 Every number measured on one RTX 3080 Ti and quality-gated before it counted;
 the naive tier moves ~2 GiB to return an idle chat. No multi-GPU. No
