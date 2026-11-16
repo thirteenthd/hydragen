@@ -12,6 +12,33 @@ Newest first; section numbers are stable, so §N always refers to the same entry
 
 
 
+## §171 prebuilt CUDA binaries via GitHub Releases; Windows park-disk compile guards (2026-11-16)
+
+The installers now install a prebuilt engine first and compile from source only
+as a fallback. Release `prebuilt-1` carries `hydragen-linux-cuda-x86_64.tar.gz`
+(fat sm_86/89/120 binary + bundled CUDA runtime libs) and
+`hydragen-windows-cuda-x86_64.zip` (fat sm_86/89/120 exe + cublas/cublasLt
+DLLs), both listed in a SHA256SUMS manifest; provenance (commit, CUDA version,
+arch list, glibc floor) ships inside each archive. The Linux asset is built
+from a fresh public clone on the reference host; the Windows asset on a stock
+Windows 11 + CUDA 13.5 + VS BuildTools host with the installer's exact flags.
+
+- `install.sh` / `install.ps1`: fetch the release asset, verify SHA-256,
+  install under `runtime/`; any download, hash, or glibc-floor failure falls
+  back to the source build automatically. `--build-from-source` /
+  `-BuildFromSource` skips the download path entirely. The Linux config writer
+  adds `runtime/lib` to `LD_LIBRARY_PATH` when the prebuilt engine is used; the
+  Windows installer runs `Unblock-File` on everything it extracts.
+- README + installer headers carry the SmartScreen caveat (manual browser
+  downloads of the unsigned zip may warn; More info -> Run anyway) and the
+  source-build fallback message.
+- Engine: two missing `_WIN32` preprocessor guards in the park-disk v2 tier
+  (chunks-dir mkdir, orphan-chunk readdir sweep — dead at runtime on Windows
+  because v2 self-disables there, but they still had to compile) broke Windows
+  source builds since the v2 tier landed. Both sites now guard exactly like the
+  neighbouring blocks. Verified: the first Windows CUDA fat binary of the fork
+  chain links and runs from its packaged directory (cublas DLLs colocated).
+
 ## §165 the levers ship as defaults: tier cap + admit ordering on every serving surface (2026-11-16)
 
 Per §164's measured reading, both levers became defaults on all three serving

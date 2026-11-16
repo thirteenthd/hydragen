@@ -130,11 +130,18 @@ void ParkDisk::init(const Options& o, IdentityFn identity, LimitsFn limits) {
 #endif
     if (v2_) {
         chunks_dir_ = dir_ + "/chunks";
+#ifdef _WIN32
+        if (!CreateDirectoryA(chunks_dir_.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+            std::fprintf(stderr, "strata serve: park disk: v2 DISABLED: CreateDirectory %s\n", chunks_dir_.c_str());
+            v2_ = false;
+        }
+#else
         if (mkdir(chunks_dir_.c_str(), 0700) != 0 && errno != EEXIST) {
             std::fprintf(stderr, "strata serve: park disk: v2 DISABLED: mkdir %s: %s\n",
                          chunks_dir_.c_str(), std::strerror(errno));
             v2_ = false;
         }
+#endif
     }
     const auto boot_serial = [](const std::string& path) -> uint64_t {
         size_t base = path.rfind('/') + 1;
@@ -324,6 +331,7 @@ void ParkDisk::init(const Options& o, IdentityFn identity, LimitsFn limits) {
     if (v2_ && walk_ok) {
         // orphan sweep: chunk files no surviving entry references (and half-written .tmp publishes) leave now
         size_t swept = 0;
+#ifndef _WIN32   // v2 is POSIX-only on Windows (forced off in init); the walk itself is dead code there
         if (DIR* d = opendir(chunks_dir_.c_str())) {
             while (const dirent* e = readdir(d)) {
                 const std::string name = e->d_name;
@@ -337,6 +345,7 @@ void ParkDisk::init(const Options& o, IdentityFn identity, LimitsFn limits) {
             }
             closedir(d);
         }
+#endif
         if (swept) std::fprintf(stderr, "strata serve: park disk: swept %zu orphan chunk file(s)\n", swept);
         std::fprintf(stderr, "strata serve: park disk: v2 dedup tier active (store %zu chunks, %.1f GiB)\n",
                      blobs_.size(), (double) blob_bytes_ / (1024.0 * 1024.0 * 1024.0));

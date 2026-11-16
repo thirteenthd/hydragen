@@ -1,22 +1,27 @@
 #!/usr/bin/env bash
 # HydraGen installer (Linux, NVIDIA).
-# Builds the vendored engine FROM SOURCE - prebuilt Strata release binaries do not contain
-# HydraGen's CoW chain (expert-slot refcounting + admission fork, host-tier parked-session
-# dedup, park-disk v2 lineage tier + deep resume; see docs/FINAL_REPORT.md) - and sets up the
-# Python venv for the serving front. The vendored engine is the canonical cow-m3b branch
-# (M-C1c..M-C10c): this build IS the canonical engine, no arm switches.
+# Prefers a PREBUILT CUDA engine (this repo's GitHub Releases: RTX 30/40/50, fat
+# sm_86/89/120 binary + bundled CUDA runtime libs, SHA-256-verified, provenance
+# in runtime/BUILD_INFO) and falls back to building the vendored engine FROM
+# SOURCE automatically when the download, the hash check, or the distro's glibc
+# floor fails - or on request with --build-from-source. The prebuilt engine IS
+# the canonical cow chain (expert-slot refcounting + admission fork, host-tier
+# parked-session dedup, park-disk v2 lineage tier + deep resume; see
+# docs/FINAL_REPORT.md) - same flags the source build uses.
 #
-# Needs: an NVIDIA driver, a CUDA toolkit (nvcc), a C++ toolchain, Python 3.10+.
-#        CUDA toolkit: https://developer.nvidia.com/cuda-downloads
-#        cmake + ninja come from pip (engine/requirements-build.txt); nothing else to install.
+# Source-build path needs: an NVIDIA driver, a CUDA toolkit (nvcc), a C++
+# toolchain, Python 3.10+. CUDA toolkit: https://developer.nvidia.com/cuda-downloads
+# cmake + ninja come from pip (engine/requirements-build.txt); nothing else to install.
 #
-#   ./install.sh                       # sm_86 (RTX 3060 Ti / 3080 Ti - the target cards)
+#   ./install.sh                       # prebuilt if available, else source (sm_86)
+#   ./install.sh --build-from-source   # never run a downloaded binary; compile locally
 #   HYDRAGEN_CUDA_ARCH=89-real ./install.sh          # RTX 40-series
 #   HYDRAGEN_CUDA_ARCH="86-real;89-real" ./install.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${HYDRAGEN_CUDA_ARCH:-86-real}"
+RELEASE_TAG="prebuilt-1"
 
 # Model blob location: --model-dir DIR (default: <this repo>/models). The generated
 # config's --pack/--native/--ple-gguf/--mtp paths are rewritten to live under DIR.
@@ -24,10 +29,12 @@ ARCH="${HYDRAGEN_CUDA_ARCH:-86-real}"
 # engine/data/expert-profile.bin. See docs/MODELS.md for sources and the
 # vendored Strata downloader (engine/setup.sh / engine/SETUP.bat).
 MODEL_DIR=""
+BUILD_FROM_SOURCE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --model-dir) MODEL_DIR="${2:?--model-dir needs a directory}"; shift 2 ;;
-    *) echo "install.sh: unknown argument: $1 (try --model-dir DIR)" >&2; exit 2 ;;
+    --build-from-source) BUILD_FROM_SOURCE=1; shift ;;
+    *) echo "install.sh: unknown argument: $1 (try --model-dir DIR, --build-from-source)" >&2; exit 2 ;;
   esac
 done
 [ -n "$MODEL_DIR" ] || MODEL_DIR="$PWD/models"
@@ -60,8 +67,43 @@ if [ -n "$FREE_MIB" ] && [ -n "$DET_MIB" ] && [ "$FREE_MIB" -lt $(( DET_MIB + 17
   echo "install.sh: NOTE: ${FREE_MIB} MiB free at $MODEL_DIR - model blobs need ~160 GiB plus the ${DET_MIB} MiB tier budget (the tier fills lazily; this is a now-check, not a hard gate)" >&2
 fi
 
-# ------------------------------------------------------------------ CUDA
+# ------------------------------------------------------------------ prebuilt engine (preferred)
+# Fat CUDA binary (sm_86/89/120 = RTX 30/40/50) + the CUDA runtime libs it needs,
+# SHA-256-verified against the release's SHA256SUMS.txt. Provenance (commit, build
+# host, glibc floor) lands in runtime/. Any failure falls through to source build.
+BIN=""
+if [ "$BUILD_FROM_SOURCE" -eq 0 ]; then
+  BASE="https://github.com/thirteenthd/hydragen/releases/download/$RELEASE_TAG"
+  if curl -fsSL -o /tmp/hg-rel-sums.txt "$BASE/SHA256SUMS.txt" 2>/dev/null; then
+    if curl -fsSL -o /tmp/hydragen-linux-cuda-x86_64.tar.gz "$BASE/hydragen-linux-cuda-x86_64.tar.gz" 2>/dev/null && \
+       (cd /tmp && grep "hydragen-linux-cuda-x86_64.tar.gz" hg-rel-sums.txt | sha256sum -c - >/dev/null 2>&1); then
+      mkdir -p runtime
+      tar xzf /tmp/hydragen-linux-cuda-x86_64.tar.gz -C runtime
+      chmod +x runtime/hydragen 2>/dev/null || true
+      FLOOR=$(cat runtime/GLIBC_FLOOR 2>/dev/null || echo "")
+      HAVE=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')
+      OLDER=$(printf '%s\n%s\n' "${FLOOR:-0}" "${HAVE:-0}" | sort -V | head -1)
+      if [ -x runtime/hydragen ] && { [ -z "$FLOOR" ] || [ "$OLDER" = "$FLOOR" ]; }; then
+        BIN="$PWD/runtime/hydragen"
+        echo "install.sh: prebuilt engine installed (runtime/hydragen, SHA-256 verified):"
+        sed 's/^/    /' runtime/BUILD_INFO 2>/dev/null || true
+        echo "install.sh: this binary is unsigned like all community CUDA builds; the hash above"
+        echo "            pins provenance. Prefer your own compile? rerun: ./install.sh --build-from-source"
+      else
+        echo "install.sh: NOTE: glibc $HAVE is older than this binary's build floor ($FLOOR) - falling back to a source build" >&2
+      fi
+    else
+      echo "install.sh: NOTE: prebuilt download/hash check failed - falling back to a source build" >&2
+    fi
+    rm -f /tmp/hydragen-linux-cuda-x86_64.tar.gz /tmp/hg-rel-sums.txt
+  else
+    echo "install.sh: NOTE: no release manifest reachable (offline?) - falling back to a source build" >&2
+  fi
+fi
+
+# ------------------------------------------------------------------ CUDA (source-build path)
 CUDA=""
+if [ -z "$BIN" ]; then
 for c in $(ls -d /usr/local/cuda /usr/local/cuda-* /opt/cuda 2>/dev/null | sort -V) "${CUDA_HOME:-}"; do
   [ -n "$c" ] && [ -x "$c/bin/nvcc" ] && CUDA="$c"
 done
@@ -74,6 +116,7 @@ if [ -z "$CUDA" ]; then
   exit 1
 fi
 echo "CUDA: $CUDA ($("$CUDA/bin/nvcc" --version | grep -o 'release [0-9.]*'))"
+fi
 
 # ------------------------------------------------------------------ Python + venv
 PY=""
@@ -93,10 +136,11 @@ fi
 echo "Python: installing runtime and build packages into .venv ..."
 .venv/bin/python -m pip -q install -r engine/requirements.txt -r engine/requirements-build.txt
 
-# ------------------------------------------------------------------ engine build
+# ------------------------------------------------------------------ engine build (fallback path)
 # Upstream's cuda-compile preset flags (the release flags of packaging/build_cuda_linux.sh);
 # the default arch is sm_86 because that is the card HydraGen was developed and measured on.
-echo "Building the HydraGen engine (CUDA arch: $ARCH) ..."
+if [ -z "$BIN" ]; then
+echo "Building the HydraGen engine from source (CUDA arch: $ARCH) ..."
 ".venv/bin/cmake" -S engine -B engine/build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_ENABLE_CUDA=ON \
@@ -112,6 +156,7 @@ echo "Building the HydraGen engine (CUDA arch: $ARCH) ..."
 BIN="$PWD/engine/build/hydragen"
 [ -x "$BIN" ] || { echo "install.sh: build finished but engine/build/hydragen is missing" >&2; exit 1; }
 echo "engine OK: $BIN"
+fi
 
 # ------------------------------------------------------------------ local config
 if [ ! -f hydragen-local.json ]; then
@@ -139,6 +184,10 @@ for i, tok in enumerate(args):
 cfg["cwd"] = repo
 cfg["tokenizer"] = os.path.join(md, "packs", "iq3_xxs", "tokenizer")
 env = cfg.setdefault("env", {})
+rt = os.path.join(repo, "runtime")
+if os.path.isdir(os.path.join(rt, "lib")):  # prebuilt engine: bundled CUDA runtime libs
+    prev = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = os.path.join(rt, "lib") + ((":" + prev) if prev else "")
 env["HG_PARK_COW"] = "1"
 env["HG_PARK_DISK"] = os.environ["PARK_DISK_DIR"]
 env.setdefault("HG_PARK_DISK_MIB", os.environ.get("DET_MIB") or "65536")

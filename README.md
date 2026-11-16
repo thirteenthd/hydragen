@@ -2,7 +2,7 @@
 
 ### Eight deep conversations. 131,000 tokens each. On the GPU already in your desktop.
 
-![context per chat: 131k tokens](https://img.shields.io/badge/context_per_chat-131k_tokens-2f81f7) ![concurrent 100k-token chats: 8](https://img.shields.io/badge/concurrent_100k_chats-8_measured-2f81f7) ![warm resume at 100k depth: ~2 s](https://img.shields.io/badge/warm_resume_at_100k-~2_s-2f81f7) ![idle chat return: 0.1 MiB](https://img.shields.io/badge/idle_chat_return-0.1_MiB-2f81f7) [![notarized experiments: 175](https://img.shields.io/badge/notarized_experiments-175_incl._failures-6e7681)](docs/CHANGES.md)
+![context per chat: 131k tokens](https://img.shields.io/badge/context_per_chat-131k_tokens-2f81f7) ![concurrent 100k-token chats: 8](https://img.shields.io/badge/concurrent_100k_chats-8_measured-2f81f7) ![warm resume at 100k depth: ~2 s](https://img.shields.io/badge/warm_resume_at_100k-~2_s-2f81f7) ![idle chat return: 0.1 MiB](https://img.shields.io/badge/idle_chat_return-0.1_MiB-2f81f7) [![notarized experiments: 176](https://img.shields.io/badge/notarized_experiments-176_incl._failures-6e7681)](docs/CHANGES.md)
 
 Every number measured on one RTX 3080 Ti and quality-gated before it counted;
 the naive tier moves ~2 GiB to return an idle chat. No multi-GPU. No
@@ -32,6 +32,19 @@ git clone https://github.com/thirteenthd/hydragen.git; cd hydragen
 .\install.ps1
 .venv\Scripts\python.exe engine\serve\server.py --engine hydragen --config hydragen-local.json
 ```
+
+Both installers first fetch a **prebuilt CUDA engine** from this repo's GitHub
+Releases (RTX 30/40/50 fat binary, bundled CUDA runtime libs, SHA-256-verified
+against the release manifest) and fall back to a source build automatically.
+The prebuilt binary is unsigned, like every community CUDA build: if you
+download the `.zip` yourself in a browser, Windows SmartScreen may show
+"Windows protected your PC" — *More info → Run anyway*. The installer route
+adds no browser mark, unblocks what it extracts, and always verifies the hash.
+On Linux the installer also compares your distro's glibc against the binary's
+build floor and falls back by itself. Prefer to run only code you compiled
+yourself? `./install.sh --build-from-source` / `.\install.ps1 -BuildFromSource`
+skips the download entirely — same engine, built on your machine, just more
+time and the toolchain prerequisites.
 
 OpenAI-compatible API + live concurrency dashboard → `http://127.0.0.1:8181/`
 (point the config's model-blob paths at your own model set first — see

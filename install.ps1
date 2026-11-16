@@ -1,23 +1,37 @@
 # HydraGen installer (Windows 10/11, NVIDIA).
-# Builds the vendored engine FROM SOURCE - prebuilt Strata release binaries do not contain
-# HydraGen's CoW chain (expert-slot refcounting + admission fork, host-tier parked-session
-# dedup; see docs/FINAL_REPORT.md) - and sets up the Python venv for the serving front.
+# Prefers a PREBUILT CUDA engine (this repo's GitHub Releases: RTX 30/40/50 fat
+# sm_86/89/120 binary + the CUDA runtime DLLs it needs; SHA-256-verified against
+# the release manifest, download marked-and-unblocked by this script) and falls
+# back to building the vendored engine FROM SOURCE when the download or hash
+# check fails - or on request with -BuildFromSource. The prebuilt engine IS the
+# canonical cow chain (expert-slot refcounting + admission fork, host-tier
+# parked-session dedup; see docs/FINAL_REPORT.md) - same flags the source build uses.
 #
-# Needs: an NVIDIA driver, a CUDA toolkit (nvcc), an MSVC C++ toolchain, Python 3.10+.
+# The prebuilt binary is UNSIGNED, like every community CUDA build: if you grab
+# the .zip yourself in a browser, Windows SmartScreen may show "Windows protected
+# your PC" - click More info -> Run anyway. This installer's own download carries
+# no browser mark and every extracted file is unblocked here, so you will not see
+# that warning when installing this way. Unsure about running a downloaded
+# binary? Use -BuildFromSource: same engine compiled on your machine, just more
+# time (and the toolchain requirements below).
+#
+# Source-build path needs: an NVIDIA driver, a CUDA toolkit (nvcc), an MSVC C++ toolchain, Python 3.10+.
 #   CUDA toolkit:  https://developer.nvidia.com/cuda-downloads
 #   MSVC:          winget install Microsoft.VisualStudio.2022.BuildTools --override `
 #                    "--wait --quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
 #   cmake + ninja come from pip (engine/requirements-build.txt); nothing else to install.
 #
-#   .\install.ps1                                  # sm_86 (RTX 3060 Ti / 3080 Ti / 3090)
+#   .\install.ps1                                  # prebuilt if available, else source (sm_86)
+#   .\install.ps1 -BuildFromSource                 # never run a downloaded binary; compile locally
 #   $env:HYDRAGEN_CUDA_ARCH="89-real"; .\install.ps1     # RTX 40-series
 #   $env:HYDRAGEN_CUDA_ARCH="86-real;89-real"; .\install.ps1
 
-param([string]$ModelDir)
+param([string]$ModelDir, [switch]$BuildFromSource)
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
 $ARCH = if ($env:HYDRAGEN_CUDA_ARCH) { $env:HYDRAGEN_CUDA_ARCH } else { "86-real" }
+$RELEASE_TAG = "prebuilt-1"
 
 # ------------------------------------------------- environment sizing (auto-detected; edit hydragen-local.json to override)
 $DetMib = 65536
@@ -40,8 +54,36 @@ if ($ramMib -gt 0) {
   Write-Host "install.ps1: RAM detected: $ramMib MiB -> park-disk tier budget $DetMib MiB (a tier pinned above the RAM class measurably decays steady-state throughput - docs/HOW_IT_WORKS.md)"
 }
 
-# ------------------------------------------------------------------ CUDA
+# ------------------------------------------------------------------ prebuilt engine (preferred)
+$BIN = $null
+if (-not $BuildFromSource) {
+  $base = "https://github.com/thirteenthd/hydragen/releases/download/$RELEASE_TAG"
+  $zip = Join-Path $env:TEMP "hydragen-windows-cuda-x86_64.zip"
+  try {
+    Invoke-WebRequest -UseBasicParsing -Uri "$base/SHA256SUMS.txt" -OutFile "$zip.sha256sums" -TimeoutSec 30 | Out-Null
+    Invoke-WebRequest -UseBasicParsing -Uri "$base/hydragen-windows-cuda-x86_64.zip" -OutFile $zip -TimeoutSec 900 | Out-Null
+    $want = ((Get-Content "$zip.sha256sums" | Where-Object { $_ -match "windows-cuda" } | Select-Object -First 1) -split '\s+')[0]
+    $have = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+    if ($want -and $have -eq $want.ToLower()) {
+      New-Item -ItemType Directory -Force -Path "runtime" | Out-Null
+      Expand-Archive -Force -Path $zip -DestinationPath "runtime"
+      Get-ChildItem "runtime" -Recurse | Unblock-File
+      $BIN = Join-Path $PWD "runtime\hydragen.exe"
+      if (-not (Test-Path $BIN)) { $BIN = $null; Write-Warning "prebuilt zip has no hydragen.exe - falling back to a source build" }
+      else {
+        Write-Host "install.ps1: prebuilt engine installed (runtime\hydragen.exe; SHA-256 verified; download unblocked):"
+        Get-Content "runtime\BUILD_INFO.txt" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
+        Write-Host "install.ps1: prefer compiling it yourself? rerun: .\install.ps1 -BuildFromSource (same engine,"
+        Write-Host "            nothing downloaded, just more time)."
+      }
+    } else { Write-Warning "prebuilt hash check failed (manifest $want, got $have) - falling back to a source build" }
+  } catch { Write-Warning "prebuilt download failed ($($_.Exception.Message)) - falling back to a source build" }
+  Remove-Item $zip, "$zip.sha256sums" -ErrorAction SilentlyContinue
+}
+
+# ------------------------------------------------------------------ CUDA (source-build path)
 $CUDA = $null
+if (-not $BIN) {
 $cands = @()
 if ($env:CUDA_PATH -and (Test-Path "$env:CUDA_PATH\bin\nvcc.exe")) { $cands += $env:CUDA_PATH }
 $pf = ${env:ProgramFiles}
@@ -63,8 +105,10 @@ or set CUDA_PATH to one. cmake/ninja are handled for you.
 "@
 }
 Write-Host "CUDA: $CUDA"
+}
 
 # ------------------------------------------------------------------ MSVC
+if (-not $BIN) {
 $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
 $vs = $null
 if (Test-Path $vswhere) {
@@ -83,6 +127,7 @@ if ($vcvars -and (Test-Path $vcvars)) {
     if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
   }
   Write-Host "MSVC environment activated (vcvars64)"
+}
 }
 
 # ------------------------------------------------------------------ Python + venv
@@ -104,10 +149,11 @@ Write-Host "Python: installing runtime and build packages into .venv ..."
 & .venv\Scripts\python.exe -m pip -q install -r engine/requirements.txt -r engine/requirements-build.txt
 if ($LASTEXITCODE -ne 0) { Write-Error "install.ps1: pip install failed" }
 
-# ------------------------------------------------------------------ engine build
+# ------------------------------------------------------------------ engine build (fallback path)
+if (-not $BIN) {
 $CMAKE = ".venv\Scripts\cmake.exe"
 $NINJA = (Resolve-Path ".venv\Scripts\ninja.exe").Path
-Write-Host "Building the HydraGen engine (CUDA arch: $ARCH) ..."
+Write-Host "Building the HydraGen engine from source (CUDA arch: $ARCH) ..."
 & $CMAKE -S engine -B engine/build -G Ninja `
   -DCMAKE_BUILD_TYPE=Release `
   -DSTRATA_ENABLE_CUDA=ON `
@@ -125,6 +171,7 @@ if ($LASTEXITCODE -ne 0) { Write-Error "install.ps1: build failed" }
 $BIN = Join-Path $PWD "engine\build\hydragen.exe"
 if (-not (Test-Path $BIN)) { Write-Error "install.ps1: build finished but engine\build\hydragen.exe is missing" }
 Write-Host "engine OK: $BIN"
+}
 
 # ------------------------------------------------------------------ local config
 if (-not $ModelDir) { $ModelDir = Join-Path $PWD "models" }
