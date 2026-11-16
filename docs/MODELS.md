@@ -22,6 +22,11 @@ GGUFs over 16 connections, resumes interrupted downloads, checks every file's
 SHA-256 against pinned values, then builds the pack and fetches the MTP draft
 into the same data dir:
 
+(The pack build is also what exports the model's `tokenizer/` folder.  If serve
+exits with *the model's tokenizer is missing*, the pack step has not run to
+completion — the error prints the exact repair command, including a fast
+tokenizer-only export for when the pack itself is already complete.)
+
 ```bash
 # Linux
 bash engine/setup.sh --model IQ3_XXS --data-dir <your-model-dir>

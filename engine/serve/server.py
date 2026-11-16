@@ -10177,7 +10177,20 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     tcfg = {}
     tpath = Path(a.tokenizer)
     if a.engine == "strata" and not (tpath / "vocab.json").exists():
-        ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
+        _fix = ""
+        if tpath.name == "tokenizer" and len(tpath.parents) >= 3:
+            _pack_dir = tpath.parent
+            if os.name == "nt":
+                _fix = ("  the tokenizer is exported when the pack is built: run  cmd /c engine\\SETUP.bat"
+                        " --model <QUANT> --data-dir " + str(tpath.parents[2]) + "  (resumable; re-runs are cheap)."
+                        "  If the pack is already complete, export just the tokenizer:"
+                        "  .venv\\Scripts\\python.exe engine\\tools\\strata_tokenizer.py --gguf <model shard-1 .gguf> --out " + str(_pack_dir))
+            else:
+                _fix = ("  the tokenizer is exported when the pack is built: run  ./engine/SETUP.sh"
+                        " --model <QUANT> --data-dir " + str(tpath.parents[2]) + "  (resumable; re-runs are cheap)."
+                        "  If the pack is already complete, export just the tokenizer:"
+                        "  .venv/bin/python engine/tools/strata_tokenizer.py --gguf <model shard-1 .gguf> --out " + str(_pack_dir))
+        ap.error("the model's tokenizer is missing (" + str(tpath / "vocab.json") + ");" + _fix)
     if (tpath / "vocab.json").exists():
         import strata_tokenizer as ST
         vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))

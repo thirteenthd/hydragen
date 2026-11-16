@@ -231,6 +231,10 @@ Write-Host "       cmd /c engine\SETUP.bat --model IQ3_XXS --data-dir `"$ModelDi
 Write-Host "     (Strata's own downloader: resumable, SHA-256-checked; builds the pack and fetches MTP)."
 Write-Host "     Or: uvx hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF --include `"IQ3_XXS/*`" --local-dir DIR"
 Write-Host "         then engine\SETUP.bat --gguf-dir DIR"
+if (-not (Test-Path (Join-Path $ModelDir "packs\iq3_xxs\tokenizer\vocab.json"))) {
+  Write-Host "     NOTE: the model pack (and with it the tokenizer serve checks for) does not exist yet" -ForegroundColor Yellow
+  Write-Host "           under $ModelDir\packs\iq3_xxs - serve will refuse to start until step 1 runs." -ForegroundColor Yellow
+}
 Write-Host "  2. .venv\Scripts\python.exe engine\serve\server.py --engine hydragen --config hydragen-local.json --port 8181"
 Write-Host "  3. dashboard + Monitor: http://127.0.0.1:8181/"
 Write-Host "  4. the canonical stack is pre-wired: STRATA_PARK_COW=1, park-disk v2 tier (park-disk\),"

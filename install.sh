@@ -259,3 +259,8 @@ Next steps
      Merge gates (optional, from this tree): build with -DSTRATA_BUILD_CONVERSATION_TESTS=ON and run
      the conversation_cache_test and park_disk_boot_test targets.
 EON
+if [ ! -f "$MODEL_DIR/packs/iq3_xxs/tokenizer/vocab.json" ]; then
+  echo >&2
+  echo "install.sh: NOTE: $MODEL_DIR/packs/iq3_xxs/tokenizer/vocab.json does not exist yet - the pack build (step 1) is what" >&2
+  echo "    exports the tokenizer, and serve refuses to start without it. Run step 1 before step 2." >&2
+fi
