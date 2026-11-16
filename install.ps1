@@ -19,6 +19,27 @@ Set-Location $PSScriptRoot
 
 $ARCH = if ($env:HYDRAGEN_CUDA_ARCH) { $env:HYDRAGEN_CUDA_ARCH } else { "86-real" }
 
+# ------------------------------------------------- environment sizing (auto-detected; edit hydragen-local.json to override)
+$DetMib = 65536
+$smi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
+if (-not $smi) { $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue }
+if ($smi) {
+  $gpu = & $smi.Source --query-gpu=name,memory.total,compute_cap --format=csv,noheader,nounits 2>$null |
+    Sort-Object { [int](($_ -split ',\s*')[1]) } -Descending | Select-Object -First 1
+  if ($gpu) {
+    $p = $gpu -split ',\s*'
+    Write-Host "install.ps1: GPU detected: $gpu"
+    if (([int]$p[1]) -lt 12000) { Write-Warning "largest GPU is $($p[1]) MiB - the shipped config targets 12 GB+ VRAM" }
+    if ($p[2] -notmatch '^(8|9|1[0-9])\.') { Write-Warning "compute capability $($p[2]) - this engine build targets Ampere (sm_80) or newer" }
+  }
+} else { Write-Warning "install.ps1: nvidia-smi not found - install the NVIDIA driver before serving (skipping GPU sizing)" }
+$ramMib = [int]((Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).TotalPhysicalMemory / 1MB)
+if ($ramMib -gt 0) {
+  $DetMib = [Math]::Min($ramMib, 131072); if ($DetMib -lt 16384) { $DetMib = 16384 }
+  if ($ramMib -lt 49152) { Write-Warning "$ramMib MiB RAM detected - the documented floor is 64 GB; expect parked sessions to be re-prefilled more often" }
+  Write-Host "install.ps1: RAM detected: $ramMib MiB -> park-disk tier budget $DetMib MiB (a tier pinned above the RAM class measurably decays steady-state throughput - docs/HOW_IT_WORKS.md)"
+}
+
 # ------------------------------------------------------------------ CUDA
 $CUDA = $null
 $cands = @()
@@ -109,6 +130,10 @@ Write-Host "engine OK: $BIN"
 if (-not $ModelDir) { $ModelDir = Join-Path $PWD "models" }
 if (-not [System.IO.Path]::IsPathRooted($ModelDir)) { $ModelDir = Join-Path $PWD $ModelDir }
 foreach ($d in @("packs", "models", "mtp")) { New-Item -ItemType Directory -Force -Path (Join-Path $ModelDir $d) | Out-Null }
+try { $freeMib = [int]((New-Object System.IO.DriveInfo($ModelDir.Substring(0, 2))).AvailableFreeSpace / 1MB) } catch { $freeMib = -1 }
+if ($freeMib -ge 0 -and $freeMib -lt ($DetMib + 174080)) {
+  Write-Warning "install.ps1: $freeMib MiB free on the $ModelDir drive - model blobs need ~160 GiB plus the $DetMib MiB tier budget (the tier fills lazily; now-check, not a hard gate)"
+}
 $mdFwd = $ModelDir -replace '\\','/'
 $ggufDir = "$mdFwd/models/IQ3_XXS/IQ3_XXS"
 $blobTargets = @{
@@ -124,7 +149,8 @@ if (-not (Test-Path hydragen-local.json)) {
   $cfg.log = (Join-Path $PWD "logs\strata.log") -replace '\\','/'
   foreach ($d in @("logs", "park-disk")) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
   $cfg.env | Add-Member -Force -NotePropertyMembers @{
-    STRATA_PARK_COW = "1"; STRATA_PARK_DISK_V2 = "1"; STRATA_PARK_DISK_MIB = "163840";
+    STRATA_PARK_COW = "1"; STRATA_PARK_DISK_V2 = "1"; STRATA_PARK_DISK_MIB = "$DetMib";
+    STRATA_ADMIT_SHORT_FIRST = "8192";
     STRATA_RESUME_DEEPEST = "1";
     STRATA_PARK_DISK = (Join-Path $PWD "park-disk") -replace '\\','/'
   }
@@ -154,4 +180,5 @@ Write-Host "         then engine\SETUP.bat --gguf-dir DIR"
 Write-Host "  2. .venv\Scripts\python.exe engine\serve\server.py --engine hydragen --config hydragen-local.json --port 8181"
 Write-Host "  3. dashboard + Monitor: http://127.0.0.1:8181/"
 Write-Host "  4. the canonical stack is pre-wired: STRATA_PARK_COW=1, park-disk v2 tier (park-disk\),"
-Write-Host "     STRATA_RESUME_DEEPEST=1, --prompt-cache-tail (budget: STRATA_PARK_DISK_MIB, default 160 GiB)"
+Write-Host "     STRATA_RESUME_DEEPEST=1, --prompt-cache-tail (tier budget: STRATA_PARK_DISK_MIB, default 64 GiB -"
+Write-Host "     a pinned bigger cap measurably decays throughput on a 64 GB-RAM host), STRATA_ADMIT_SHORT_FIRST=8192"

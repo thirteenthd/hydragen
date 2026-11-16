@@ -26,10 +26,15 @@ donor's host K/V buffer segments as verified views — only the tail is copied.
 ref-counting) are compiled into this engine and always on — that is the product.
 The canonical serving stack is wired by the installer into `hydragen-local.json`:
 `STRATA_PARK_COW=1` (host-tier parked dedup, CoW parks), a park-disk v2 tier
-(`STRATA_PARK_DISK=<dir>` + `STRATA_PARK_DISK_V2=1`) that keeps parked sessions
+(`STRATA_PARK_DISK=<dir>` + `STRATA_PARK_DISK_V2=1`, with `STRATA_PARK_DISK_MIB=65536`
+sized for the 64 GB-RAM class — a tier pinned at a larger cap measurably decays
+steady-state throughput on such hosts) that keeps parked sessions
 cross-boot at view-mount cost, and `STRATA_RESUME_DEEPEST=1` + the
 `--prompt-cache-tail` arg so a parked session resumes at its own deepest
-checkpoint instead of re-reading its tail. `STRATA_COW_JOIN_HH` /
+checkpoint instead of re-reading its tail. `STRATA_ADMIT_SHORT_FIRST=8192` gives
+short agent turns the prefill lane before big cold prompts (a long prompt that
+waited `STRATA_ADMIT_MAX_WAIT_S`, 30 s, counts as short — nothing starves).
+`STRATA_COW_JOIN_HH` /
 `STRATA_COW_SHARED` are the closed-negative experiments, kept default-off for
 roomier substrates.
 

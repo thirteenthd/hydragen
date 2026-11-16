@@ -12,6 +12,47 @@ Newest first; section numbers are stable, so §N always refers to the same entry
 
 
 
+## §165 the levers ship as defaults: tier cap + admit ordering on every serving surface (2026-11-16)
+
+Per §164's measured reading, both levers became defaults on all three serving
+surfaces (all overridable by env):
+
+- Reference-host config generator: park-disk budget default 163840 -> 65536 MiB,
+  `STRATA_ADMIT_SHORT_FIRST` default 0 -> 8192 (`MAX_WAIT_S` stays 30). Boot
+  verified: the live serve process's own `/proc/<pid>/environ` shows
+  65536 / 8192 / 30, and `/v1` answers with context 131072.
+- Public installers: freshly generated `hydragen-local.json` now carries
+  `STRATA_PARK_DISK_MIB=65536` and `STRATA_ADMIT_SHORT_FIRST=8192`; the harmful
+  163840 default is gone from the repo. `docs/HOW_IT_WORKS.md` carries the same
+  guidance in the stack paragraph.
+- Second box: container config env patched and the container restarted - the
+  engine child's `/proc/<pid>/environ` shows 65536 / 8192, `/v1/models` back to
+  HTTP 200. Its 160 GiB tier is still on disk 15 min after boot (unlike the
+  §164 pruning pass); the budget bites as save-side drops bring it down.
+
+`bash -n` and the PowerShell AST parser both clean; the written env block was
+key-checked against a rewritten `hydragen-local.json`.
+
+## §166 installer environment auto-sizing: GPU identity, RAM-sized tier budget, disk advisory (2026-11-16)
+
+`install.sh` and `install.ps1` now detect the machine before writing configs:
+
+- **GPU** via `nvidia-smi` (largest GPU by `memory.total`): echoes name / VRAM /
+  compute capability; WARNING under 12000 MiB; WARNING for compute capability
+  outside 8.x / 9.x / 1x.x (the build targets sm_80+); NOTE when `nvidia-smi`
+  is absent - sizing is skipped, install does not fail.
+- **Park-tier budget** = min(total RAM, 131072 MiB), floor 16384 - §164's law
+  encoded: a tier budget sized to the RAM class, because a pinned larger cap
+  measurably decays steady-state throughput. WARNING below 49152 MiB RAM
+  (documented floor is 64 GB).
+- **Disk advisory**: NOTE when the model drive's free space is under
+  budget + 174080 MiB (model blobs ~160 GiB); advisory, not a gate.
+
+The detected budget flows into `hydragen-local.json`. Probes against real
+hardware: RTX 3080 Ti host with 62168 MiB RAM -> 62168 budget; RTX 3060 box
+with 64204 MiB -> 64204; Windows host, RTX 3090, 130966 MiB -> 130966
+(no clamping hit below 128 GiB). Parser checks clean on both script families.
+
 ## §164 park-cap + admit-ordering A/B on the reference host: 1.89x self-decay measured, levers recover it (2026-11-16)
 
 The second-box run2 finding was reproduced on the reference host and then A/B'd. Baseline A0:

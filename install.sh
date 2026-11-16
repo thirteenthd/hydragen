@@ -33,6 +33,33 @@ done
 [ -n "$MODEL_DIR" ] || MODEL_DIR="$PWD/models"
 case "$MODEL_DIR" in /*) ;; *) MODEL_DIR="$PWD/$MODEL_DIR" ;; esac
 
+# --- environment sizing (auto-detected; override by editing hydragen-local.json) ---
+DET_MIB=""
+GPU_LINE=""
+if command -v nvidia-smi >/dev/null 2>&1; then
+  GPU_LINE=$(nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader,nounits 2>/dev/null | sort -t, -k2 -rn | head -1)
+fi
+if [ -n "$GPU_LINE" ]; then
+  VRAM=$(echo "$GPU_LINE" | awk -F', ' '{print $2}')
+  CC=$(echo "$GPU_LINE" | awk -F', ' '{print $3}')
+  echo "install.sh: GPU detected: $GPU_LINE"
+  [ "$VRAM" -lt 12000 ] 2>/dev/null && echo "install.sh: WARNING: largest GPU is ${VRAM} MiB - the shipped config targets 12 GB+ VRAM" >&2
+  case "$CC" in 8.*|9.*|1[0-9].*) : ;; "") : ;; *) echo "install.sh: WARNING: compute capability $CC - this engine build targets Ampere (sm_80) or newer" >&2 ;; esac
+else
+  echo "install.sh: NOTE: nvidia-smi not found - install the NVIDIA driver before serving (skipping GPU sizing)" >&2
+fi
+RAM_MIB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+if [ "$RAM_MIB" -gt 0 ] 2>/dev/null; then
+  DET_MIB=$(( RAM_MIB > 131072 ? 131072 : RAM_MIB ))
+  [ "$DET_MIB" -lt 16384 ] && DET_MIB=16384
+  [ "$RAM_MIB" -lt 49152 ] && echo "install.sh: WARNING: ${RAM_MIB} MiB RAM detected - the documented floor is 64 GB; expect parked sessions to be re-prefilled more often" >&2
+  echo "install.sh: RAM detected: ${RAM_MIB} MiB -> park-disk tier budget ${DET_MIB} MiB (a tier pinned above the RAM class measurably decays steady-state throughput - docs/HOW_IT_WORKS.md)"
+fi
+FREE_MIB=$(df -Pm "$MODEL_DIR" 2>/dev/null | awk 'NR==2{print $4}')
+if [ -n "$FREE_MIB" ] && [ -n "$DET_MIB" ] && [ "$FREE_MIB" -lt $(( DET_MIB + 174080 )) ] 2>/dev/null; then
+  echo "install.sh: NOTE: ${FREE_MIB} MiB free at $MODEL_DIR - model blobs need ~160 GiB plus the ${DET_MIB} MiB tier budget (the tier fills lazily; this is a now-check, not a hard gate)" >&2
+fi
+
 # ------------------------------------------------------------------ CUDA
 CUDA=""
 for c in $(ls -d /usr/local/cuda /usr/local/cuda-* /opt/cuda 2>/dev/null | sort -V) "${CUDA_HOME:-}"; do
@@ -92,7 +119,7 @@ if [ ! -f hydragen-local.json ]; then
       -e "s#\"log\": \"[^\"]*\"#\"log\": \"$PWD/logs/strata.log\"#" \
       configs/strata-iq3xxs-m25-0213-ctx131k.json > hydragen-local.json
   mkdir -p logs park-disk "$MODEL_DIR/packs" "$MODEL_DIR/models" "$MODEL_DIR/mtp"
-  PARK_DISK_DIR="$PWD/park-disk" MODEL_DIR="$MODEL_DIR" REPO_DIR="$PWD" .venv/bin/python - <<'PYEOF'
+  PARK_DISK_DIR="$PWD/park-disk" MODEL_DIR="$MODEL_DIR" REPO_DIR="$PWD" DET_MIB="$DET_MIB" .venv/bin/python - <<'PYEOF'
 import json, os
 p = "hydragen-local.json"
 cfg = json.load(open(p))
@@ -114,7 +141,8 @@ cfg["tokenizer"] = os.path.join(md, "packs", "iq3_xxs", "tokenizer")
 env = cfg.setdefault("env", {})
 env["STRATA_PARK_COW"] = "1"
 env["STRATA_PARK_DISK"] = os.environ["PARK_DISK_DIR"]
-env.setdefault("STRATA_PARK_DISK_MIB", "163840")
+env.setdefault("STRATA_PARK_DISK_MIB", os.environ.get("DET_MIB") or "65536")
+env.setdefault("STRATA_ADMIT_SHORT_FIRST", "8192")
 env["STRATA_PARK_DISK_V2"] = "1"
 env["STRATA_RESUME_DEEPEST"] = "1"
 if "--conversation-cache-min-free-mib" not in args:
@@ -150,11 +178,17 @@ Next steps
                                 parked RAM on agent workloads (docs/FINAL_REPORT.md)
        STRATA_PARK_DISK=DIR     the cross-boot park-disk tier under it (a park-disk/ dir
                                 was created here); STRATA_PARK_DISK_MIB caps its budget
-                                (default 163840 = 160 GiB - lower it on small disks)
+                                (default 65536 = 64 GiB; on a 64 GB-RAM host a tier pinned
+                                at a bigger cap measurably decays steady-state throughput -
+                                raise it only with several x that cap in system RAM)
        STRATA_PARK_DISK_V2=1    v2 writer + lineage-aware two-phase boot rebuild
        STRATA_RESUME_DEEPEST=1  a parked session resumes at its own deepest checkpoint,
                                 together with the --prompt-cache-tail engine arg now in
                                 the config's args list
+       STRATA_ADMIT_SHORT_FIRST=8192  short turns (typical agent follow-ups) take the
+                                prefill lane before big cold prompts; a long prompt that
+                                waited STRATA_ADMIT_MAX_WAIT_S (30 s) counts as short,
+                                so nothing starves
        STRATA_COW_JOIN_HH, STRATA_COW_SHARED are closed-negative experiments; leave off.
      Merge gates (optional, from this tree): build with -DSTRATA_BUILD_CONVERSATION_TESTS=ON and run
      the conversation_cache_test and park_disk_boot_test targets.
