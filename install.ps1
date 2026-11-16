@@ -192,7 +192,7 @@ $blobTargets = @{
 }
 if (-not (Test-Path hydragen-local.json)) {
   $cfg = Get-Content configs/strata-iq3xxs-m25-0213-ctx131k.json -Raw | ConvertFrom-Json
-  $cfg.exe = (Join-Path $PWD "engine\build\hydragen.exe") -replace '\\','/'
+  $cfg.exe = ($BIN -replace '\\','/')
   $cfg.log = (Join-Path $PWD "logs\strata.log") -replace '\\','/'
   foreach ($d in @("logs", "park-disk")) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
   $cfg.env | Add-Member -Force -NotePropertyMembers @{
