@@ -33,6 +33,36 @@ surfaces (all overridable by env):
 `bash -n` and the PowerShell AST parser both clean; the written env block was
 key-checked against a rewritten `hydragen-local.json`.
 
+## §169 fork knobs renamed to HG_*: fork-only env names read HG_ first, STRATA_ spelling falls back (2026-11-16)
+
+Per §168's inventory, the thirteen env names introduced by this campaign
+(park-disk tier family: PARK_COW, PARK_DISK, _MIB, _V2, _MIN_FREE_MIB; deep
+resume; the CoW arena / slots / fork / join / shared / permute experiments)
+are fork-only, so renaming them costs nothing and gains legibility. The engine
+now reads the HG_ spelling first and falls back to the legacy STRATA_
+spelling - pre-rename configs and containers keep working untouched. Upstream-
+derived knobs (ADMIT_*, the coalesce family, PARK_TRACE / PARK_ASYNC /
+PARK_VRAM_MIB, CRASH_BT) stay plain STRATA_ reads; the identifier diff against
+the vendored base confirmed zero overlap either way.
+
+Mechanics: new header strata/core/hg_env.hpp (HG_-first getenv + u64
+wrapper); read sites converted in generate.cpp (9), conversation_park_disk.cpp
+(2, covering the pd_env_u64 wrapper), layer.cpp (1). The installers write HG_
+names into hydragen-local.json; HOW_IT_WORKS, UPSTREAM_DELTA and the README
+coexistence note state the naming rule.
+
+Verified on the reference host: merge gates park_disk_boot_test (38 checks)
+and conversation_cache_test (4842 checks) green on the renamed tree; a boot
+with only the legacy STRATA_ spelling confirmed the fallback, then the HG_
+boot went canonical - serve process and engine child each carry the five
+HG_ names, and /metrics reports park_disk enabled, budget_mib 65536, 40
+entries / 68.5 GiB store, 0 refused. One restart race surfaced and was
+re-run clean: the second boot refused with "too little free VRAM" while the
+first boot's engine still held the GPU - restart-race law, not a rename bug.
+
+The second box still runs its pre-rename image on legacy spellings via the
+fallback, by design; it picks the HG_ names up with its next image rebuild.
+
 ## §168 upstream-delta inventory: every v0.2.13 difference classified; lever knobs found to be upstream features (2026-11-16)
 
 The repo carried the delta as history (vendored base merge, 16 individually

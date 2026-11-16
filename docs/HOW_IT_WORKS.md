@@ -25,18 +25,21 @@ donor's host K/V buffer segments as verified views — only the tail is copied.
 **Knobs.** The VRAM funding mechanisms (global arenas, admission fork with page
 ref-counting) are compiled into this engine and always on — that is the product.
 The canonical serving stack is wired by the installer into `hydragen-local.json`:
-`STRATA_PARK_COW=1` (host-tier parked dedup, CoW parks), a park-disk v2 tier
-(`STRATA_PARK_DISK=<dir>` + `STRATA_PARK_DISK_V2=1`, with `STRATA_PARK_DISK_MIB=65536`
+`HG_PARK_COW=1` (host-tier parked dedup, CoW parks), a park-disk v2 tier
+(`HG_PARK_DISK=<dir>` + `HG_PARK_DISK_V2=1`, with `HG_PARK_DISK_MIB=65536`
 sized for the 64 GB-RAM class — a tier pinned at a larger cap measurably decays
 steady-state throughput on such hosts) that keeps parked sessions
-cross-boot at view-mount cost, and `STRATA_RESUME_DEEPEST=1` + the
+cross-boot at view-mount cost, and `HG_RESUME_DEEPEST=1` + the
 `--prompt-cache-tail` arg so a parked session resumes at its own deepest
 checkpoint instead of re-reading its tail. `STRATA_ADMIT_SHORT_FIRST=8192` gives
 short agent turns the prefill lane before big cold prompts (a long prompt that
 waited `STRATA_ADMIT_MAX_WAIT_S`, 30 s, counts as short — nothing starves).
-`STRATA_COW_JOIN_HH` /
-`STRATA_COW_SHARED` are the closed-negative experiments, kept default-off for
-roomier substrates.
+`HG_COW_JOIN_HH` /
+`HG_COW_SHARED` are the closed-negative experiments, kept default-off for
+roomier substrates. Naming rule for knobs: fork-introduced names read `HG_*`
+first with the legacy `STRATA_*` spelling as fallback; upstream-derived knobs
+(`STRATA_ADMIT_*`, the coalesce family, `STRATA_PARK_TRACE`/`_ASYNC`/
+`_VRAM_MIB`, `STRATA_CRASH_BT`) keep plain `STRATA_*` reads.
 
 **Eviction rules.** Donors whose anchored child is still resident are not eviction
 candidates (M-C10); the cascade only takes a donor when the departing child was its

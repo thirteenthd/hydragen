@@ -1,4 +1,5 @@
 #include "strata/core/logit_bias.hpp"
+#include <strata/core/hg_env.hpp>
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
 // THE DRIVER, and the first program in this project that answers a question.  Everything below it is a
@@ -4323,16 +4324,16 @@ int main(int argc, char** argv) {
     }
     strata::core::qsa_set_kv_resident(o.kv_resident);
     {   // cow-m1: global K/V slot arenas (opt-in; streamed INT8 only)
-        const char* en = std::getenv("STRATA_COW_ARENA");
-        const char* ns = std::getenv("STRATA_COW_ARENA_SLOTS");
+        const char* en = hg_getenv("STRATA_COW_ARENA");
+        const char* ns = hg_getenv("STRATA_COW_ARENA_SLOTS");
         if (en != nullptr && en[0] == '1' && o.kv_resident > 0 && o.kv == "int8") {
             strata::core::qsa_set_cow_arena(ns != nullptr ? std::atoll(ns)
                                                           : 4 * (o.kv_resident / 4));   // page_size = 4 cells
-            const char* jh = std::getenv("STRATA_COW_JOIN_HH");
+            const char* jh = hg_getenv("STRATA_COW_JOIN_HH");
             if (jh != nullptr) strata::core::qsa_set_cow_join_hh(std::atoll(jh));
-            const char* csh = std::getenv("STRATA_COW_SHARED");
+            const char* csh = hg_getenv("STRATA_COW_SHARED");
             if (csh != nullptr) strata::core::qsa_set_cow_shared(std::atoll(csh));
-            const char* sc = std::getenv("STRATA_COW_SLOT_CELLS");
+            const char* sc = hg_getenv("STRATA_COW_SLOT_CELLS");
             if (sc != nullptr) strata::core::qsa_set_cow_slot_cells(std::atoll(sc));
         }
     }
@@ -12262,7 +12263,7 @@ int main(int argc, char** argv) {
             // M-C2 host-tier CoW: the longest parked conversation this prompt starts with (proper prefix:
             // never itself) anchors the park; its image's K/V bytes become views, not a second copy.
             static const bool park_cow = [] {
-                const char* v = std::getenv("STRATA_PARK_COW");
+                const char* v = hg_getenv("STRATA_PARK_COW");
                 return v != nullptr && v[0] == '1';
             }();
             const strata::core::SavedConversation* anchor_img = nullptr;
@@ -14461,7 +14462,7 @@ int main(int argc, char** argv) {
         // round trip through host memory, which costs ~40-90 ms per admission on a 4-card split); each device is
         // synchronized once before and once after.  Opt-in: STRATA_SLOT_COPY_DIRECT=1 (default: the host path).
         static const bool cow_fork_on = [] {
-            const char* v = std::getenv("STRATA_COW_FORK");
+            const char* v = hg_getenv("STRATA_COW_FORK");
             return v != nullptr && v[0] == '1';
         }();
         static const bool slot_copy_direct = [] {
@@ -16440,7 +16441,7 @@ int main(int argc, char** argv) {
             // 1.4 s, threw it away with session_zero and re-read all 100k in 38.7 s). With
             // STRATA_RESUME_DEEPEST the tiers compete: the deeper prefix wins, and the winner's own
             // checkpoints set the resume depth (mounted, not reread-from).
-            static const bool deep_resume = std::getenv("STRATA_RESUME_DEEPEST") != nullptr;
+            static const bool deep_resume = hg_getenv("STRATA_RESUME_DEEPEST") != nullptr;
             decltype(park_disk.best(ids, req_imgs, want_cvec)) disk_best;
             if (deep_resume && park_disk.enabled())
                 disk_best = park_disk.best(ids, req_imgs, want_cvec);
@@ -16469,7 +16470,7 @@ int main(int argc, char** argv) {
                         // donor with a longer shared token prefix turns the byte-identical aligned prefix
                         // into views (verify-then-view), so the fleet keeps owning only its tails.
                         static const bool pd_cow = [] {
-                            const char* v = std::getenv("STRATA_PARK_COW");
+                            const char* v = hg_getenv("STRATA_PARK_COW");
                             return v != nullptr && v[0] == '1';
                         }();
                         if (pd_cow) {

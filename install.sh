@@ -139,12 +139,12 @@ for i, tok in enumerate(args):
 cfg["cwd"] = repo
 cfg["tokenizer"] = os.path.join(md, "packs", "iq3_xxs", "tokenizer")
 env = cfg.setdefault("env", {})
-env["STRATA_PARK_COW"] = "1"
-env["STRATA_PARK_DISK"] = os.environ["PARK_DISK_DIR"]
-env.setdefault("STRATA_PARK_DISK_MIB", os.environ.get("DET_MIB") or "65536")
+env["HG_PARK_COW"] = "1"
+env["HG_PARK_DISK"] = os.environ["PARK_DISK_DIR"]
+env.setdefault("HG_PARK_DISK_MIB", os.environ.get("DET_MIB") or "65536")
 env.setdefault("STRATA_ADMIT_SHORT_FIRST", "8192")
-env["STRATA_PARK_DISK_V2"] = "1"
-env["STRATA_RESUME_DEEPEST"] = "1"
+env["HG_PARK_DISK_V2"] = "1"
+env["HG_RESUME_DEEPEST"] = "1"
 if "--conversation-cache-min-free-mib" not in args:
     args += ["--conversation-cache-min-free-mib", "512"]
 if "--prompt-cache-tail" not in args:
@@ -173,23 +173,26 @@ Next steps
      Dashboard + Monitor (concurrency panel): http://127.0.0.1:8181/
      LAN serving: set "host": "0.0.0.0" and "api_key" in the config (the key gates the
      API; the dashboard page itself is open, so keep it on a trusted network).
-  3. The canonical serving stack is already wired into hydragen-local.json:
-       STRATA_PARK_COW=1        host-tier parked-session dedup (CoW parks) - ~40% less
+  3. The canonical serving stack is already wired into hydragen-local.json.
+     Fork-introduced knobs carry an HG_ prefix so they are distinguishable from
+     upstream Strata knobs (which keep their STRATA_ names); the legacy
+     STRATA_* spelling of the HG_ knobs still works as a fallback.
+       HG_PARK_COW=1            host-tier parked-session dedup (CoW parks) - ~40% less
                                 parked RAM on agent workloads (docs/FINAL_REPORT.md)
-       STRATA_PARK_DISK=DIR     the cross-boot park-disk tier under it (a park-disk/ dir
-                                was created here); STRATA_PARK_DISK_MIB caps its budget
+       HG_PARK_DISK=DIR         the cross-boot park-disk tier under it (a park-disk/ dir
+                                was created here); HG_PARK_DISK_MIB caps its budget
                                 (default 65536 = 64 GiB; on a 64 GB-RAM host a tier pinned
                                 at a bigger cap measurably decays steady-state throughput -
                                 raise it only with several x that cap in system RAM)
-       STRATA_PARK_DISK_V2=1    v2 writer + lineage-aware two-phase boot rebuild
-       STRATA_RESUME_DEEPEST=1  a parked session resumes at its own deepest checkpoint,
+       HG_PARK_DISK_V2=1        v2 writer + lineage-aware two-phase boot rebuild
+       HG_RESUME_DEEPEST=1      a parked session resumes at its own deepest checkpoint,
                                 together with the --prompt-cache-tail engine arg now in
                                 the config's args list
        STRATA_ADMIT_SHORT_FIRST=8192  short turns (typical agent follow-ups) take the
                                 prefill lane before big cold prompts; a long prompt that
                                 waited STRATA_ADMIT_MAX_WAIT_S (30 s) counts as short,
-                                so nothing starves
-       STRATA_COW_JOIN_HH, STRATA_COW_SHARED are closed-negative experiments; leave off.
+                                so nothing starves  (upstream feature, measured here)
+       HG_COW_JOIN_HH, HG_COW_SHARED are closed-negative experiments; leave off.
      Merge gates (optional, from this tree): build with -DSTRATA_BUILD_CONVERSATION_TESTS=ON and run
      the conversation_cache_test and park_disk_boot_test targets.
 EON

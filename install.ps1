@@ -149,10 +149,10 @@ if (-not (Test-Path hydragen-local.json)) {
   $cfg.log = (Join-Path $PWD "logs\strata.log") -replace '\\','/'
   foreach ($d in @("logs", "park-disk")) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
   $cfg.env | Add-Member -Force -NotePropertyMembers @{
-    STRATA_PARK_COW = "1"; STRATA_PARK_DISK_V2 = "1"; STRATA_PARK_DISK_MIB = "$DetMib";
+    HG_PARK_COW = "1"; HG_PARK_DISK_V2 = "1"; HG_PARK_DISK_MIB = "$DetMib";
     STRATA_ADMIT_SHORT_FIRST = "8192";
-    STRATA_RESUME_DEEPEST = "1";
-    STRATA_PARK_DISK = (Join-Path $PWD "park-disk") -replace '\\','/'
+    HG_RESUME_DEEPEST = "1";
+    HG_PARK_DISK = (Join-Path $PWD "park-disk") -replace '\\','/'
   }
   for ($i = 0; $i -lt $cfg.args.Count; $i++) {
     if ($blobTargets.ContainsKey($cfg.args[$i]) -and $i + 1 -lt $cfg.args.Count) {

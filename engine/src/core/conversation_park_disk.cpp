@@ -1,6 +1,7 @@
 // M-C3a implementation. All file I/O goes through conversation_file.cpp (STRSES v1): identity binding,
 // bounded parse, payload hashes, temp-file-and-rename publish, mode 0600 files under a 0700 folder.
 #include "strata/core/conversation_park_disk.hpp"
+#include <strata/core/hg_env.hpp>
 #include "strata/core/conversation_snapshot.hpp"
 
 #include <algorithm>
@@ -29,7 +30,7 @@ namespace strata::core {
 namespace {
 
 std::optional<uint64_t> pd_env_u64(const char* name) {
-    const char* v = std::getenv(name);
+    const char* v = hg_getenv(name);
     if (!v || !*v) return std::nullopt;
     char* end = nullptr;
     const unsigned long long n = std::strtoull(v, &end, 10);
@@ -92,7 +93,7 @@ bool pd_key_from_hex(const std::string& hex, uint64_t& k0, uint64_t& k1) {
 } // namespace
 
 std::optional<ParkDisk::Options> ParkDisk::from_env() {
-    const char* dir = std::getenv("STRATA_PARK_DISK");
+    const char* dir = hg_getenv("STRATA_PARK_DISK");
     if (!dir || !*dir) return std::nullopt;
     Options o;
     o.dir = dir;

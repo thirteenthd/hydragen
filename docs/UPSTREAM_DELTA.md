@@ -60,8 +60,13 @@ Not our code — worth knowing before crediting or debugging it as ours:
 
 The installed binary is `hydragen` and serve accepts `--engine hydragen`, so
 an upstream Strata install and HydraGen coexist on one machine. Internals —
-CMake target, source names, every `STRATA_*` env var — deliberately keep
-upstream identity for mergeability and provenance.
+CMake target, source names, and every upstream-derived `STRATA_*` env var —
+deliberately keep upstream identity for mergeability and provenance. The
+thirteen fork-introduced env names (park-disk tier family, parked-session CoW,
+deep resume, the CoW arena/plumbing experiments) read `HG_*` first — e.g.
+`HG_PARK_COW`, `HG_PARK_DISK_MIB`, `HG_RESUME_DEEPEST` — with the legacy
+`STRATA_*` spelling honored as a fallback, so a process environment instantly
+shows which knobs are ours and which are upstream's.
 
 ## Commit granularity in this repo
 
