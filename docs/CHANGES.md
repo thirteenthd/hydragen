@@ -12,6 +12,23 @@ Newest first; section numbers are stable, so §N always refers to the same entry
 
 
 
+## §176 — README restructured: measured block leads under the banner; one consolidated Install section (2026-11-17)
+
+Layout pass, no content changes to any number:
+
+- The measured-benchmark block (was "The headline") now sits directly under
+  the badge line with no section header of its own — first thing a visitor
+  reads is the before/after table and what it means in practice.
+- All install text (requirements, try-it commands, prebuilt/SmartScreen/
+  glibc notes, dashboard line) merged with the old "Install notes"
+  (first-run behavior, model blobs, living beside upstream Strata) into one
+  `## Install` section. One duplicate prerequisite sentence folded out; one
+  stale sentence ("A source build is the only option" — predates the
+  prebuilt-release flow) corrected to state both routes.
+- Table-of-contents counters fixed to 181 (they had drifted at 170/167).
+
+Counter: 181.
+
 ## §175 — concurrency wording held to the host-vs-decode line (2026-11-17)
 
 A skeptic pass over the §174 headline caught a real seam: "eight

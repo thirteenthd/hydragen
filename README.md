@@ -2,55 +2,11 @@
 
 ### Eight 100,000-token conversations live at once. Two answering at a time. All of them interactive. On the GPU already in your desktop.
 
-![context per chat: 131k tokens](https://img.shields.io/badge/context_per_chat-131k_tokens-2f81f7) ![hosted 100k-deep chats: 8](https://img.shields.io/badge/hosted_100k_deep_chats-8_measured-2f81f7) ![batched decode: 2-up](https://img.shields.io/badge/batched_decode-2up-2f81f7) ![warm resume at 100k depth: ~2 s](https://img.shields.io/badge/warm_resume_at_100k-~2_s-2f81f7) ![idle chat return: 0.1 MiB](https://img.shields.io/badge/idle_chat_return-0.1_MiB-2f81f7) [![notarized experiments: 180](https://img.shields.io/badge/notarized_experiments-180_incl._failures-6e7681)](docs/CHANGES.md)
+![context per chat: 131k tokens](https://img.shields.io/badge/context_per_chat-131k_tokens-2f81f7) ![hosted 100k-deep chats: 8](https://img.shields.io/badge/hosted_100k_deep_chats-8_measured-2f81f7) ![batched decode: 2-up](https://img.shields.io/badge/batched_decode-2up-2f81f7) ![warm resume at 100k depth: ~2 s](https://img.shields.io/badge/warm_resume_at_100k-~2_s-2f81f7) ![idle chat return: 0.1 MiB](https://img.shields.io/badge/idle_chat_return-0.1_MiB-2f81f7) [![notarized experiments: 181](https://img.shields.io/badge/notarized_experiments-181_incl._failures-6e7681)](docs/CHANGES.md)
 
 Every number measured on one RTX 3080 Ti and quality-gated before it counted;
 the naive tier moves ~2 GiB to return an idle chat. No multi-GPU. No
 datacenter card. No answer-quality compromise.
-
-**Requirements:** NVIDIA Ampere GPU with **12 GB+ VRAM** (RTX 3060 Ti / 3080
-Ti class) and **64 GB+ system RAM** — conversation memory streams to pinned
-host RAM — plus an NVMe, CUDA toolkit 11+/12, and Python 3.10+.
-
-**Try it** — the installer builds the engine from source, detects your GPU
-(model, VRAM, compute capability) and system RAM, sizes the park-tier budget to
-your machine, and writes a default `hydragen-local.json` (localhost, canonical
-stack pre-wired):
-
-Linux:
-
-```bash
-git clone https://github.com/thirteenthd/hydragen.git && cd hydragen
-./install.sh
-.venv/bin/python engine/serve/server.py --engine hydragen --config hydragen-local.json
-```
-
-Windows (PowerShell):
-
-```powershell
-git clone https://github.com/thirteenthd/hydragen.git; cd hydragen
-.\install.ps1
-.venv\Scripts\python.exe engine\serve\server.py --engine hydragen --config hydragen-local.json
-```
-
-Both installers first fetch a **prebuilt CUDA engine** from this repo's GitHub
-Releases (RTX 30/40/50 fat binary, bundled CUDA runtime libs, SHA-256-verified
-against the release manifest) and fall back to a source build automatically.
-The prebuilt binary is unsigned, like every community CUDA build: if you
-download the `.zip` yourself in a browser, Windows SmartScreen may show
-"Windows protected your PC" — *More info → Run anyway*. The installer route
-adds no browser mark, unblocks what it extracts, and always verifies the hash.
-On Linux the installer also compares your distro's glibc against the binary's
-build floor and falls back by itself. Prefer to run only code you compiled
-yourself? `./install.sh --build-from-source` / `.\install.ps1 -BuildFromSource`
-skips the download entirely — same engine, built on your machine, just more
-time and the toolchain prerequisites.
-
-OpenAI-compatible API + live concurrency dashboard → `http://127.0.0.1:8181/`
-(point the config's model-blob paths at your own model set first — see
-Install notes).
-
-## The headline
 
 One fleet of agent sessions, each holding a ~100k-token conversation, on one
 RTX 3080 Ti (12 GB). Same benchmark, run **before** and **after** HydraGen's
@@ -122,23 +78,66 @@ duplication. The full layer map: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md).
 | [docs/MILESTONES.md](docs/MILESTONES.md) | every milestone marker (M-C10c, forkb4, b3a…) defined with outcome and progression |
 | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | methodology, every measurement table, how to reproduce them |
 | [docs/MODELS.md](docs/MODELS.md) | model files: what to get, where it comes from, one-command fetch via Strata setup |
-| [docs/CHANGES.md](docs/CHANGES.md) | the journey: 170 notarized entries, newest first — reads bottom-up from day one |
+| [docs/CHANGES.md](docs/CHANGES.md) | the journey: 181 notarized entries, newest first — reads bottom-up from day one |
 | [docs/FINAL_REPORT.md](docs/FINAL_REPORT.md) | the Nov-12 program snapshot (pre-disk-tier era) |
 | [docs/laws/](docs/laws/) | engineering laws distilled the hard way |
 | `engine/` | our fork of [Strata](https://github.com/Niko1221/Strata) (MIT): v0.2.13 + the full M-C1→M-C10 chain (tip: M-C10c); per-piece classification in [docs/UPSTREAM_DELTA.md](docs/UPSTREAM_DELTA.md) |
 | [docs/UPSTREAM_DELTA.md](docs/UPSTREAM_DELTA.md) | what we re-engineered, what is net-new vs upstream Strata, and which shipped defaults are upstream features we measured and enabled |
 | `configs/` + `bench/` | canonical ctx-131k serving config + launcher, and the gate suite every landing must pass (quality battery, concurrency ladder, park-ladders) |
 
-## Install notes
+## Install
 
-Prerequisites: NVIDIA driver + CUDA toolkit + Python 3.10+ (Windows adds an
-MSVC C++ toolchain; both installers tell you exactly what is missing and how to
-get it). The installers provision `.venv` (cmake + ninja from pip), compile the
+**Requirements:** NVIDIA Ampere GPU with **12 GB+ VRAM** (RTX 3060 Ti / 3080
+Ti class) and **64 GB+ system RAM** — conversation memory streams to pinned
+host RAM — plus an NVMe, CUDA toolkit 11+/12, and Python 3.10+.
+
+**Try it** — the installer builds the engine from source, detects your GPU
+(model, VRAM, compute capability) and system RAM, sizes the park-tier budget to
+your machine, and writes a default `hydragen-local.json` (localhost, canonical
+stack pre-wired):
+
+Linux:
+
+```bash
+git clone https://github.com/thirteenthd/hydragen.git && cd hydragen
+./install.sh
+.venv/bin/python engine/serve/server.py --engine hydragen --config hydragen-local.json
+```
+
+Windows (PowerShell):
+
+```powershell
+git clone https://github.com/thirteenthd/hydragen.git; cd hydragen
+.\install.ps1
+.venv\Scripts\python.exe engine\serve\server.py --engine hydragen --config hydragen-local.json
+```
+
+Both installers first fetch a **prebuilt CUDA engine** from this repo's GitHub
+Releases (RTX 30/40/50 fat binary, bundled CUDA runtime libs, SHA-256-verified
+against the release manifest) and fall back to a source build automatically.
+The prebuilt binary is unsigned, like every community CUDA build: if you
+download the `.zip` yourself in a browser, Windows SmartScreen may show
+"Windows protected your PC" — *More info → Run anyway*. The installer route
+adds no browser mark, unblocks what it extracts, and always verifies the hash.
+On Linux the installer also compares your distro's glibc against the binary's
+build floor and falls back by itself. Prefer to run only code you compiled
+yourself? `./install.sh --build-from-source` / `.\install.ps1 -BuildFromSource`
+skips the download entirely — same engine, built on your machine, just more
+time and the toolchain prerequisites.
+
+OpenAI-compatible API + live concurrency dashboard → `http://127.0.0.1:8181/`
+(point the config's model-blob paths at your own model set first — **Model
+blobs** below).
+
+**First run and build:** every installer tells you exactly what a missing
+prerequisite is and how to get it (Windows adds an MSVC C++ toolchain to the list
+above). The installers provision `.venv` (cmake + ninja from pip), compile the
 vendored engine with upstream release flags, and write `hydragen-local.json`
 from the canonical config. Default build arch is sm_86 — the 3060 Ti / 3080 Ti
 this program was developed on; override with `HYDRAGEN_CUDA_ARCH` (e.g.
-`89-real` for RTX 40-series). A source build is the only option: prebuilt
-Strata release binaries do not contain this engine's chain. Verified
+`89-real` for RTX 40-series). A source build is always available: prebuilt Strata release binaries
+alone do not contain this engine's chain — the installers compile this repo's
+engine when no matching prebuilt is fetched. Verified
 end-to-end: both installers from a fresh clone build a working engine on a
 3080 Ti.
 
