@@ -12,6 +12,29 @@ Newest first; section numbers are stable, so §N always refers to the same entry
 
 
 
+## §175 — concurrency wording held to the host-vs-decode line (2026-11-17)
+
+A skeptic pass over the §174 headline caught a real seam: "eight
+conversations at a time" implies eight-way simultaneous generation. The
+measured serving envelope is: **eight ~100k-deep sessions hosted live, at
+most two generating tokens at any instant** (`--batch 2`); the rest live in
+the conversation cache and queue — the C8 warm-turn TTFT p50 of 21.2 s *is*
+that queue, measured. "8 concurrent" only survives on the concurrent-
+*sessions* reading, so the unattackable version of the actual claim went in
+instead — concurrency without residency:
+
+- H1 → "massive MoE models, a live fleet of deep chats, on consumer 12 GB
+  GPUs."
+- Subhead → "Eight 100,000-token conversations live at once. Two answering
+  at a time. All of them interactive. ..."
+- Badges: "concurrent 100k-token chats: 8" → "hosted 100k-deep chats: 8"
+  plus a new "batched decode: 2-up" badge — the split is stated on the face
+  of the page.
+- GitHub About → "...host up to 8 live ~100k-token agent sessions on one
+  12 GB RTX card (2-up batched decode)..."
+- The performance table already said "queue-bound at this depth"; no numbers
+  changed anywhere. Counter: 180.
+
 ## §174 — headline rebalance: sell the measured envelope, not the old ambition (2026-11-17)
 
 The headline had led with "high-concurrency" ever since the program's first

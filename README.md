@@ -1,8 +1,8 @@
-# HydraGen — massive MoE models, eight conversations at a time, on consumer 12 GB GPUs
+# HydraGen — massive MoE models, a live fleet of deep chats, on consumer 12 GB GPUs
 
-### Eight deep conversations. 131,000 tokens each. Simultaneously. On the GPU already in your desktop.
+### Eight 100,000-token conversations live at once. Two answering at a time. All of them interactive. On the GPU already in your desktop.
 
-![context per chat: 131k tokens](https://img.shields.io/badge/context_per_chat-131k_tokens-2f81f7) ![concurrent 100k-token chats: 8](https://img.shields.io/badge/concurrent_100k_chats-8_measured-2f81f7) ![warm resume at 100k depth: ~2 s](https://img.shields.io/badge/warm_resume_at_100k-~2_s-2f81f7) ![idle chat return: 0.1 MiB](https://img.shields.io/badge/idle_chat_return-0.1_MiB-2f81f7) [![notarized experiments: 179](https://img.shields.io/badge/notarized_experiments-179_incl._failures-6e7681)](docs/CHANGES.md)
+![context per chat: 131k tokens](https://img.shields.io/badge/context_per_chat-131k_tokens-2f81f7) ![hosted 100k-deep chats: 8](https://img.shields.io/badge/hosted_100k_deep_chats-8_measured-2f81f7) ![batched decode: 2-up](https://img.shields.io/badge/batched_decode-2up-2f81f7) ![warm resume at 100k depth: ~2 s](https://img.shields.io/badge/warm_resume_at_100k-~2_s-2f81f7) ![idle chat return: 0.1 MiB](https://img.shields.io/badge/idle_chat_return-0.1_MiB-2f81f7) [![notarized experiments: 180](https://img.shields.io/badge/notarized_experiments-180_incl._failures-6e7681)](docs/CHANGES.md)
 
 Every number measured on one RTX 3080 Ti and quality-gated before it counted;
 the naive tier moves ~2 GiB to return an idle chat. No multi-GPU. No
@@ -84,7 +84,7 @@ What that means in practice, at ~100k-token depth on a 12 GB card:
 
 ## Why this exists
 
-**The goal is more simultaneous conversations, not one faster request.** Many
+**The goal is more live conversations, not one faster request.** Many
 users (or many cooperating agents) each keeping a long, growing chat — tens of
 thousands of tokens deep — on one small consumer graphics card. The datacenter
 answer (buy a bigger card, or several) is off the table by design.
