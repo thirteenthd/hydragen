@@ -12,6 +12,28 @@ Newest first; section numbers are stable, so §N always refers to the same entry
 
 
 
+## §174 — headline rebalance: sell the measured envelope, not the old ambition (2026-11-17)
+
+The headline had led with "high-concurrency" ever since the program's first
+weeks, when 32–64 simultaneous streams were the ambition. The box has always
+ended up serving 4–8 concurrent 100k-token-deep chats on one 12 GB card
+(`--batch 2`, eight conversation-cache slots), and every body number in the
+repo — badges, "Measured expectations" — already said so. Only the marquee
+still sold the dream. The promise now matches the product:
+
+- README H1: "high-concurrency MoE inference on 12 GB GPUs" → "massive MoE
+  models, eight conversations at a time, on consumer 12 GB GPUs"; the subhead
+  gains "Simultaneously." — the concurrency claim is now a number you can
+  check, not an adjective.
+- GitHub About: led with "Run massive MoE models on consumer GPUs —"; the
+  rest of that line was already measured (8 concurrent ~100k sessions, 2x
+  wall / 2x warm-TTFT / 25x fewer lost prefixes vs stock).
+- `docs/FINAL_REPORT.md`: left intact — its body already states the mission
+  as "real decode concurrency (4+ simultaneous streams)"; the program title
+  there is a historical marker, not a live promise.
+
+No code, no config, no flag changes. Counter: 179.
+
 ## §173 tokenizer-missing startup error made actionable; installers pre-warn on an unbuilt pack (2026-11-16)
 
 A fresh Windows install that ran the installer but not the model-setup step hit
