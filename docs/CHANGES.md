@@ -408,6 +408,60 @@ under expert-stream re-reads, not link).
 Suite rerun (run2, same four arms, warm box this time): measures run-to-run variance
 and steady-state tier behavior; results appended to this entry when complete.
 
+## §181 — engine/ synced to upstream Strata 0.1.60; answer-stream delta and re-notarized battery constants (2026-11-18)
+
+`engine/` is now upstream 0.1.60 (`38f63bc5`) with the fork overlay reapplied: 49 fork
+files re-applied, 18 real three-way merges, and the DeepSeek-V4.1 family deletion this
+fork carried is adopted upstream-side (0.1.60 removed it too, so that overlay patch
+retires). Serve/, tests and packaging were re-merged against the fork's Nov-6 vendoring
+point rather than the 0.1.42 engine base, which avoids resurrecting stale vendored
+content.
+
+Two fork regressions were caught before landing, both from files adopted wholesale:
+the installed-artifact rename (`OUTPUT_NAME "hydragen"`, restored in
+`cmake/strata_gpu_engine.cmake`) and the park-disk source registration, which since
+M-C3 had been injected at build time by `mc3_patch.py` and is now registered in-tree in
+the same cmake file. Fork-wire greps (`hg_getenv` family, ParkDisk/CoW wiring,
+`is_view_donor`/`guarded_`, `RESUME_DEEPEST`) all pass on the merged tree.
+
+Build and tests on modelserver01 (CUDA 13.1, arch 86-real, `STRATA_GEOMETRY=flash_next`):
+the build is green and ctest reports 322/352. The 22 GPU-parity failures reproduce
+byte-identically on the previous 0.1.41-era build on the same host (pre-existing, with
+the live serving arm on the card), and 10 failures are new 0.1.60 tests (nvfp4/q36
+families) whose skip behavior on consumer cards was not investigated.
+
+Answer stream, measured cold-boot with the standard 200 s settle protocol, four
+configurations each side. QC0-QC6 are byte-identical across every 0.1.60 variant
+(default, `STRATA_KV_HOST_DMA=0`, `-DSTRATA_MMQ=ON`) and reproduce across repeated cold
+boots of the previous build; QC7 (the longest prompt) forks one token-pattern deep:
+the previous stream writes `**Answer:**\n\nThe FASTA record starts with…` and 0.1.60
+writes `The FASTA record starts with…`. MMQ on/off and the KV host-DMA default
+(0.1.60 turns it on for CUDA; it only stages host copies, it cannot move logits) were
+tested as candidates and neither restores the old wording; the fork does not carry a
+knob that reproduces 0.1.41 prefill numerics. The fork therefore accepts 0.1.60's
+stream as the new baseline - this is the same drift class upstream's own quality suite
+documents between releases (top-1 agreement 97.7-98.2%) - and re-notarizes the battery
+constants on the canonical arm (modelserver01 s180 config, tail skip 0 per §180):
+
+```
+QC0 To calculate $17 \times 23$, we can use the standard multiplication method or break it down into simpler
+QC1 The sky appears blue because molecules in the Earth's atmosphere scatter sunlight more effectively at shorter
+QC2 Fast cache holds the heat,\nRAM waits in silent rows,\nData flows like streams.
+QC3 Le serveur démarre rapidement.
+QC4 Here are several implementations of the Fibonacci function in Python, ranging from simple to optimized:\n\n###
+QC5 To determine which fraction is larger, $\frac{9}{10}$ or $\frac{10}{11}$, we can use a few different
+QC6 97, 101, 103
+QC7 The FASTA record starts with the character **`>`** (greater-than sign), and GTIN stands for **Global Trade Ite
+```
+
+Acceptance additionally ran the C4 concurrency harness on the same arm: 24/24 requests,
+needle 4/4, 2.43 M prompt tokens, memory-guard pauses 0, crash lines 0, park-disk store
+at 118 sessions / 4,096 chunks, engine alive after the run.
+
+The production Windows arm (RTX 3090) keeps the 0.1.41-era binary until an explicit
+switch; switching it is a deliberate decision, since it moves the served answers onto
+this section's stream. Prior §179 and earlier numbers measured the 0.1.41-era stream.
+
 ## §180 — Route tail skip disabled on all arms (`STRATA_ROUTE_TAIL_SKIP=0`)
 
 Upstream 0.1.42 made `STRATA_ROUTE_TAIL_SKIP=7` the CUDA-serve default [1]: a *missed* expert that
