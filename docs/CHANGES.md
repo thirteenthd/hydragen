@@ -407,3 +407,33 @@ under expert-stream re-reads, not link).
 
 Suite rerun (run2, same four arms, warm box this time): measures run-to-run variance
 and steady-state tier behavior; results appended to this entry when complete.
+
+## §180 — Route tail skip disabled on all arms (`STRATA_ROUTE_TAIL_SKIP=0`)
+
+Upstream 0.1.42 made `STRATA_ROUTE_TAIL_SKIP=7` the CUDA-serve default [1]: a *missed* expert that
+every token of a verify window routes at rank 7-9 (the smallest top-10 weights) is neither copied
+nor computed; its contribution is zero, without renormalisation. Upstream measures +10-20% decode
+on 12-16 GB cards, and states the answers differ slightly (KL 0.003-0.006 against 0.1.41
+behavior, top-1 agreement 97.7-98.2%, same-engine floor 0.0006-0.0007).
+
+Found on this fork 2026-11-18: the production arm's engine log reported 1,104,355 skipped experts
+since start - the mechanism was ON on the serving answer stream, while every exactness and battery
+gate in this repo runs with `STRATA_ROUTE_TAIL_SKIP=0` (the identity-gate flag set). The greedy
+stream hashes, KL figures and battery results notarized here therefore measured a different answer
+path than production served. Two fork-specific side effects beyond the quality question: a skipped
+expert is never copied in, so it never enters the arena or the adaptive-LRU usage stats (the async
+tier under-sees rank-7+ tail experts); and the draft-acceptance cost of skipping (which upstream
+flags as net-negative near a full cache) was never measured against this fork's
+`--spec 4 --coupled-draft` configuration.
+
+Decision: off on all arms - reported decode speed describes the stream the answers actually come
+from. The upstream +10-20% decode gain is given up. Pinned in the production runtime env, both
+reference configs shipped here (`configs/strata-iq3s-m25-0213-ctx131k.json`,
+`configs/strata-iq3xxs-m25-0213-ctx131k.json`) and all four modelserver01 experimental run configs.
+(The live modelserver01 arm runs `--batch 2`, under which upstream already excludes the mechanism;
+pinning the env makes the exclusion explicit rather than incidental.) Turning it back on is a
+config change (`=7`); doing so would first take an A/B of quality-per-token-cost on this fork's
+model and quant, which has never been run.
+
+[1] `engine/docs/DETAILS.md`: the `STRATA_ROUTE_TAIL_SKIP (7)` settings row and the 0.1.42
+    measurements table.
