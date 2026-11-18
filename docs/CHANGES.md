@@ -29,6 +29,19 @@ Layout pass, no content changes to any number:
 
 Counter: 181.
 
+## §179 — S0 memory-tier levers A/B on the reference machine: mmap file tier loses to the resident arena when the pack fits RAM (2026-11-18)
+
+First rung of the concurrency milestone ladder run on the 12 GB reference machine (RTX 3080 Ti, 60 GiB RAM, IQ3_XXS canonical stack, batch 2). Three arms, one boot swap each, bench N=1/2/4/8 (agg tok/s):
+
+- A0 baseline (resident expert arena): 66.8 / 61.2 / 60.4 / 53.9
+- A1 `--mmap-experts` (experts served from the GGUF shards via page cache, no experts.bin): 55.3 / 34.6 / 44.7 / 46.2
+- A2 A1 + `STRATA_IO_PF_STAGE=1 STRATA_IO_PF_SCHED=1` (prefetch staging + 149 window byte-budget scheduler): 43.9 / 39.2 / 45.7 / 44.0
+
+Mechanism read from the engine's own file-tier telemetry: the A2 decode windows saw the page cache hold 100% of the decode's expert reads — 94.5 MB from storage (63 major faults) against 35.7 GB of expert reads — so the mmap arms were NOT I/O-bound on this host; the deficit is the per-read access path plus the prefetch scheduler closing its windows (1,387 closed, budget 0 MB/window: nothing to steal when the cache already holds everything). The baseline engine restored after the ladder; canonical state unchanged.
+
+Decisions: (a) the resident arena stays the default everywhere the expert set fits host RAM — the zero-copy file tier is expected to pay only for packs beyond RAM (the IQ3_S-on-64-GiB configuration), which is where S2/S5 will re-test it; (b) the sm_86 decode-flag table verified ON by default in this lineage (STRATA_SM86_PERF is only an off-switch), so there was no table lever to enable; (c) S0 as a free win is CLOSED-NEGATIVE on the reference machine — the ladder's value moves to S1/S2.
+
+
 ## §178 — Installers: IQ3_S model-tier option; repo hygiene (mc3_patches.eml removed) (2026-11-17)
 
 - install.ps1 gains `-Model IQ3_XXS|IQ3_S` and install.sh `--model IQ3_XXS|IQ3_S`; the local
