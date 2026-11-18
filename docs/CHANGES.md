@@ -29,6 +29,18 @@ Layout pass, no content changes to any number:
 
 Counter: 181.
 
+## §178 — Installers: IQ3_S model-tier option; repo hygiene (mc3_patches.eml removed) (2026-11-17)
+
+- install.ps1 gains `-Model IQ3_XXS|IQ3_S` and install.sh `--model IQ3_XXS|IQ3_S`; the local
+  serve config is now wired from the matching canonical config. New configs/strata-iq3s-m25-0213-ctx131k.json
+  is the canonical cow stack applied to the IQ3_S artifacts (same flags and context; IQ3_S pack and
+  shards; the learned-profile key follows the blob name automatically). engine setup already accepted
+  --model IQ3_S — the installers were the IQ3_XXS-only gap.
+- docs/MODELS.md documents the IQ3_S artifact sizes (shard 1 54,817,524,224 B, pinned in
+  engine/setup.py; the 28,800,138,432 B PLE shard shared across tiers; tier needs 64 GB RAM, ~15% slower).
+- mc3_patches.eml (an exported patch-mail from earlier batch work) removed from the repo root —
+  build mail is a working artifact, not repo content.
+
 ## §177 — Park-disk v2 proven on Windows: spill, restore, token-identical resume across a restart (2026-11-17)
 
 Engine change (canonical lineage, then mirrored here): three files — `src/core/conversation_park_disk.cpp`, `include/strata/core/conversation_park_disk.hpp`, `CMakeLists.txt`.

@@ -15,6 +15,7 @@
 #
 #   ./install.sh                       # prebuilt if available, else source (sm_86)
 #   ./install.sh --build-from-source   # never run a downloaded binary; compile locally
+#   ./install.sh --model IQ3_S         # wire the local config for the IQ3_S model tier (default: IQ3_XXS)
 #   HYDRAGEN_CUDA_ARCH=89-real ./install.sh          # RTX 40-series
 #   HYDRAGEN_CUDA_ARCH="86-real;89-real" ./install.sh
 set -euo pipefail
@@ -29,16 +30,19 @@ RELEASE_TAG="prebuilt-1"
 # engine/data/expert-profile.bin. See docs/MODELS.md for sources and the
 # vendored Strata downloader (engine/setup.sh / engine/SETUP.bat).
 MODEL_DIR=""
+MODEL="IQ3_XXS"
 BUILD_FROM_SOURCE=0
 while [ $# -gt 0 ]; do
   case "$1" in
+    --model) MODEL="${2:?--model needs IQ3_XXS or IQ3_S}"; shift 2 ;;
     --model-dir) MODEL_DIR="${2:?--model-dir needs a directory}"; shift 2 ;;
     --build-from-source) BUILD_FROM_SOURCE=1; shift ;;
-    *) echo "install.sh: unknown argument: $1 (try --model-dir DIR, --build-from-source)" >&2; exit 2 ;;
+    *) echo "install.sh: unknown argument: $1 (try --model IQ3_XXS|IQ3_S, --model-dir DIR, --build-from-source)" >&2; exit 2 ;;
   esac
 done
 [ -n "$MODEL_DIR" ] || MODEL_DIR="$PWD/models"
 case "$MODEL_DIR" in /*) ;; *) MODEL_DIR="$PWD/$MODEL_DIR" ;; esac
+case "$MODEL" in IQ3_XXS|IQ3_S) ;; *) echo "install.sh: --model must be IQ3_XXS (default) or IQ3_S (docs/MODELS.md)" >&2; exit 2 ;; esac
 
 # --- environment sizing (auto-detected; override by editing hydragen-local.json) ---
 DET_MIB=""
@@ -160,20 +164,22 @@ fi
 
 # ------------------------------------------------------------------ local config
 if [ ! -f hydragen-local.json ]; then
+  if [ "$MODEL" = "IQ3_S" ]; then CFG="configs/strata-iq3s-m25-0213-ctx131k.json"; else CFG="configs/strata-iq3xxs-m25-0213-ctx131k.json"; fi
   sed -e "s#\"exe\": \"[^\"]*\"#\"exe\": \"$BIN\"#" \
       -e "s#\"log\": \"[^\"]*\"#\"log\": \"$PWD/logs/strata.log\"#" \
-      configs/strata-iq3xxs-m25-0213-ctx131k.json > hydragen-local.json
+      "$CFG" > hydragen-local.json
   mkdir -p logs park-disk "$MODEL_DIR/packs" "$MODEL_DIR/models" "$MODEL_DIR/mtp"
-  PARK_DISK_DIR="$PWD/park-disk" MODEL_DIR="$MODEL_DIR" REPO_DIR="$PWD" DET_MIB="$DET_MIB" .venv/bin/python - <<'PYEOF'
+  PARK_DISK_DIR="$PWD/park-disk" MODEL_DIR="$MODEL_DIR" MODEL="$MODEL" REPO_DIR="$PWD" DET_MIB="$DET_MIB" .venv/bin/python - <<'PYEOF'
 import json, os
 p = "hydragen-local.json"
 cfg = json.load(open(p))
 md, repo = os.environ["MODEL_DIR"], os.environ["REPO_DIR"]
-gguf = os.path.join(md, "models", "IQ3_XXS", "IQ3_XXS")
+mdl = os.environ["MODEL"]
+gguf = os.path.join(md, "models", mdl, mdl)
 targets = {
-    "--pack": os.path.join(md, "packs", "iq3_xxs"),
-    "--native": os.path.join(gguf, "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf"),
-    "--ple-gguf": os.path.join(gguf, "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf"),
+    "--pack": os.path.join(md, "packs", mdl.lower()),
+    "--native": os.path.join(gguf, f"Qwen3.8-Flash-Next-GSQ-RCO-{mdl}-00001-of-00002.gguf"),
+    "--ple-gguf": os.path.join(gguf, f"Qwen3.8-Flash-Next-GSQ-RCO-{mdl}-00002-of-00002.gguf"),
     "--expert-profile": os.path.join(repo, "engine", "data", "expert-profile.bin"),
     "--mtp": os.path.join(md, "mtp", "rt"),
 }
@@ -196,7 +202,7 @@ for i, tok in enumerate(args):
         args[i + 2 : i + 2] = ["--expert-profile-save", _learned]
         break
 cfg["cwd"] = repo
-cfg["tokenizer"] = os.path.join(md, "packs", "iq3_xxs", "tokenizer")
+cfg["tokenizer"] = os.path.join(md, "packs", mdl.lower(), "tokenizer")
 env = cfg.setdefault("env", {})
 rt = os.path.join(repo, "runtime")
 if os.path.isdir(os.path.join(rt, "lib")):  # prebuilt engine: bundled CUDA runtime libs
@@ -215,19 +221,19 @@ if "--prompt-cache-tail" not in args:
 json.dump(cfg, open(p, "w"), indent=1)
 PYEOF
   echo "config created: hydragen-local.json (localhost:8181, canonical cow stack wired)"
-  echo "model paths point under: $MODEL_DIR (override location: ./install.sh --model-dir DIR)"
+  echo "model paths point under: $MODEL_DIR (tier: $MODEL; override location: ./install.sh --model-dir DIR --model IQ3_XXS|IQ3_S)"
 fi
 
-cat <<'EON'
+cat <<EON
 
 Next steps
-  1. Model blobs (~76 GB IQ3_XXS set). hydragen-local.json now expects them under the
+  1. Model blobs (~76 GB IQ3_XXS / ~84 GB IQ3_S set). hydragen-local.json now expects them under the
      model dir printed above. Easiest is the vendored Strata setup - it downloads the
      pinned GGUFs (resumable, SHA-256-checked), builds the expert pack and fetches the
      MTP draft into that dir:
-         bash engine/setup.sh --model IQ3_XXS --data-dir <model-dir>
+         bash engine/setup.sh --model $MODEL --data-dir <model-dir>
      Or fetch them yourself and let setup reuse them:
-         uvx hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF --include "IQ3_XXS/*" --local-dir DIR
+         uvx hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF --include "$MODEL/*" --local-dir DIR
          bash engine/setup.sh --gguf-dir DIR
      Source table and licenses: docs/MODELS.md. The expert-routing profile is already
      in this repo (engine/data/expert-profile.bin) - nothing to download for it.

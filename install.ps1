@@ -23,12 +23,15 @@
 #
 #   .\install.ps1                                  # prebuilt if available, else source (sm_86)
 #   .\install.ps1 -BuildFromSource                 # never run a downloaded binary; compile locally
+#   .\install.ps1 -Model IQ3_S                     # wire the local config for the IQ3_S model tier (default: IQ3_XXS)
 #   $env:HYDRAGEN_CUDA_ARCH="89-real"; .\install.ps1     # RTX 40-series
 #   $env:HYDRAGEN_CUDA_ARCH="86-real;89-real"; .\install.ps1
 
-param([string]$ModelDir, [switch]$BuildFromSource)
+param([string]$ModelDir, [string]$Model = "IQ3_XXS", [switch]$BuildFromSource)
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
+if ($Model -notin @("IQ3_XXS", "IQ3_S")) { Write-Error "install.ps1: -Model must be IQ3_XXS (default) or IQ3_S - docs\MODELS.md" }
+$ModelTag = $Model.ToLower()
 
 $ARCH = if ($env:HYDRAGEN_CUDA_ARCH) { $env:HYDRAGEN_CUDA_ARCH } else { "86-real" }
 $RELEASE_TAG = "prebuilt-1"
@@ -182,22 +185,23 @@ if ($freeMib -ge 0 -and $freeMib -lt ($DetMib + 174080)) {
   Write-Warning "install.ps1: $freeMib MiB free on the $ModelDir drive - model blobs need ~160 GiB plus the $DetMib MiB tier budget (the tier fills lazily; now-check, not a hard gate)"
 }
 $mdFwd = $ModelDir -replace '\\','/'
-$ggufDir = "$mdFwd/models/IQ3_XXS/IQ3_XXS"
+$ggufDir = "$mdFwd/models/$Model/$Model"
 $blobTargets = @{
-  "--pack" = "$mdFwd/packs/iq3_xxs";
-  "--native" = "$ggufDir/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf";
-  "--ple-gguf" = "$ggufDir/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf";
+  "--pack" = "$mdFwd/packs/$ModelTag";
+  "--native" = "$ggufDir/Qwen3.8-Flash-Next-GSQ-RCO-$Model-00001-of-00002.gguf";
+  "--ple-gguf" = "$ggufDir/Qwen3.8-Flash-Next-GSQ-RCO-$Model-00002-of-00002.gguf";
   "--expert-profile" = ((Join-Path $PWD "engine\data\expert-profile.bin") -replace '\\','/');
   "--mtp" = "$mdFwd/mtp/rt"
 }
 # per-artifact learned-profile loop (mirrors install.sh): --expert-profile-save persists the
 # adaptive tier's live ranking; the file is keyed by the model blob name so a stale ranking
 # from a different artifact can never abort the next boot.
-$_pkey = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes("Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf"))).Replace("-","").Substring(0,10).ToLower()
+$_pkey = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes("Qwen3.8-Flash-Next-GSQ-RCO-$Model-00001-of-00002.gguf"))).Replace("-","").Substring(0,10).ToLower()
 $learned = (Join-Path $PWD "expert-profile-learned-$_pkey.bin") -replace '\\','/'
 if (Test-Path $learned) { $blobTargets["--expert-profile"] = $learned }
 if (-not (Test-Path hydragen-local.json)) {
-  $cfg = Get-Content configs/strata-iq3xxs-m25-0213-ctx131k.json -Raw | ConvertFrom-Json
+  $cfgSrc = if ($Model -eq "IQ3_S") { "configs/strata-iq3s-m25-0213-ctx131k.json" } else { "configs/strata-iq3xxs-m25-0213-ctx131k.json" }
+  $cfg = Get-Content $cfgSrc -Raw | ConvertFrom-Json
   $cfg.exe = ($BIN -replace '\\','/')
   $cfg.log = (Join-Path $PWD "logs\strata.log") -replace '\\','/'
   foreach ($d in @("logs", "park-disk")) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
@@ -213,12 +217,12 @@ if (-not (Test-Path hydragen-local.json)) {
     }
   }
   $cfg.cwd = ($PWD -replace '\\','/')
-  $cfg.tokenizer = "$mdFwd/packs/iq3_xxs/tokenizer"
+  $cfg.tokenizer = "$mdFwd/packs/$ModelTag/tokenizer"
   if ($cfg.args -notcontains "--expert-profile-save") { $cfg.args += @("--expert-profile-save", $learned) }
   if ($cfg.args -notcontains "--conversation-cache-min-free-mib") { $cfg.args += @("--conversation-cache-min-free-mib", "512") }
   if ($cfg.args -notcontains "--prompt-cache-tail") { $cfg.args += "--prompt-cache-tail" }
   ($cfg | ConvertTo-Json -Depth 6) | Set-Content hydragen-local.json
-  Write-Host "created hydragen-local.json (canonical cow stack wired) - model paths point under $ModelDir (override: .\install.ps1 -ModelDir D:\models)."
+  Write-Host "created hydragen-local.json (canonical cow stack wired, model tier: $Model) - model paths point under $ModelDir (overrides: .\install.ps1 -ModelDir D:\models -Model IQ3_XXS|IQ3_S)."
   Write-Host "  the expert-routing profile is already in this repo (engine\data\expert-profile.bin); the GGUFs/pack/MTP come next."
 } else {
   Write-Host "hydragen-local.json already exists; leaving it alone."
@@ -226,14 +230,14 @@ if (-not (Test-Path hydragen-local.json)) {
 
 Write-Host ""
 Write-Host "Install complete. Next:"
-Write-Host "  1. model blobs (~76 GB IQ3_XXS set), sources and layout: docs\MODELS.md. Easiest:"
-Write-Host "       cmd /c engine\SETUP.bat --model IQ3_XXS --data-dir `"$ModelDir`""
+Write-Host "  1. model blobs (~76 GB IQ3_XXS / ~84 GB IQ3_S set), sources and layout: docs\MODELS.md. Easiest:"
+Write-Host "       cmd /c engine\SETUP.bat --model $Model --data-dir `"$ModelDir`""
 Write-Host "     (Strata's own downloader: resumable, SHA-256-checked; builds the pack and fetches MTP)."
-Write-Host "     Or: uvx hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF --include `"IQ3_XXS/*`" --local-dir DIR"
+Write-Host "     Or: uvx hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF --include `"$Model/*`" --local-dir DIR"
 Write-Host "         then engine\SETUP.bat --gguf-dir DIR"
-if (-not (Test-Path (Join-Path $ModelDir "packs\iq3_xxs\tokenizer\vocab.json"))) {
+if (-not (Test-Path (Join-Path $ModelDir "packs\$ModelTag\tokenizer\vocab.json"))) {
   Write-Host "     NOTE: the model pack (and with it the tokenizer serve checks for) does not exist yet" -ForegroundColor Yellow
-  Write-Host "           under $ModelDir\packs\iq3_xxs - serve will refuse to start until step 1 runs." -ForegroundColor Yellow
+  Write-Host "           under $ModelDir\packs\$ModelTag - serve will refuse to start until step 1 runs." -ForegroundColor Yellow
 }
 Write-Host "  2. .venv\Scripts\python.exe engine\serve\server.py --engine hydragen --config hydragen-local.json --port 8181"
 Write-Host "  3. dashboard + Monitor: http://127.0.0.1:8181/"

@@ -15,6 +15,12 @@ layout below; you choose the root (`./install.sh --model-dir DIR` /
 | `--mtp` | `mtp/rt/` | ~5 GB | fetched by Strata's setup (`engine/tools/mtp_fetch.py`; range-reads the MTP tensors from the BF16 checkpoint, SHA-256-verified) |
 | `--expert-profile` | — | 196 KB | **ships in this repo**: `engine/data/expert-profile.bin` (boot seed only; the installers wire `--expert-profile-save` so the engine re-seeds from what your own traffic learned — see HOW_IT_WORKS) |
 
+The installers default to the **IQ3_XXS** tier. `--model IQ3_S` / `-Model IQ3_S` wires
+the same layout for the 3.5-bit tier: `models/IQ3_S/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-*`
+shards (shard 1 ~55 GB; the PLE shard is byte-identical across all tiers, ~29 GB) and a pack
+built under `packs/iq3_s/`. IQ3_S is the best-quality tier (matches the full model on the
+published benchmarks), about 15% slower than IQ3_XXS, and setup documents a 64 GB RAM floor.
+
 ## Easiest path: let Strata's setup fetch and verify everything
 
 The vendored engine carries Strata's own setup, which downloads the pinned
