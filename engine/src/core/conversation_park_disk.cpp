@@ -12,16 +12,22 @@
 #include <deque>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
-#ifndef _WIN32
 #include <cerrno>
-#include <dirent.h>
+#include <cstdint>
 #include <fcntl.h>
+#include <unordered_set>
+#ifndef _WIN32
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
-#include <unordered_set>
 #include <unistd.h>
 #else
+#ifndef NOMINMAX
+#define NOMINMAX   // windows.h's min/max macros would break std::min/std::max here (the guard every other Windows TU carries)
+#endif
+#include <io.h>
 #include <windows.h>
 #endif
 
@@ -90,6 +96,194 @@ bool pd_key_from_hex(const std::string& hex, uint64_t& k0, uint64_t& k1) {
     return true;
 }
 
+// ---- M-C11-win: park v2's own file primitives, compiled for both platforms. POSIX passes them
+// through as before; Windows builds them on the CRT low-level I/O (the same handles Win32 uses),
+// refuses reparse points before the open (O_NOFOLLOW's equivalent), reads link counts and sizes
+// from GetFileInformationByHandle so read_v2's single-linked-regular-file law is a real check on
+// NTFS too, and publishes with MoveFileEx(REPLACE_EXISTING). The Windows branch keeps errno alive
+// (_dosmaperr) so every error line reads the same on both sides.
+struct PdStat {
+    bool ok = false;      // a regular file: not a directory, not a reparse point
+    uint64_t size = 0;
+    int nlink = 0;
+};
+
+#ifdef _WIN32
+int pd_open_ro(const std::string& p) {
+    const DWORD a = ::GetFileAttributesA(p.c_str());
+    if (a == INVALID_FILE_ATTRIBUTES) { errno = ENOENT; return -1; }
+    if (a & FILE_ATTRIBUTE_DIRECTORY) { errno = EACCES; return -1; }
+    if (a & FILE_ATTRIBUTE_REPARSE_POINT) {
+# ifdef ELOOP
+        errno = ELOOP;      // O_NOFOLLOW's equivalent: junctions and symlinks are refused before the open
+# else
+        errno = EACCES;
+# endif
+        return -1;
+    }
+    return ::_open(p.c_str(), _O_RDONLY | _O_BINARY | _O_RANDOM);
+}
+int pd_create_new(const std::string& p) {
+    // MSVC _open with _O_CREAT REQUIRES the mode varargs: omitted, the file is created with the
+    // read-only bit set (M-C11-WIN: chunk files came back 0444 and the corruption gate could not write them).
+    return ::_open(p.c_str(), _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY | _O_RANDOM, _S_IREAD | _S_IWRITE);
+}
+intptr_t pd_read(int fd, void* buf, size_t n) {
+    intptr_t total = 0;
+    while (total < (intptr_t) n) {
+        const int got = ::_read(fd, (char*) buf + total, (unsigned) std::min<size_t>(n - (size_t) total, 1u << 30));
+        if (got <= 0) break;   // -1: errno set by the CRT; 0: end of file
+        total += got;
+    }
+    return total;
+}
+intptr_t pd_pread(int fd, void* buf, size_t n, long long off) {
+    if (::_lseeki64(fd, off, SEEK_SET) < 0) { errno = EINVAL; return -1; }
+    return pd_read(fd, buf, n);
+}
+intptr_t pd_write(int fd, const void* buf, size_t n) {
+    intptr_t total = 0;
+    while (total < (intptr_t) n) {
+        const int put = ::_write(fd, (const char*) buf + total, (unsigned) std::min<size_t>(n - (size_t) total, 1u << 30));
+        if (put <= 0) break;   // every caller requires the full count: a short answer is a failure either way
+        total += put;
+    }
+    return total;
+}
+intptr_t pd_pwrite(int fd, const void* buf, size_t n, long long off) {
+    if (::_lseeki64(fd, off, SEEK_SET) < 0) { errno = EINVAL; return -1; }
+    return pd_write(fd, buf, n);
+}
+int pd_fsync(int fd) { return ::_commit(fd); }
+int pd_close(int fd) { return ::_close(fd); }
+int pd_unlink(const std::string& p) { return ::_unlink(p.c_str()); }
+int pd_rename(const std::string& from, const std::string& to) {
+    if (::MoveFileExA(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 0;
+    // _dosmaperr is private to the CRT: map the handful of codes a publish can actually hit.
+    switch (::GetLastError()) {
+        case ERROR_FILE_NOT_FOUND:    errno = ENOENT; break;
+        case ERROR_PATH_NOT_FOUND:    errno = ENOENT; break;
+        case ERROR_ACCESS_DENIED:     errno = EACCES; break;
+        case ERROR_ALREADY_EXISTS:    errno = EEXIST; break;
+        case ERROR_DISK_FULL:
+        case ERROR_NOT_ENOUGH_MEMORY: errno = ENOSPC; break;
+        default:                      errno = EIO;    break;
+    }
+    return -1;
+}
+PdStat pd_stat_handle(HANDLE h) {
+    PdStat s;
+    BY_HANDLE_FILE_INFORMATION bi;
+    if (!::GetFileInformationByHandle(h, &bi)) return s;
+    s.ok = (bi.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
+    s.nlink = (int) bi.nNumberOfLinks;
+    s.size = ((uint64_t) bi.nFileSizeHigh << 32) | bi.nFileSizeLow;
+    return s;
+}
+PdStat pd_fstat(int fd) {
+    const HANDLE h = (HANDLE) (intptr_t) ::_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE) return {};
+    return pd_stat_handle(h);
+}
+PdStat pd_stat(const std::string& p) {
+    const HANDLE h = ::CreateFileA(p.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                   nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return {};
+    const PdStat s = pd_stat_handle(h);
+    ::CloseHandle(h);
+    return s;
+}
+bool pd_exists(const std::string& p) {
+    const DWORD a = ::GetFileAttributesA(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+std::vector<std::string> pd_dir_names(const std::string& dir) {
+    std::vector<std::string> out;
+    WIN32_FIND_DATAA fd;
+    if (const HANDLE h = ::FindFirstFileA((dir + "\\*").c_str(), &fd); h != INVALID_HANDLE_VALUE) {
+        do {
+            const std::string name = fd.cFileName;
+            if (name != "." && name != "..") out.push_back(name);
+        } while (::FindNextFileA(h, &fd));
+        ::FindClose(h);
+    }
+    return out;
+}
+#else
+int pd_open_ro(const std::string& p) { return ::open(p.c_str(), O_RDONLY | O_NOFOLLOW); }
+int pd_create_new(const std::string& p) { return ::open(p.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600); }
+intptr_t pd_read(int fd, void* buf, size_t n) {
+    intptr_t total = 0;
+    while (total < (intptr_t) n) {
+        const intptr_t got = ::read(fd, (char*) buf + total, n - (size_t) total);
+        if (got <= 0) { if (got < 0 && errno == EINTR) continue; break; }
+        total += got;
+    }
+    return total;
+}
+intptr_t pd_pread(int fd, void* buf, size_t n, long long off) {
+    intptr_t total = 0;
+    while (total < (intptr_t) n) {
+        const intptr_t got = ::pread(fd, (char*) buf + total, n - (size_t) total, (off_t) off + total);
+        if (got <= 0) { if (got < 0 && errno == EINTR) continue; break; }
+        total += got;
+    }
+    return total;
+}
+intptr_t pd_write(int fd, const void* buf, size_t n) {
+    intptr_t total = 0;
+    while (total < (intptr_t) n) {
+        const intptr_t got = ::write(fd, (const char*) buf + total, n - (size_t) total);
+        if (got <= 0) { if (got < 0 && errno == EINTR) continue; break; }
+        total += got;
+    }
+    return total;
+}
+intptr_t pd_pwrite(int fd, const void* buf, size_t n, long long off) {
+    intptr_t total = 0;
+    while (total < (intptr_t) n) {
+        const intptr_t got = ::pwrite(fd, (const char*) buf + total, n - (size_t) total, (off_t) off + total);
+        if (got <= 0) { if (got < 0 && errno == EINTR) continue; break; }
+        total += got;
+    }
+    return total;
+}
+int pd_fsync(int fd) { return ::fsync(fd); }
+int pd_close(int fd) { return ::close(fd); }
+int pd_unlink(const std::string& p) { return ::unlink(p.c_str()); }
+int pd_rename(const std::string& from, const std::string& to) { return ::rename(from.c_str(), to.c_str()); }
+PdStat pd_fstat(int fd) {
+    struct stat sb;
+    PdStat s;
+    if (::fstat(fd, &sb) != 0 || !S_ISREG(sb.st_mode)) return s;
+    s.ok = true;
+    s.size = (uint64_t) sb.st_size;
+    s.nlink = (int) sb.st_nlink;
+    return s;
+}
+PdStat pd_stat(const std::string& p) {
+    struct stat sb;
+    PdStat s;
+    if (::stat(p.c_str(), &sb) != 0 || !S_ISREG(sb.st_mode)) return s;
+    s.ok = true;
+    s.size = (uint64_t) sb.st_size;
+    s.nlink = (int) sb.st_nlink;
+    return s;
+}
+bool pd_exists(const std::string& p) { struct stat sb; return ::stat(p.c_str(), &sb) == 0 && S_ISREG(sb.st_mode); }
+std::vector<std::string> pd_dir_names(const std::string& dir) {
+    std::vector<std::string> out;
+    if (DIR* d = ::opendir(dir.c_str())) {
+        while (const dirent* e = ::readdir(d)) {
+            const std::string name = e->d_name;
+            if (name != "." && name != "..") out.push_back(name);
+        }
+        ::closedir(d);
+    }
+    return out;
+}
+#endif
+
 } // namespace
 
 std::optional<ParkDisk::Options> ParkDisk::from_env() {
@@ -110,9 +304,6 @@ void ParkDisk::init(const Options& o, IdentityFn identity, LimitsFn limits) {
     identity_fn_ = std::move(identity);
     limits_fn_ = std::move(limits);
     v2_ = o.v2;
-#ifdef _WIN32
-    if (v2_) { std::fprintf(stderr, "strata serve: park disk: STRATA_PARK_DISK_V2 is POSIX-only for now: staying on v1\n"); v2_ = false; }
-#endif
     std::string error;
 #ifndef _WIN32
     if (mkdir(dir_.c_str(), 0700) != 0 && errno != EEXIST) {
@@ -162,26 +353,14 @@ void ParkDisk::init(const Options& o, IdentityFn identity, LimitsFn limits) {
     size_t found = 0, refused = 0, quarantined = 0;
     bool walk_ok = true;
     std::vector<std::string> paths;
-#ifndef _WIN32
-    if (DIR* d = opendir(dir_.c_str())) {
-        while (const dirent* e = readdir(d)) {
-            const std::string name = e->d_name;
-            if (name.rfind("park-", 0) == 0 && name.size() > 8 && name.compare(name.size() - 8, 8, ".ses.tmp") == 0) {
-                ::unlink((dir_ + "/" + name).c_str());   // half-written spill of an old boot: no live writer can publish it
-                continue;
-            }
-            if (name.rfind("park-", 0) == 0 && name.size() > 4 && name.compare(name.size() - 4, 4, ".ses") == 0)
-                paths.push_back(dir_ + "/" + name);
+    for (const std::string& name : pd_dir_names(dir_)) {
+        if (name.rfind("park-", 0) == 0 && name.size() > 8 && name.compare(name.size() - 8, 8, ".ses.tmp") == 0) {
+            pd_unlink(dir_ + "/" + name);   // half-written spill of an old boot: no live writer can publish it
+            continue;
         }
-        closedir(d);
+        if (name.rfind("park-", 0) == 0 && name.size() > 4 && name.compare(name.size() - 4, 4, ".ses") == 0)
+            paths.push_back(dir_ + "/" + name);
     }
-#else
-    WIN32_FIND_DATAA fd;
-    if (HANDLE h = FindFirstFileA((dir_ + "\\park-*.ses").c_str(), &fd); h != INVALID_HANDLE_VALUE) {
-        do paths.push_back(dir_ + "\\" + fd.cFileName); while (FindNextFileA(h, &fd));
-        FindClose(h);
-    }
-#endif
     std::sort(paths.begin(), paths.end());   // serial order: the LRU keeps its spill order across a restart
     for (const auto& path : paths) {
         const auto id = identity_cached(error);   // the fingerprint is computed once; a failure is permanent
@@ -213,8 +392,7 @@ void ParkDisk::init(const Options& o, IdentityFn identity, LimitsFn limits) {
                         for (const auto& k : qkeys) {
                             BlobRef& br = blobs_[k];
                             if (br.refs == 0) {
-                                struct stat cs;
-                                br.len = (::stat(blob_path(k).c_str(), &cs) == 0 && cs.st_size > 0) ? (uint64_t) cs.st_size : 0;
+                                br.len = pd_stat(blob_path(k)).size;   // 0 unless it is a real regular file
                                 bytes_ += br.len;
                                 blob_bytes_ += br.len;
                             }
@@ -229,7 +407,7 @@ void ParkDisk::init(const Options& o, IdentityFn identity, LimitsFn limits) {
                     walk_ok = false;   // not the file's fault: the rest waits for a later boot, nothing churns
                     break;
                 }
-                ::unlink(path.c_str());   // corrupt: the file's own bytes; shared chunks are protected by refs, swept in pass 2 only
+                pd_unlink(path);   // corrupt: the file's own bytes; shared chunks are protected by refs, swept in pass 2 only
                 continue;
             }
             if (v2img.live.ids.empty() || v2img.kv.empty()) { ++refused; continue; }
@@ -255,8 +433,7 @@ void ParkDisk::init(const Options& o, IdentityFn identity, LimitsFn limits) {
             for (const auto& k : en.blob_keys) {
                 BlobRef& br = blobs_[k];
                 if (br.refs == 0) {
-                    struct stat cs;
-                    br.len = (::stat(blob_path(k).c_str(), &cs) == 0 && cs.st_size > 0) ? (uint64_t) cs.st_size : 0;
+                    br.len = pd_stat(blob_path(k)).size;   // 0 unless it is a real regular file
                     add += br.len;
                     blob_bytes_ += br.len;
                 }
@@ -286,11 +463,7 @@ void ParkDisk::init(const Options& o, IdentityFn identity, LimitsFn limits) {
                 walk_ok = false;
                 break;   // io/memory right now: the rest waits for a later boot rather than churn the disk
             }
-#ifndef _WIN32
-            ::unlink(path.c_str());
-#else
-            ::DeleteFileA(path.c_str());
-#endif
+            pd_unlink(path);
             continue;
         }
         if (image.live.ids.empty() || image.kv.empty()) {   // nothing restorable to key on
@@ -331,21 +504,15 @@ void ParkDisk::init(const Options& o, IdentityFn identity, LimitsFn limits) {
     if (v2_ && walk_ok) {
         // orphan sweep: chunk files no surviving entry references (and half-written .tmp publishes) leave now
         size_t swept = 0;
-#ifndef _WIN32   // v2 is POSIX-only on Windows (forced off in init); the walk itself is dead code there
-        if (DIR* d = opendir(chunks_dir_.c_str())) {
-            while (const dirent* e = readdir(d)) {
-                const std::string name = e->d_name;
-                const std::string full = chunks_dir_ + "/" + name;
-                if (name.find(".tmp") != std::string::npos) { ::unlink(full.c_str()); ++swept; continue; }
-                if (name.size() == 36 && name.compare(name.size() - 4, 4, ".bin") == 0) {
-                    uint64_t k0 = 0, k1 = 0;
-                    if (!pd_key_from_hex(name.substr(0, 32), k0, k1)) { ::unlink(full.c_str()); ++swept; continue; }
-                    if (!blobs_.count(PdKey{k0, k1})) { ::unlink(full.c_str()); ++swept; }
-                }
+        for (const std::string& name : pd_dir_names(chunks_dir_)) {
+            const std::string full = chunks_dir_ + "/" + name;
+            if (name.find(".tmp") != std::string::npos) { pd_unlink(full); ++swept; continue; }
+            if (name.size() == 36 && name.compare(name.size() - 4, 4, ".bin") == 0) {
+                uint64_t k0 = 0, k1 = 0;
+                if (!pd_key_from_hex(name.substr(0, 32), k0, k1)) { pd_unlink(full); ++swept; continue; }
+                if (!blobs_.count(PdKey{k0, k1})) { pd_unlink(full); ++swept; }
             }
-            closedir(d);
         }
-#endif
         if (swept) std::fprintf(stderr, "strata serve: park disk: swept %zu orphan chunk file(s)\n", swept);
         std::fprintf(stderr, "strata serve: park disk: v2 dedup tier active (store %zu chunks, %.1f GiB)\n",
                      blobs_.size(), (double) blob_bytes_ / (1024.0 * 1024.0 * 1024.0));
@@ -495,10 +662,8 @@ void ParkDisk::drain_finished() {
             // dropped while its write ran (room loop): the rename may still have published a file nobody
             // indexes - take it back (a boot scan would otherwise resurrect the stale copy)
             if (f.ok) {
-#ifndef _WIN32
-                ::unlink(pd_tier_path(dir_, f.serial).c_str());
-                for (const auto& [k, len] : f.created) ::unlink(blob_path(k).c_str());
-#endif
+                pd_unlink(pd_tier_path(dir_, f.serial));
+                for (const auto& [k, len] : f.created) pd_unlink(blob_path(k));
             }
             continue;
         }
@@ -539,7 +704,7 @@ void ParkDisk::drain_finished() {
         } else {
             std::fprintf(stderr, "strata serve: park disk: spill failed for %zu tokens (%s)\n",
                          it->ids.size(), f.error.c_str());
-            for (const auto& [k, len] : f.created) ::unlink(blob_path(k).c_str());   // published, never indexed
+            for (const auto& [k, len] : f.created) pd_unlink(blob_path(k));   // published, never indexed
             bytes_ -= it->bytes;
             entries_.erase(it);
             ++drops_;
@@ -606,11 +771,7 @@ void ParkDisk::drop_oldest() {
     release_entry(e);
     bytes_ -= e.bytes;
     ++drops_;
-#ifndef _WIN32
-    ::unlink(e.path.c_str());
-#else
-    ::DeleteFileA(e.path.c_str());
-#endif
+    pd_unlink(e.path);
     std::fprintf(stderr, "strata serve: park disk: drop %s (%.1f MiB, %zu entries, %.1f GiB on disk)\n",
                  e.path.c_str(), (double) e.bytes / (1024.0 * 1024.0), entries_.size(),
                  (double) bytes_ / (1024.0 * 1024.0 * 1024.0));
@@ -658,23 +819,21 @@ std::optional<SessionFileIdentity> ParkDisk::identity_cached(std::string& error)
 
 // ---- M-C3b v2: deduped block files. The payload walk is STRSES v1's own (session_payload_blocks);
 // the envelope and the chunk store are ParkDisk's. Any structural refusal falls back to a plain v1
-// write for the same image, so a v2 problem can never lose a spill. POSIX-only for now (the v2 knob
-// forces v1 on Windows); v1 files keep working under v2 unchanged.
+// write for the same image, so a v2 problem can never lose a spill. M-C11-win made this layer
+// portable (the pd_* shim above): both platforms run the same v2 code; v1 files keep working
+// under v2 unchanged. On Windows the single-link law holds because NTFS reports real link counts
+// through GetFileInformationByHandle, and reparse points (junctions, symlinks) are refused.
 std::string ParkDisk::blob_path(const PdKey& k) const {
     return chunks_dir_ + "/" + pd_hexkey(k.k0, k.k1) + ".bin";
 }
 
 bool ParkDisk::file_is_v2(const std::string& path) {
-#ifndef _WIN32
-    int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW);
+    const int fd = pd_open_ro(path);
     if (fd < 0) return false;
     char m[8];
-    const bool v2 = ::read(fd, m, 8) == 8 && std::memcmp(m, kPd2Magic, 8) == 0;
-    ::close(fd);
+    const bool v2 = pd_read(fd, m, 8) == 8 && std::memcmp(m, kPd2Magic, 8) == 0;
+    pd_close(fd);
     return v2;
-#else
-    return false;
-#endif
 }
 
 void ParkDisk::release_entry(const Entry& e) {
@@ -690,9 +849,7 @@ void ParkDisk::release_entry(const Entry& e) {
         if (--it->second.refs == 0) {
             bytes_ -= it->second.len;
             blob_bytes_ -= it->second.len;
-#ifndef _WIN32
-            ::unlink(blob_path(k).c_str());
-#endif
+            pd_unlink(blob_path(k));   // refs hit zero: the bytes leave, on either platform
             blobs_.erase(it);
         }
     }
@@ -715,14 +872,13 @@ void ParkDisk::write_v2(const Write& w, const SessionFileIdentity& id, Finished&
             f.ok = true;
         }
     };
-#ifndef _WIN32
     const std::string tmp = w.path + ".tmp";
-    int fd = ::open(tmp.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+    const int fd = pd_create_new(tmp);
     if (fd < 0) { to_v1(); return; }
     std::vector<uint8_t> front(kPd2Body, 0);   // header + zero-filled table area; the body streams after
-    if (::write(fd, front.data(), front.size()) != (ssize_t) front.size()) {
-        ::close(fd);
-        ::unlink(tmp.c_str());
+    if (pd_write(fd, front.data(), front.size()) != (intptr_t) front.size()) {
+        pd_close(fd);
+        pd_unlink(tmp);
         to_v1();
         return;
     }
@@ -744,9 +900,9 @@ void ParkDisk::write_v2(const Write& w, const SessionFileIdentity& id, Finished&
     std::unordered_map<const void*, const Write::ViewSpan*> vmap;
     for (const auto& v : w.views) vmap[v.p] = &v;
     const auto abort_v2 = [&](void) {
-        ::close(fd);
-        ::unlink(tmp.c_str());
-        for (const auto& [k, len] : c.created) ::unlink(blob_path(k).c_str());   // published, never will be indexed
+        pd_close(fd);
+        pd_unlink(tmp);
+        for (const auto& [k, len] : c.created) pd_unlink(blob_path(k));   // published, never will be indexed
         c.created.clear();
         to_v1();
     };
@@ -761,25 +917,24 @@ void ParkDisk::write_v2(const Write& w, const SessionFileIdentity& id, Finished&
         bool blobbed = false;
         if (len >= (64u << 10)) {           // worth a chunk file: below this the table cost beats the dedup
             const std::string bp = blob_path(key);
-            struct stat sb;
-            if (::stat(bp.c_str(), &sb) == 0) {
+            if (pd_exists(bp)) {
                 blobbed = true;
                 c.saved += len;
             } else {
                 const std::string bt = bp + ".tmp";
-                int bfd = ::open(bt.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+                const int bfd = pd_create_new(bt);
                 if (bfd < 0 && errno == EEXIST) blobbed = true;   // raced with an identical publish: same bytes
                 else if (bfd >= 0) {
                     bool ok = true;
                     for (const auto& [p, n] : c.slices)
-                        if (::write(bfd, p, n) != (ssize_t) n) { ok = false; break; }
-                    if (ok) ok = ::fsync(bfd) == 0;
-                    ::close(bfd);
-                    if (ok && ::rename(bt.c_str(), bp.c_str()) == 0) {
+                        if (pd_write(bfd, p, n) != (intptr_t) n) { ok = false; break; }
+                    if (ok) ok = pd_fsync(bfd) == 0;
+                    pd_close(bfd);
+                    if (ok && pd_rename(bt, bp) == 0) {
                         blobbed = true;
                         c.created.emplace_back(key, len);
                     } else {
-                        ::unlink(bt.c_str());
+                        pd_unlink(bt);
                     }
                 }
             }
@@ -788,7 +943,7 @@ void ParkDisk::write_v2(const Write& w, const SessionFileIdentity& id, Finished&
             c.keys.push_back(key);
         } else {
             for (const auto& [p, n] : c.slices)
-                if (::write(fd, p, n) != (ssize_t) n) { c.failed = true; return; }
+                if (pd_write(fd, p, n) != (intptr_t) n) { c.failed = true; return; }
             c.inline_bytes += len;
         }
         uint8_t ent[kPd2Ent] = {};
@@ -864,7 +1019,7 @@ void ParkDisk::write_v2(const Write& w, const SessionFileIdentity& id, Finished&
     if (walk_ok) flush_block();   // the last, short block
     if (!walk_ok || c.failed || c.overflow || c.table.empty()) { abort_v2(); return; }
 
-    if (::pwrite(fd, c.table.data(), c.table.size(), (off_t) kPd2Hdr) != (ssize_t) c.table.size()) { abort_v2(); return; }
+    if (pd_pwrite(fd, c.table.data(), c.table.size(), (long long) kPd2Hdr) != (intptr_t) c.table.size()) { abort_v2(); return; }
     uint8_t h[kPd2Hdr] = {};
     std::memcpy(h, kPd2Magic, 8);
     const uint32_t ver = 2, hdr = (uint32_t) kPd2Body;
@@ -882,44 +1037,38 @@ void ParkDisk::write_v2(const Write& w, const SessionFileIdentity& id, Finished&
     std::memcpy(h + 72, &c.inline_bytes, 8);
     const uint64_t hh = session_hash64(h, 80, 0);
     std::memcpy(h + 80, &hh, 8);
-    if (::pwrite(fd, h, kPd2Hdr, 0) != (ssize_t) kPd2Hdr) { abort_v2(); return; }
-    if (::fsync(fd) != 0) { abort_v2(); return; }
-    ::close(fd);
-    if (::rename(tmp.c_str(), w.path.c_str()) != 0) {
-        ::unlink(tmp.c_str());
-        for (const auto& [k, len] : c.created) ::unlink(blob_path(k).c_str());
+    if (pd_pwrite(fd, h, kPd2Hdr, 0) != (intptr_t) kPd2Hdr) { abort_v2(); return; }
+    if (pd_fsync(fd) != 0) { abort_v2(); return; }
+    pd_close(fd);
+    if (pd_rename(tmp, w.path) != 0) {
+        pd_unlink(tmp);
+        for (const auto& [k, len] : c.created) pd_unlink(blob_path(k));
         f.error = std::string("park v2 rename: ") + std::strerror(errno);
         return;
     }
-    struct stat sb;
-    if (::stat(w.path.c_str(), &sb) != 0) sb.st_size = 0;
     f.ok = true;
-    f.file_bytes = (size_t) sb.st_size;
+    f.file_bytes = (size_t) pd_stat(w.path).size;
     f.all_keys = std::move(c.keys);
     f.created = std::move(c.created);
     f.saved = c.saved;
     f.view_parents = std::move(c.view_parents);
-#else
-    to_v1();
-#endif
 }
 
 bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, const SessionReadLimits& limits,
                        SavedConversation& image, size_t& bytes, std::string& error, SessionStatus& st,
                        std::vector<PdKey>* keys, ViewFeed* vf) {
-#ifndef _WIN32
     struct Ctx {
         int fd = -1, bfd = -1;
-        ~Ctx() { if (bfd >= 0) ::close(bfd); if (fd >= 0) ::close(fd); }
+        ~Ctx() { if (bfd >= 0) pd_close(bfd); if (fd >= 0) pd_close(fd); }
     } ctx;
-    ctx.fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW);
+    ctx.fd = pd_open_ro(path);
     if (ctx.fd < 0) { st.error = SessionError::io; error = "park v2: open: " + std::string(std::strerror(errno)); return false; }
-    struct stat sb;
-    if (::fstat(ctx.fd, &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_nlink != 1 || (uint64_t) sb.st_size < kPd2Body) {
+    const PdStat sb = pd_fstat(ctx.fd);   // M-C11-win: NTFS reports real link counts: the single-link law bites on both platforms
+    if (!sb.ok || sb.nlink != 1 || sb.size < kPd2Body) {
         st.error = SessionError::invalid; error = "park v2: not a single-linked regular file of the minimum size"; return false;
     }
     uint8_t h[kPd2Hdr];
-    if (::pread(ctx.fd, h, kPd2Hdr, 0) != (ssize_t) kPd2Hdr) { st.error = SessionError::io; error = "park v2: header read"; return false; }
+    if (pd_pread(ctx.fd, h, kPd2Hdr, 0) != (intptr_t) kPd2Hdr) { st.error = SessionError::io; error = "park v2: header read"; return false; }
     if (std::memcmp(h, kPd2Magic, 8) != 0) { st.error = SessionError::invalid; error = "park v2: bad magic"; return false; }
     uint32_t ver = 0, hdr = 0;
     std::memcpy(&ver, h + 8, 4);
@@ -936,7 +1085,7 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
     }
     if (nblocks == 0 || nblocks > kPd2MaxBlocks) { st.error = SessionError::invalid; error = "park v2: bad block count"; return false; }
     std::vector<uint8_t> tbl((size_t) nblocks * kPd2Ent);
-    if (::pread(ctx.fd, tbl.data(), tbl.size(), (off_t) kPd2Hdr) != (ssize_t) tbl.size()) { st.error = SessionError::io; error = "park v2: table read"; return false; }
+    if (pd_pread(ctx.fd, tbl.data(), tbl.size(), (long long) kPd2Hdr) != (intptr_t) tbl.size()) { st.error = SessionError::io; error = "park v2: table read"; return false; }
     struct Ent2 { uint8_t kind; uint64_t len, k0, k1; };
     std::vector<Ent2> ents;
     ents.resize((size_t) nblocks);
@@ -953,7 +1102,7 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
         sum += en.len;
         if (en.kind == 0) itot += en.len;
     }
-    if (sum != payload || itot != inline_total || (uint64_t) sb.st_size != kPd2Body + inline_total) {
+    if (sum != payload || itot != inline_total || sb.size != kPd2Body + inline_total) {
         st.error = SessionError::invalid; error = "park v2: table and file size disagree"; return false;
     }
     if (limits.max_file_bytes != UINT64_MAX && payload > limits.max_file_bytes) {
@@ -1017,8 +1166,8 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
                     if (vf == nullptr || vf->cur_img == nullptr) { feed.no_parent = true; feed.bad_parent = e.k0; return false; }
                 }
                 else {
-                    if (*feed.bfp >= 0) ::close(*feed.bfp);
-                    *feed.bfp = ::open(blob_path(PdKey{e.k0, e.k1}).c_str(), O_RDONLY | O_NOFOLLOW);
+                    if (*feed.bfp >= 0) pd_close(*feed.bfp);
+                    *feed.bfp = pd_open_ro(blob_path(PdKey{e.k0, e.k1}));
                     if (*feed.bfp < 0) { std::fprintf(stderr, "park disk: dbg miss open %s errno %d\n", blob_path(PdKey{e.k0, e.k1}).c_str(), errno); feed.missing = true; return false; }
                     cur = PdKey{e.k0, e.k1};
                     bh = SessionHasher(0);
@@ -1027,10 +1176,10 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
                 }
             }
             const size_t take = std::min(n, block_left);
-            const ssize_t r = view_blk ? (take_view(dst, take) ? (ssize_t) take : -1)
-                                       : ::pread(inline_blk ? ctx.fd : *feed.bfp, dst, take,
-                                                (off_t) (inline_blk ? feed.body_off : block_off));
-            if (r != (ssize_t) take) {
+            const intptr_t r = view_blk ? (take_view(dst, take) ? (intptr_t) take : -1)
+                                        : pd_pread(inline_blk ? ctx.fd : *feed.bfp, dst, take,
+                                                  (long long) (inline_blk ? feed.body_off : block_off));
+            if (r != (intptr_t) take) {
                 if (inline_blk) { /* short body read below */ }
                 else if (view_blk) feed.no_parent = true;
                 else feed.missing = true;
@@ -1100,12 +1249,9 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
             std::fprintf(stderr, "strata serve: park disk: view-mounted %zu MiB shared with %zu parent(s)\n",
                          reused >> 20, parents_hit);
     }
-    bytes = (size_t) sb.st_size;
+    bytes = (size_t) sb.size;
     st.error = SessionError::none;
     return true;
-#else
-    st.error = SessionError::io; error = "park v2 files are POSIX-only"; return false;
-#endif
 }
 
 // M-C5 pass 1: collect the chunk keys a v2 file names, WITHOUT reading the payload or consulting identity:
@@ -1114,13 +1260,12 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
 // and may be shared with files this boot DOES accept: the caller phantom-references the returned keys so
 // no sweep can unlink them (a later boot with the matching geometry reads the file back whole).
 bool ParkDisk::scan_v2_keys(const std::string& path, std::vector<PdKey>& keys, std::string& error) const {
-#ifndef _WIN32
-    int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW);
+    const int fd = pd_open_ro(path);
     if (fd < 0) { error = "park v2 scan: open: " + std::string(std::strerror(errno)); return false; }
-    struct stat sb;
-    bool ok = ::fstat(fd, &sb) == 0 && S_ISREG(sb.st_mode) && (uint64_t) sb.st_size >= kPd2Body;
+    const PdStat sb = pd_fstat(fd);
+    bool ok = sb.ok && sb.size >= kPd2Body;
     uint8_t h[kPd2Hdr];
-    if (ok && ::pread(fd, h, kPd2Hdr, 0) != (ssize_t) kPd2Hdr) ok = false;
+    if (ok && pd_pread(fd, h, kPd2Hdr, 0) != (intptr_t) kPd2Hdr) ok = false;
     uint32_t ver = 0, hdr = 0;
     uint64_t nblocks = 0, hh = 0;
     if (ok) {
@@ -1132,9 +1277,9 @@ bool ParkDisk::scan_v2_keys(const std::string& path, std::vector<PdKey>& keys, s
     std::vector<uint8_t> tbl;
     if (ok) {
         tbl.resize((size_t) nblocks * kPd2Ent);
-        if (::pread(fd, tbl.data(), tbl.size(), (off_t) kPd2Hdr) != (ssize_t) tbl.size()) ok = false;
+        if (pd_pread(fd, tbl.data(), tbl.size(), (long long) kPd2Hdr) != (intptr_t) tbl.size()) ok = false;
     }
-    ::close(fd);
+    pd_close(fd);
     if (!ok) { error = "park v2 scan: not a structurally valid v2 file"; return false; }
     for (uint64_t i = 0; i < nblocks; ++i) {
         const uint8_t* e = tbl.data() + (size_t) i * kPd2Ent;
@@ -1145,10 +1290,6 @@ bool ParkDisk::scan_v2_keys(const std::string& path, std::vector<PdKey>& keys, s
         if (kind == 1) keys.push_back(PdKey{k0, k1});   // kind 2 names a parent SERIAL: that file shields its own keys
     }
     return true;
-#else
-    error = "park v2 files are POSIX-only";
-    return false;
-#endif
 }
 
 } // namespace strata::core

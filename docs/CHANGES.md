@@ -29,6 +29,22 @@ Layout pass, no content changes to any number:
 
 Counter: 181.
 
+## §177 — Park-disk v2 proven on Windows: spill, restore, token-identical resume across a restart (2026-11-17)
+
+Engine change (canonical lineage, then mirrored here): three files — `src/core/conversation_park_disk.cpp`, `include/strata/core/conversation_park_disk.hpp`, `CMakeLists.txt`.
+
+- The disk tier's own file primitives (`pd_*`) now build on both platforms. POSIX passes them through as before; the Windows branch builds the same operations on the CRT low-level I/O: reparse points refused before the open (the `O_NOFOLLOW` equivalent), link count and size read through `GetFileInformationByHandle` so the single-linked-regular-file rule is a real check on NTFS, publish via `MoveFileEx(REPLACE_EXISTING)`, and `errno` kept live on every failure so the error lines read the same on both sides.
+- Chunk files are created requesting write mode on both platforms. Without it Windows creates them read-only, and the boot-4 corruption-flip test can never flip — the CPU gate failed exactly there.
+- Freshness fix: `ParkDisk::best()` drains finished async spills at its top, the contract `drain_finished()`'s declaration states for every serve-thread call. Without it a same-boot follow-up could not find the conversation it had just spilled: the chunks were on disk and `best()` reported zero tokens.
+- End-to-end measured on the Windows host (locally built CUDA engine, IQ3_S model, a 768 MiB / 4-slot conversation window sized to force eviction):
+  - same boot: the eviction spilled 24,527 tokens to 44 chunk files (1.5 s); the follow-up read them back (405 ms) and reused 24,415 tokens — the follow-up cost 5.3 s against 12.3–12.6 s for the same prompt prefilled fresh.
+  - across a process restart: the store index rebuilt in 430 ms, the restore reused 24,415 tokens again.
+  - the follow-up's answer through the restored path is token-identical to the answer generated live.
+- Engine floor measured alongside: two identical clean disk-off boots diverged their follow-up answers at token 29 — fresh prefill is not bit-reproducible across CUDA boots. The park-cycle identity law therefore compares against the floor first: both sides must be restored from the park store to demand identical answers; a fresh-prefill pair that fails the floor voids the identity claim.
+- Linux re-verified on the same sources: 6/6 conversation + park-disk CPU tests pass with the dual-platform translation.
+
+Counter: 182.
+
 ## §175 — concurrency wording held to the host-vs-decode line (2026-11-17)
 
 A skeptic pass over the §174 headline caught a real seam: "eight

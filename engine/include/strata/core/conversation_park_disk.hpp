@@ -84,9 +84,15 @@ public:
     // The deepest disk prefix reaching this prompt. Fail-closed like common_best: picture-carrying requests
     // never match (their entries' pictures would have to re-verify), and cvec must agree. An entry LONGER
     // than the prompt can still be a match: a parked sibling that grew past this prompt shares its head.
+    // M-C11-win-2: drain at the top, like spill() and load() do (the contract at drain_finished()'s
+    // declaration is "at the top of every serve-thread call"). A spill that finished writing DURING
+    // this boot only flipped Entry::done inside drain_finished(); without the drain here a same-boot
+    // follow-up could never see its own spilled conversation (Windows park-cycle run7: the file was
+    // on disk, best() still reported 0 tokens). Not const anymore: the drain indexes finished writes.
     template<class Token>
-    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const {
+    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) {
         Match best;
+        drain_finished();
         if (dir_.empty() || prompt.empty() || !images.empty()) return best;   // pictures: fail closed
         for (const auto& e : entries_) {
             if (!e.done || e.cvec != cvec) continue;
