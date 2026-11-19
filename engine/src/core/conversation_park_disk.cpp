@@ -1054,6 +1054,107 @@ void ParkDisk::write_v2(const Write& w, const SessionFileIdentity& id, Finished&
     f.view_parents = std::move(c.view_parents);
 }
 
+
+// ---------------------------------------------------------------------------
+// S5a: unbuffered (O_DIRECT) blob reads for park-restore. Design ported from the
+// basalt fork's platform direct I/O (jesdga95/basalt, MIT; ideas adapted, never a
+// merge of the fork): a parked conversation's bytes streamed through the page cache
+// push the expert tier out of it (CHANGES #163: C8 saw 43 s gaps from exactly that).
+// The direct path is transport-only: aligned spans land in per-thread aligned
+// bounces, exact bytes are copied out, so every hash/parse/fail-closed check sees
+// byte-identical data either way. Windows keeps the buffered path (a NO_BUFFERING
+// variant is the follow-up); STRATA_PARK_DIRECT=1 enables (default off = control).
+#ifndef _WIN32
+#include <thread>
+static int pd_open_ro_direct(const std::string& p) {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PARK_DIRECT"); return v && v[0] == '1'; }();
+    if (!on) return pd_open_ro(p);
+    const int fd = ::open(p.c_str(), O_RDONLY | O_NOFOLLOW | O_DIRECT);
+    if (fd >= 0) return fd;
+    if (errno == EINVAL) return pd_open_ro(p);   // filesystem without O_DIRECT (tmpfs, ...): buffered fallback
+    return fd;                                    // ENOENT/EACCES/... propagate as before
+}
+static bool pd_fd_is_direct(int fd) {
+    const int fl = ::fcntl(fd, F_GETFL);
+    return fl >= 0 && (fl & O_DIRECT);
+}
+static size_t pd_direct_threads() {
+    static const size_t n = [] { const char* v = std::getenv("STRATA_PARK_DIRECT_THREADS");
+        int x = v ? std::atoi(v) : 4; if (x < 0) x = 0; if (x > 8) x = 8; return (size_t) x; }();
+    return n;
+}
+// Read [off, off+n) from an O_DIRECT fd: the 4096-aligned span is fetched in up to
+// 2 MiB windows with up to pd_direct_threads() parallel preads (depth keeps NVMe
+// busy; synchronous direct reads one-at-a-time serialize in the kernel), each into
+// its own aligned bounce; the exact requested bytes are then copied to dst.
+// A short answer (EOF/missing) returns the short count or -1 exactly like pd_pread,
+// so feed.missing fail-closed behavior is unchanged.
+static intptr_t pd_pread_direct(int fd, void* dst, size_t n, long long off) {
+    constexpr size_t kAlign = 4096, kChunk = 2u << 20;
+    const size_t head = (size_t) off & (kAlign - 1);
+    const size_t span = head + n;
+    const size_t nwin = (span + kChunk - 1) / kChunk;
+    struct Bounce { void* p = nullptr; size_t bytes = 0; };
+    std::vector<Bounce> bs(nwin);
+    for (size_t w = 0; w < nwin; ++w) {
+        bs[w].bytes = std::min(kChunk, span - w * kChunk);
+        if (posix_memalign(&bs[w].p, kAlign, bs[w].bytes) != 0) {
+            for (auto& b : bs) std::free(b.p);
+            return -1;
+        }
+    }
+    const PdStat sb = pd_fstat(fd);
+    const long long aligned_start = off - (long long) head;
+    const long long avail = sb.ok ? (long long) sb.size - aligned_start : (long long) span;
+    std::vector<int> bad(nwin, 0);
+    auto rd = [&](size_t w0, size_t w1) {
+        for (size_t w = w0; w < w1; ++w) {
+            const long long o = aligned_start + (long long) (w * kChunk);
+            const size_t want = (size_t) std::min<long long>((long long) bs[w].bytes, std::max<long long>(0, avail - (long long) (w * kChunk)));
+            size_t got = 0;
+            while (got < want) {
+                const intptr_t r = ::pread(fd, (char*) bs[w].p + got, want - got, (off_t) (o + (long long) got));
+                if (r <= 0) { if (r < 0 && errno == EINTR) continue; break; }
+                got += (size_t) r;
+            }
+            if (got < want) { bad[w] = 1; continue; }
+            // pad bytes past EOF are never copied; zero them so the copy can't read uninit bounce memory
+            for (size_t g = got; g < bs[w].bytes; ++g) ((char*) bs[w].p)[g] = 0;
+        }
+    };
+    const size_t T = nwin > 1 ? std::min(pd_direct_threads(), nwin) : 1;
+    if (T > 1) {
+        std::vector<std::thread> th;
+        for (size_t t = 0; t < T; ++t) {
+            const size_t a = nwin * t / T, b = nwin * (t + 1) / T;
+            if (a < b) th.emplace_back(rd, a, b);
+        }
+        for (auto& t : th) t.join();
+    } else rd(0, nwin);
+    intptr_t out = (intptr_t) n;
+    for (int b : bad) if (b) { out = -1; break; }
+    if (out == (intptr_t) n) {
+        char* p = (char*) dst; size_t left = n;
+        for (size_t w = 0; w < nwin && left; ++w) {
+            const size_t wstart = w * kChunk;
+            const size_t from = head > wstart ? head - wstart : 0;
+            size_t take2 = std::min(span, (w + 1) * kChunk) - wstart - from;
+            if (take2 > left) take2 = left;
+            std::memcpy(p, (char*) bs[w].p + from, take2);
+            p += take2; left -= take2;
+        }
+    }
+    for (auto& b : bs) std::free(b.p);
+    return out;
+}
+#else
+static int pd_open_ro_direct(const std::string& p) { return pd_open_ro(p); }
+static bool pd_fd_is_direct(int) { return false; }
+// Windows stays buffered until the NO_BUFFERING/OVERLAPPED variant lands: same
+// read semantics as pd_pread below, so the call sites are platform-identical.
+static intptr_t pd_pread_direct(int fd, void* dst, size_t n, long long off) { return pd_pread(fd, dst, n, off); }
+#endif
+
 bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, const SessionReadLimits& limits,
                        SavedConversation& image, size_t& bytes, std::string& error, SessionStatus& st,
                        std::vector<PdKey>* keys, ViewFeed* vf) {
@@ -1140,6 +1241,7 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
         return ok;
     };
     PdKey cur{};
+    bool cur_direct = false;
     SessionHasher bh(0), bh1(kPd2HashSeed1);
     const auto pull = [&](uint8_t* dst, size_t n) -> bool {
         while (n) {
@@ -1167,7 +1269,8 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
                 }
                 else {
                     if (*feed.bfp >= 0) pd_close(*feed.bfp);
-                    *feed.bfp = pd_open_ro(blob_path(PdKey{e.k0, e.k1}));
+                    *feed.bfp = pd_open_ro_direct(blob_path(PdKey{e.k0, e.k1}));
+                    cur_direct = *feed.bfp >= 0 && pd_fd_is_direct(*feed.bfp);
                     if (*feed.bfp < 0) { std::fprintf(stderr, "park disk: dbg miss open %s errno %d\n", blob_path(PdKey{e.k0, e.k1}).c_str(), errno); feed.missing = true; return false; }
                     cur = PdKey{e.k0, e.k1};
                     bh = SessionHasher(0);
@@ -1177,8 +1280,9 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
             }
             const size_t take = std::min(n, block_left);
             const intptr_t r = view_blk ? (take_view(dst, take) ? (intptr_t) take : -1)
-                                        : pd_pread(inline_blk ? ctx.fd : *feed.bfp, dst, take,
-                                                  (long long) (inline_blk ? feed.body_off : block_off));
+                          : inline_blk ? pd_pread(ctx.fd, dst, take, (long long) feed.body_off)
+                          : cur_direct ? pd_pread_direct(*feed.bfp, dst, take, (long long) block_off)
+                                       : pd_pread(*feed.bfp, dst, take, (long long) block_off);
             if (r != (intptr_t) take) {
                 if (inline_blk) { /* short body read below */ }
                 else if (view_blk) feed.no_parent = true;

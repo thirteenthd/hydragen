@@ -266,7 +266,7 @@ def main():
                "agg_decode_tok_s": round(tot_out / wall, 1),
                "ttft_p50": rnd(pct(ttfts, 50)), "ttft_p95": rnd(pct(ttfts, 95)),
                "ttft_max": rnd(max(ttfts)) if ttfts else None,
-               "decode_p50": rnd(pct(decs, 1), 1), "decode_min": rnd(min(decs), 1) if decs else None,
+               "decode_p50": rnd(pct(decs, 50), 1), "decode_min": rnd(min(decs), 1) if decs else None,
                "decode_p10": rnd(pct(decs, 10), 1), "decode_p90": rnd(pct(decs, 90), 1),
                "n_decode_samples": len(decs),
                "max_stall_gap": round(max([r["max_gap"] or 0 for r in rows]), 2),

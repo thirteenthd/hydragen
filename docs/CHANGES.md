@@ -502,3 +502,36 @@ model and quant, which has never been run.
 
 [1] `engine/docs/DETAILS.md`: the `STRATA_ROUTE_TAIL_SKIP (7)` settings row and the 0.1.42
     measurements table.
+
+## §183 — S5a: unbuffered (O_DIRECT) park-restore blob reads, Linux, env-gated (2026-11-19)
+
+Park-disk restores previously read blob bytes through the page cache, so every
+restored conversation displaced expert-pack pages — a named contributor to the §181
+decode stalls (worst 43 s inter-token gap at C8). This adds a transport-only
+alternative gated off by default:
+
+- `STRATA_PARK_DIRECT=1` (default off = existing buffered path, byte-identical):
+  blob opens use `O_DIRECT` (EINVAL -> buffered fallback for tmpfs or filesystems
+  without it); reads go through per-thread 4096-aligned bounce buffers (2 MiB),
+  fetching the aligned span in up to 4 parallel `pread`s
+  (`STRATA_PARK_DIRECT_THREADS=0..8`, default 4). Exact-byte copy out; short-read
+  and EOF counts are identical to `pd_pread`, so every hash/parse fail-closed check
+  sees the same bytes as before. Design ported from the DirectFile read-parts
+  pattern in the MIT-licensed basalt fork (jesdga95/basalt, read at 63cb68ad) as
+  reference; implementation native to this tree.
+- Windows keeps the buffered path (stub at the platform boundary; the
+  `NO_BUFFERING`/`OVERLAPPED` variant is a follow-up). Linux/Windows call sites are
+  platform-identical; the Windows build compiles the stubs.
+- Measured on modelserver01 (RTX 3080 Ti 12 GB, 64 GB DDR4, engine fork at §181 +
+  this patch): `m25_parkladder100k` N=4 (4 x ~99k-token siblings sharing a 66.5k
+  head) with an engine restart between the seed and restore phases, so every
+  restore must read the disk blob: restore recall 12/12 under `STRATA_PARK_DIRECT=1`
+  across two runs; restore wall times identical between direct and buffered arms
+  to 0.1 s (55.5/25.8/26.2/25.9 s) — latency neutral; the engine's `read_bytes`
+  (block-device reads; page-cache hits do not count) rose +779 MB across the restore
+  phase on the direct arm, and system `Cached` fell across the phase instead of
+  climbing — restore bytes stay out of the page cache, which is the point.
+- Harness fix in the same change: `bench/m25_conc8_sweep.py` top-level
+  `decode_p50` printed `pct(decs, 1)` — the 1st percentile, not the median.
+  Values emitted under that label before this fix are p1 (comparisons stayed valid
+  because both arms carried the same bug); corrected to `pct(decs, 50)`.
