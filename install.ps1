@@ -21,6 +21,10 @@
 #                    "--wait --quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
 #   cmake + ninja come from pip (engine/requirements-build.txt); nothing else to install.
 #
+#   Run it from a clone of THIS repo (the serve layer, configs, expert-routing
+#   profile and SETUP.bat all live here; the prebuilt zip only carries the engine
+#   binary and its CUDA DLLs):
+#     git clone https://github.com/thirteenthd/hydragen && cd hydragen
 #   .\install.ps1                                  # prebuilt if available, else source (sm_86)
 #   .\install.ps1 -BuildFromSource                 # never run a downloaded binary; compile locally
 #   .\install.ps1 -Model IQ3_S                     # wire the local config for the IQ3_S model tier (default: IQ3_XXS)
@@ -63,8 +67,14 @@ if (-not $BuildFromSource) {
   $base = "https://github.com/thirteenthd/hydragen/releases/download/$RELEASE_TAG"
   $zip = Join-Path $env:TEMP "hydragen-windows-cuda-x86_64.zip"
   try {
+    Write-Host "install.ps1: DOWNLOADING the prebuilt CUDA engine from GitHub Releases (the slow step:"
+    Write-Host "             a ~100 MB zip to $zip). PowerShell labels this 'Writing web request ...'"
+    Write-Host "             while bytes arrive - the climbing byte counter IS the download; a frozen"
+    Write-Host "             0 means the connection is stalling. Timeout for the zip: 15 min."
+    $dl0 = Get-Date
     Invoke-WebRequest -UseBasicParsing -Uri "$base/SHA256SUMS.txt" -OutFile "$zip.sha256sums" -TimeoutSec 30 | Out-Null
     Invoke-WebRequest -UseBasicParsing -Uri "$base/hydragen-windows-cuda-x86_64.zip" -OutFile $zip -TimeoutSec 900 | Out-Null
+    Write-Host ("install.ps1: download done: {0} MiB in {1} s - verifying SHA-256..." -f [math]::Round((Get-Item $zip).Length/1MB,1), [int](((Get-Date)-$dl0).TotalSeconds))
     $want = ((Get-Content "$zip.sha256sums" | Where-Object { $_ -match "windows-cuda" } | Select-Object -First 1) -split '\s+')[0]
     $have = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
     if ($want -and $have -eq $want.ToLower()) {

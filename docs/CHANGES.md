@@ -408,6 +408,17 @@ under expert-stream re-reads, not link).
 Suite rerun (run2, same four arms, warm box this time): measures run-to-run variance
 and steady-state tier behavior; results appended to this entry when complete.
 
+## §182 — installer UX: prebuilt download step announced, repo-clone requirement stated (2026-11-19)
+
+`install.ps1` now prints what the prebuilt-engine download IS before it starts
+(the slow step: ~100 MB zip from GitHub Releases; PowerShell's own progress label
+reads "Writing web request ..." while bytes land on disk, which reads like an
+upload), and reports size + elapsed seconds when done. The usage header now states
+explicitly that the installer runs from a clone of this repo: the prebuilt zip
+carries only the engine binary + CUDA DLLs; the serve layer, configs, expert-routing
+profile and SETUP.bat live in the checkout. Message-only change; behavior
+(hash verify, fallback to source build) unchanged.
+
 ## §181 — engine/ synced to upstream Strata 0.1.60; answer-stream delta and re-notarized battery constants (2026-11-18)
 
 `engine/` is now upstream 0.1.60 (`38f63bc5`) with the fork overlay reapplied: 49 fork
