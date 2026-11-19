@@ -535,3 +535,30 @@ alternative gated off by default:
   `decode_p50` printed `pct(decs, 1)` — the 1st percentile, not the median.
   Values emitted under that label before this fix are p1 (comparisons stayed valid
   because both arms carried the same bug); corrected to `pct(decs, 50)`.
+
+## §184 — S4 v1: /slots exposes per-slot idleness and held conversations (2026-11-19)
+
+A multi-agent client (several Hermes sessions sharing one engine) needs to know
+BEFORE sending what the batch slots hold and how long they have been idle -
+the pre-refusal compaction question basalt answers with an elastic KV ceiling.
+This is the serve-layer half of that, engine-agnostic:
+
+- `GET /slots` per-slot entries gain three fields: `state` (idle / reading /
+  decoding), `held_tokens` (the conversation the slot keeps for its next turn)
+  and `idle_s` (seconds since the slot was last released; null: never used since
+  the engine started). Existing fields unchanged; purely additive.
+- Mechanism: a `slot_t_free` timestamp stamped at every busy->free transition in
+  the batch manager, surfaced through the existing `slots_view()`, which
+  `/slots` and the `/metrics` live view already shared.
+
+Scoped-read finding (why basalt's idle-KV timer was NOT ported): this engine
+already evicts cached slots LRU at admission (`pick_slot`), parks the held
+conversation BEFORE the overwrite when it can (`park_slot`, all guards), and
+restores from the park tier at admission (`park_disk.best` -> load -> resume).
+Idle VRAM cost under `--batch` + `--kv-resident` streaming is just each idle
+slot's resident KV window; recycling those windows (attach/detach with graph
+re-capture) is recorded as the follow-up - it is also the ownership layer S2b
+(shared read-only prefix blocks + CoW) needs. Verified on modelserver01: two
+concurrent requests landed on separate slots; `/slots` reported
+`held_tokens` 317/318 and `idle_s` 0.1/0.0 on the two released slots, null on
+the two never used.

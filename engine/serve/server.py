@@ -1418,6 +1418,7 @@ class StrataEngine:
         self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
+        self.slot_t_free = [0.0] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
         # given back; slot_releasing: slots handed to the background BDONE wait.  A busy slot in neither has no owner
         # (its flag leaked) and would keep every later request waiting for a slot that nothing will free.
@@ -1822,7 +1823,7 @@ class StrataEngine:
                         self._release_slot_when_done(slot, None, born)      # it went on in the slot: BSTOP, free at BDONE
                     else:
                         with self.slot_cv:
-                            self.slot_busy[slot] = False
+                            self.slot_busy[slot] = False; self.slot_t_free[slot] = time.time()
                             self.slot_releasing.discard(slot)
                             self.slot_cv.notify_all()
             finally:
@@ -2089,7 +2090,7 @@ class StrataEngine:
             if busy and b not in self.slot_claims and b not in self.slot_releasing:
                 first = self._orphan_seen.setdefault(b, now)
                 if now - first >= self.ORPHAN_SLOT_S:
-                    self.slot_busy[b] = False
+                    self.slot_busy[b] = False; self.slot_t_free[b] = time.time()
                     self._orphan_seen.pop(b, None)
                     freed.append(b)
             else:
@@ -2179,7 +2180,7 @@ class StrataEngine:
             return
         cancel._strata_preslot = None
         with self.slot_cv:
-            self.slot_busy[slot] = False
+            self.slot_busy[slot] = False; self.slot_t_free[slot] = time.time()
             self.slot_claims.discard(slot)
             self.slot_cv.notify_all()
 
@@ -2369,7 +2370,7 @@ class StrataEngine:
                         slot, reserved = reserved, None     # gave way: the read goes on in that slot (below)
                     elif reserved is not None:              # it did not give way: the slot is free again
                         with self.slot_cv:
-                            self.slot_busy[reserved] = False
+                            self.slot_busy[reserved] = False; self.slot_t_free[reserved] = time.time()
                             self.slot_claims.discard(reserved)
                             self.slot_cv.notify_all()
                         reserved = None
@@ -2581,7 +2582,7 @@ class StrataEngine:
                             self.slot_live[slot] = None
                             self.slot_used[slot] = time.time()
                             with self.slot_cv:
-                                self.slot_busy[slot] = False
+                                self.slot_busy[slot] = False; self.slot_t_free[slot] = time.time()
                                 self.slot_claims.discard(slot)
                                 self.slot_cv.notify_all()
                             slot, gen0 = None, None
@@ -2638,7 +2639,7 @@ class StrataEngine:
                     self.admitting = max(0, self.admitting - 1)
             if reserved is not None and same:
                 with self.slot_cv:
-                    self.slot_busy[reserved] = False
+                    self.slot_busy[reserved] = False; self.slot_t_free[reserved] = time.time()
                     self.slot_claims.discard(reserved)
                     self.slot_cv.notify_all()
             if slot is not None and same and not handed:
@@ -2648,7 +2649,7 @@ class StrataEngine:
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
                     self.slot_held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
                     with self.slot_cv:
-                        self.slot_busy[slot] = False
+                        self.slot_busy[slot] = False; self.slot_t_free[slot] = time.time()
                         self.slot_claims.discard(slot)
                         self.slot_cv.notify_all()
                 elif phase == "slot":
@@ -2658,7 +2659,7 @@ class StrataEngine:
                     self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
                 else:
                     with self.slot_cv:
-                        self.slot_busy[slot] = False
+                        self.slot_busy[slot] = False; self.slot_t_free[slot] = time.time()
                         self.slot_claims.discard(slot)
                         self.slot_cv.notify_all()
 
@@ -2752,7 +2753,8 @@ class StrataEngine:
         for b in range(self.batch):
             r = self.slot_live[b]
             if r is None:
-                view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b])})
+                view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b]),
+                             "idle_s": round(now - self.slot_t_free[b], 1) if self.slot_t_free[b] else None})
                 continue
             ft = r.get("first_token")
             view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
@@ -8284,7 +8286,10 @@ def make_handler(svc: Service):
                         # --batch: one entry per slot (the same view /metrics has), not one for the whole engine
                         n_ctx = svc.reported_ctx()
                         slots = [{"id": s["slot"], "n_ctx": n_ctx, "is_processing": s["state"] != "idle",
-                                  "n_prompt_tokens": int(s.get("prompt_tokens") or s.get("held_tokens") or 0)}
+                                  "n_prompt_tokens": int(s.get("prompt_tokens") or s.get("held_tokens") or 0),
+                                  "state": s["state"],
+                                  "held_tokens": int(s.get("held_tokens") or 0),
+                                  "idle_s": s.get("idle_s")}
                                  for s in svc.engine.slots_view()]
                     else:
                         slots = [{"id": 0, "n_ctx": svc.reported_ctx(), "is_processing": busy,
