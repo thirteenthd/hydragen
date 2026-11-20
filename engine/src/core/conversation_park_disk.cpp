@@ -603,7 +603,8 @@ std::vector<int32_t> ParkDisk::ids(uint64_t serial) const {
     return {};
 }
 
-std::optional<SavedConversation> ParkDisk::load(Match m, std::string& error) {
+std::optional<SavedConversation> ParkDisk::load(Match m, std::string& error,
+                                                const std::vector<const SavedConversation*>* donors) {
     drain_finished();
     const auto it = std::find_if(entries_.begin(), entries_.end(),
                                  [&](const Entry& e) { return e.serial == m.serial && e.done; });
@@ -621,7 +622,8 @@ std::optional<SavedConversation> ParkDisk::load(Match m, std::string& error) {
     const auto t0 = std::chrono::steady_clock::now();
     const bool v2_file = file_is_v2(it->path);
     ViewFeed vf;   // M-C3b3: a view child assembles through its parent (transients die with this load)
-    const bool read_ok = v2_file ? read_v2(it->path, *id, limits, image, bytes, error, st, nullptr, &vf)
+    ReadStats rs;
+    const bool read_ok = v2_file ? read_v2(it->path, *id, limits, image, bytes, error, st, nullptr, &vf, donors, &rs)
                                  : session_file_read(it->path, *id, image, bytes, error, limits, &st);
     if (!read_ok) {
         if (st.error == SessionError::invalid) {   // corrupt: never again
@@ -651,10 +653,15 @@ std::optional<SavedConversation> ParkDisk::load(Match m, std::string& error) {
         bytes_ += bytes - it->bytes;
         it->bytes = bytes;
     }
+    const std::string dstat = rs.ram_blocks
+        ? " delta: " + std::to_string(rs.ram_bytes >> 20) + " MiB from RAM"
+          + " / " + std::to_string(rs.disk_bytes >> 20) + " MiB from store"
+        : std::string();
     std::fprintf(stderr, "strata serve: park disk: restored %zu tokens, %.1f MiB read in %.0f ms "
-                         "(%zu entries, %.1f GiB on disk)\n",
+                         "(%zu entries, %.1f GiB on disk)%s\n",
                  image.live.ids.size(), (double) bytes / (1024.0 * 1024.0), ms,
-                 entries_.size(), (double) bytes_ / (1024.0 * 1024.0 * 1024.0));
+                 entries_.size(), (double) bytes_ / (1024.0 * 1024.0 * 1024.0),
+                 dstat.c_str());   // NOTE: a std::string temporary here would die before the call reads it
     return image;
 }
 
@@ -1005,6 +1012,11 @@ void ParkDisk::write_v2(const Write& w, const SessionFileIdentity& id, Finished&
     // scalar region: fixed 256 KiB grid from the region start; KV buffers: cell-aligned blocks.
     uint64_t next_cut = kPd3Cut, sblk = 0;
     int64_t cur_L = INT64_MIN; int cur_part = -1; uint64_t cur_b = UINT64_MAX;
+    // S5c: open the FIRST block with a salt. Without this the first payload block (the scalar head:
+    // geometry, ids) flushed with an all-zero salt, which is not self-distinguishing: S5c's probe
+    // reads that salt as a real KV fact (layer 0, part 0, head cells, whose ladder ph is also 0)
+    // and would serve bytes of the wrong region. A no-op flush here (empty slices) is harmless.
+    put_salt(0, -1, 0xFFFFFFFFu, 0);
     const bool walk_ok = session_payload_bcs(w.image,
         [&](uint64_t off, const uint8_t* p, size_t n) -> bool {
             phash.update(p, n);
@@ -1198,7 +1210,8 @@ static intptr_t pd_pread_direct(int fd, void* dst, size_t n, long long off) { re
 
 bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, const SessionReadLimits& limits,
                        SavedConversation& image, size_t& bytes, std::string& error, SessionStatus& st,
-                       std::vector<PdKey>* keys, ViewFeed* vf) {
+                       std::vector<PdKey>* keys, ViewFeed* vf,
+                       const std::vector<const SavedConversation*>* donors, ReadStats* rs) {
     struct Ctx {
         int fd = -1, bfd = -1;
         ~Ctx() { if (bfd >= 0) pd_close(bfd); if (fd >= 0) pd_close(fd); }
@@ -1262,19 +1275,64 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
             st.error = SessionError::memory; error = "park v2: RAM preflight: " + why; return false;
         }
     }
+    // S5c: salt-to-donor reuse. A v3 table entry names its bytes exactly: (prefix-ladder hash,
+    // layer, part, first cell). A RAM-resident sibling whose own ladder agrees at that cell range
+    // holds the same bytes for the same ids and the same geometry - so its buffer can serve the
+    // block instead of the store. Integrity is NOT relaxed: every served block is still re-hashed
+    // against the entry key (same as the disk path). If a donor's bytes ever disagree (identical
+    // ids, non-identical prefill bytes), the read retries cleanly from the store: the partial
+    // assembly is discarded, the file is never blamed. The ladder is recomputed from the donor's
+    // ids with the writer's formula: hashes only, no KV bytes touched. The caller keeps the donor
+    // alive and immobile (ConversationCache::guard) for the duration of this call.
+    struct DonorIndex {
+        std::vector<uint64_t> phv;                                   // prefix ladder
+        std::vector<std::array<const ConversationBuffer*, 5>> bufs;  // per layer: k,v,k_scale,v_scale,pooled
+        std::vector<size_t> stride;                                  // per layer: bytes per cell (0: non-uniform)
+    };
+    std::vector<DonorIndex> donors_idx;
+    if (donors && !std::getenv("S5C_NOIDX")) for (const SavedConversation* d : *donors) {
+        if (!d) continue;
+        DonorIndex dn;
+        uint64_t maxc = 1;
+        for (const auto& k : d->kv) maxc = std::max<uint64_t>(maxc, (uint64_t) std::max<int64_t>(k.cells, 1));
+        dn.phv.resize((size_t) ((maxc + kPd3KvCells - 1) / kPd3KvCells) + 2);
+        {
+            SessionHasher hh(0);
+            dn.phv[0] = 0;
+            const auto& ids_d = d->live.ids;
+            size_t have = 0;
+            for (size_t i = 1; i < dn.phv.size(); ++i) {
+                const size_t want = std::min<size_t>(i * kPd3KvCells, ids_d.size());
+                if (want > have) hh.update(ids_d.data() + have, (want - have) * sizeof(*ids_d.data()));
+                have = want;
+                dn.phv[i] = hh.digest();
+            }
+        }
+        dn.bufs.resize(d->kv.size());
+        dn.stride.resize(d->kv.size(), 0);
+        for (size_t li = 0; li < d->kv.size(); ++li) {
+            const ConversationKv& k = d->kv[li];
+            const ConversationBuffer* bps[5] = { &k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled };
+            for (int p = 0; p < 5; ++p) dn.bufs[li][(size_t) p] = bps[p];
+            if (k.cells > 0 && k.k.size() % (size_t) k.cells == 0) dn.stride[li] = k.k.size() / (size_t) k.cells;   // size(), not bytes(): bytes() counts capacity
+        }
+        donors_idx.push_back(std::move(dn));
+    }
     // the assembled read: inline blocks stream from this file, chunks from the store, and every chunk's
     // own key is RECOMPUTED while its bytes serve the parser: a mutated chunk fails closed here
     struct Feed {
         std::vector<Ent2>::const_iterator it;
         uint64_t body_off = kPd3Body;
         int* bfp;
-        bool missing = false, bad_chunk = false;
-    } feed{ents.begin(), kPd3Body, &ctx.bfd, false, false};
+        bool missing = false, bad_chunk = false, delta_fail = false;
+    } feed{ents.begin(), kPd3Body, &ctx.bfd, false, false, false};
     uint64_t block_left = 0, block_off = 0;
     bool hashing = false, inline_blk = false;
     const uint8_t* cur_salt = nullptr;   // S5b: the salt of the blob being served (into its table entry)
     PdKey cur{};
     bool cur_direct = false;
+    const ConversationBuffer* ram_bp = nullptr;   // S5c: donor buffer serving the current block
+    size_t ram_base = 0;
     SessionHasher bh(0), bh1(kPd2HashSeed1);
     const auto pull = [&](uint8_t* dst, size_t n) -> bool {
         while (n) {
@@ -1284,15 +1342,76 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
                 inline_blk = e.kind == 0;
                 block_left = e.len;
                 block_off = 0;
+                ram_bp = nullptr;
+
                 if (inline_blk) {
                     // inline blocks stream from the .ses body; they have no chunk file and their
                     // integrity rides on the payload hash — no store open, no per-block re-hash.
                     hashing = false;
                 } else {
-                    if (*feed.bfp >= 0) pd_close(*feed.bfp);
-                    *feed.bfp = pd_open_ro_direct(blob_path(PdKey{e.k0, e.k1}));
-                    cur_direct = *feed.bfp >= 0 && pd_fd_is_direct(*feed.bfp);
-                    if (*feed.bfp < 0) { feed.missing = true; return false; }
+                    // S5c: does a guarded RAM donor already hold this exact cell range? The salt
+                    // names it; the ladder says the donor's ids agree there. Bytes are still
+                    // re-hashed below - a disagreeing donor retries the read from the store.
+                    for (const DonorIndex& dn : donors_idx) {
+                        uint64_t ph; int64_t L; uint32_t part; int64_t c0;
+                        std::memcpy(&ph, e.salt + 0, 8);
+                        std::memcpy(&L, e.salt + 8, 8);
+                        std::memcpy(&part, e.salt + 16, 4);
+                        std::memcpy(&c0, e.salt + 24, 8);
+                        static const bool s5c_trace = std::getenv("STRATA_PARK_DELTA_TRACE") != nullptr;
+                        static std::atomic<int> s5c_shown{0};
+                        const bool s5c_t = s5c_trace && s5c_shown.fetch_add(1) < 8;
+                        if (L < 0 || part > 4 || c0 < 0 || (size_t) L >= dn.bufs.size()) {
+                            if (s5c_t) std::fprintf(stderr, "strata park: delta probe skip L=%lld part=%u c0=%llu bufs=%zu\n",
+                                                    (long long) L, part, (unsigned long long) c0, dn.bufs.size());
+                            continue;
+                        }
+                        const size_t sd = dn.stride[(size_t) L];
+                        if (!sd) {
+                            if (s5c_t) std::fprintf(stderr, "strata park: delta probe skip stride0 L=%lld\n", (long long) L);
+                            continue;
+                        }
+                        const uint64_t bi = (uint64_t) c0 / kPd3KvCells;
+                        if (bi >= dn.phv.size() || dn.phv[(size_t) bi] != ph) {
+                            if (s5c_t) std::fprintf(stderr, "strata park: delta probe miss ladder L=%lld part=%u c0=%llu bi=%llu want=%016llx got=%016llx phv_n=%zu\n",
+                                                    (long long) L, part, (unsigned long long) c0, (unsigned long long) bi,
+                                                    (unsigned long long) ph,
+                                                    bi < dn.phv.size() ? (unsigned long long) dn.phv[(size_t) bi] : 0ull,
+                                                    dn.phv.size());
+                            continue;
+                        }
+                        const ConversationBuffer* bp = dn.bufs[(size_t) L][(size_t) part];
+                        const uint64_t boff = (uint64_t) c0 * sd;
+                        if (!bp || boff + e.len > bp->size()) {
+                            if (s5c_t) std::fprintf(stderr, "strata park: delta probe skip range L=%lld part=%u c0=%llu len=%llu boff=%llu bytes=%llu\n",
+                                                    (long long) L, part, (unsigned long long) c0,
+                                                    (unsigned long long) e.len, (unsigned long long) boff,
+                                                    bp ? (unsigned long long) bp->bytes() : 0ull);
+                            continue;
+                        }
+                        if (e.len != kPd3KvCells * sd && boff + e.len != bp->size()) {
+                            if (s5c_t) std::fprintf(stderr, "strata park: delta probe skip shape L=%lld part=%u c0=%llu len=%llu 4096sd=%llu end=%d\n",
+                                                    (long long) L, part, (unsigned long long) c0,
+                                                    (unsigned long long) e.len, (unsigned long long) (kPd3KvCells * sd),
+                                                    (int) (boff + e.len == bp->bytes()));
+                            continue;
+                        }
+                        if (s5c_t) std::fprintf(stderr, "strata park: delta probe HIT L=%lld part=%u c0=%llu len=%llu\n",
+                                                (long long) L, part, (unsigned long long) c0, (unsigned long long) e.len);
+                        ram_bp = bp; ram_base = (size_t) boff;
+                        break;
+                    }
+                    if (ram_bp) {
+                        if (rs) { ++rs->ram_blocks; rs->ram_bytes += e.len; }
+                        ++delta_blocks_; delta_bytes_ += e.len;
+                    } else {
+                        if (*feed.bfp >= 0) pd_close(*feed.bfp);
+                        *feed.bfp = pd_open_ro_direct(blob_path(PdKey{e.k0, e.k1}));
+                        cur_direct = *feed.bfp >= 0 && pd_fd_is_direct(*feed.bfp);
+                        if (*feed.bfp < 0) { feed.missing = true; return false; }
+                        if (rs) { ++rs->disk_blocks; rs->disk_bytes += e.len; }
+                        disk_read_bytes_ += e.len;
+                    }
                     cur = PdKey{e.k0, e.k1};
                     cur_salt = e.salt;                       // S5b: re-hash served bytes against the entry's salt
                     bh = SessionHasher(0);  bh.update(cur_salt, 32);
@@ -1302,10 +1421,12 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
             }
             const size_t take = std::min(n, block_left);
             const intptr_t r = inline_blk ? pd_pread(ctx.fd, dst, take, (long long) feed.body_off)
+                          : ram_bp ? (ram_bp->read(dst, ram_base + (size_t) block_off, take) ? (intptr_t) take : (intptr_t) -1)
                           : cur_direct ? pd_pread_direct(*feed.bfp, dst, take, (long long) block_off)
                                        : pd_pread(*feed.bfp, dst, take, (long long) block_off);
             if (r != (intptr_t) take) {
                 if (inline_blk) { /* short body read below */ }
+                else if (ram_bp) feed.delta_fail = true;
                 else feed.missing = true;
                 return false;
             }
@@ -1317,14 +1438,39 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
             n -= take;
             if (block_left == 0) {
                 if (hashing && keys) keys->push_back(cur);
-                if (hashing && (bh.digest() != cur.k0 || bh1.digest() != cur.k1)) { feed.bad_chunk = true; return false; }
+                if (hashing && (bh.digest() != cur.k0 || bh1.digest() != cur.k1)) {
+                    if (ram_bp) feed.delta_fail = true;   // S5c: donor disagreed: the file is NOT blamed
+                    else feed.bad_chunk = true;
+                    return false;
+                }
                 ++feed.it;
             }
         }
         return true;
     };
     SessionError pkind = SessionError::invalid;
-    if (!session_payload_unblocks(payload, phash, pull, image, limits, error, &pkind)) {
+    bool read_ok2 = session_payload_unblocks(payload, phash, pull, image, limits, error, &pkind);
+    if (!read_ok2 && feed.delta_fail) {
+        // S5c: a salt-matched donor block failed its re-hash: the same-ids-same-bytes premise broke
+        // for this lineage. Throw the partial assembly away and serve the whole read from the
+        // store, with integrity checks as usual. The file is untouched; divergence is logged -
+        // it is worth knowing about, and the retry must stay rare.
+        std::fprintf(stderr, "strata park: delta: donor bytes disagreed; re-reading the restore from the store\n");
+        ++delta_events_;   // a divergence event: bytes accounting stays with the hit path
+        image = SavedConversation{};
+        if (keys) keys->clear();
+        feed.it = ents.begin(); feed.body_off = kPd3Body;
+        feed.missing = feed.bad_chunk = feed.delta_fail = false;
+        block_left = block_off = 0; hashing = false; inline_blk = false; cur_direct = false;
+        ram_bp = nullptr; cur_salt = nullptr;
+        bh = SessionHasher(0); bh1 = SessionHasher(kPd2HashSeed1);
+        pkind = SessionError::invalid;
+        error.clear();
+        donors_idx.clear();   // this read now runs entirely on the store
+        if (rs) { rs->ram_blocks = 0; rs->ram_bytes = 0; }
+        read_ok2 = session_payload_unblocks(payload, phash, pull, image, limits, error, &pkind);
+    }
+    if (!read_ok2) {
         if (feed.missing) { st.error = SessionError::invalid; error = "park v2: a chunk file is missing or truncated"; }
         else if (feed.bad_chunk) { st.error = SessionError::invalid; error = "park v2: a chunk failed its key (corrupt)"; }
         else { st.error = pkind; if (error.empty()) error = "park v2: parse failed"; }

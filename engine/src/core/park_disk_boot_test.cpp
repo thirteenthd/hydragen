@@ -499,6 +499,33 @@ int main() {
             check(img.has_value(), "v3lin: child restores reading only the shared chunks");
             if (img) check(same(*img, Ccopy), "v3lin: restore is byte-identical");
         }
+        // ---- S5c: salt-to-donor delta serve on live-shape geometry (chunked 256 KiB KV blocks;
+        // make_image's KV is too small to blob). (a) A donor that IS the spilled image's RAM twin:
+        // every salted KV block must serve from RAM and the restore stays byte-identical. (b) The
+        // same donor with one corrupted byte in a covered block: the salt still matches (ids are
+        // untouched) but the re-hash does not - the read retries on the store, the file is never
+        // blamed, and the restored bytes are exactly the ones that were written.
+        {
+            SavedConversation L = make_live_image(27, 200000);
+            const SavedConversation Lcopy(L);
+            pd.spill(SavedConversation(L), -1);
+            wait_for([&] { return list_ses(dirv).size() == 3; }, "s5c: L published");
+            const std::vector<const SavedConversation*> dlist{ &L };
+            const uint64_t db0 = pd.delta_blocks(), de0 = pd.delta_events();
+            const uint64_t rb0 = pd.delta_bytes(), dr0 = pd.disk_read_bytes();
+            const auto mL = pd.best(L.live.ids, {}, false);
+            std::string errA;
+            const auto imgA = pd.load(mL, errA, std::getenv("S5C_OFF") ? nullptr : &dlist);
+check(imgA.has_value() && same(*imgA, Lcopy), "s5c: RAM-twin restore is byte-identical");
+            // 6 layers x (k+v) x 48 COMPLETE 4096-cell blocks = 576; measured 582 (tails beyond
+            // the donor end and inline tails take other paths) - the assertion holds the floor.
+            check(pd.delta_blocks() - db0 >= 2 * L.kv.size() * 48, "s5c: every complete KV block served from RAM");
+            check(pd.delta_bytes() - rb0 >= (pd.delta_blocks() - db0) * 262144, "s5c: every served block carried its full 256 KiB");   // cumulative-safe: bytes scale with blocks
+            L.kv[3].k.visit((size_t) 10 * 4096 * 64 + 8, 1, [](uint8_t* q, size_t, size_t) { *q ^= 0xFF; return true; });
+            const auto imgB = pd.load(mL, errA, &dlist);
+            check(imgB.has_value() && same(*imgB, Lcopy), "s5c: a divergent donor retries from the store, byte-identical");
+            check(pd.delta_events() - de0 == 1, "s5c: divergence recorded exactly once");
+        }
         g_pd = nullptr;
     }
     fs::remove_all(dirv);

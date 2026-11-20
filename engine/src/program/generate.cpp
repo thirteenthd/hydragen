@@ -17506,7 +17506,28 @@ int main(int argc, char** argv) {
                 const auto d = deep_resume ? disk_best : park_disk.best(ids, req_imgs, want_cvec);
                 if (d.tokens > disk_gate) {
                     std::string derr;
-                    if (auto img = park_disk.load(d, derr)) {
+                    // S5c: hand the read a RAM donor. A parked sibling whose head agrees with this
+                    // prompt shares whole salt-named cell ranges with the file; the read serves those
+                    // from the sibling's buffers and touches the store only for the rest. The donor is
+                    // guarded across the load (guards nest, S191) so the room loop cannot move it.
+                    static const bool pd_delta = [] {
+                        const char* v = hg_getenv("STRATA_PARK_DELTA");
+                        return !(v && v[0] == '0');
+                    }();
+                    std::vector<const strata::core::SavedConversation*> dn_list;
+                    bool dn_guarded = false;
+                    if (pd_delta) {
+                        const auto m2 = conversations.common_best(ids, req_imgs, want_cvec);
+                        if (m2.tokens > 0 && m2.tokens < (int64_t) ids.size())
+                            if (const auto* dn2 = conversations.find(m2.serial)) {
+                                conversations.guard(m2.serial);
+                                dn_guarded = true;
+                                dn_list.push_back(dn2);
+                            }
+                    }
+                    auto img = park_disk.load(d, derr, dn_list.empty() ? nullptr : &dn_list);
+                    if (dn_guarded) conversations.unguard();
+                    if (img) {
                         // M-C3b2a: the restored image re-joins the RAM tier's CoW immediately: a parked
                         // donor with a longer shared token prefix turns the byte-identical aligned prefix
                         // into views (verify-then-view), so the fleet keeps owning only its tails.

@@ -775,3 +775,46 @@ device, park-disk ON with a clean index (0 refused, 0 quarantined), and the
 4-point needle battery ran `4/4` on engine 0.1.60 - needles recovered at
 depths 2 500/6 000/12 000/22 000 words (prompt 18 995/46 993/96 994/186 994
 tokens) with `overflow_fields={}`.
+
+## §194 — S5c-v3: delta restore — a guarded RAM sibling serves the blocks it already holds (2026-11-20)
+
+The v3 salt names every chunked block exactly: (prefix-ladder hash, layer, part, first cell).
+A restore already has a sibling in RAM (the cache donor the lineage spilled from, §186). If the
+sibling's own ladder — recomputed from its ids, hashes only, no KV bytes touched — agrees with an
+entry's salt, its buffer serves the block: a memcpy instead of a store read. Integrity is NOT
+relaxed: every RAM-served block is still re-hashed against the entry key, exactly like a disk
+block. A donor whose bytes disagree (same ids, non-identical prefill) is a RETRY event, not an
+error: the partial assembly is discarded, the read restarts from the store, the file is never
+blamed, and the event is counted (`delta_events`, want: ~0).
+
+Hook: the deep-resume call site hoists one donor via `ConversationCache::common_best` and holds
+the PARK GUARD across the load (guards nest, §191). `STRATA_PARK_DELTA=0` disables the path
+(default ON). `read_v2(..., donors, ReadStats*)` and `load(Match, err, donors)` carry the donor
+list; the restore line now prints `delta: X MiB from RAM / Y MiB from store`.
+
+Writer fix this exposed: the v3 writer flushed the FIRST payload block before any salt was set,
+so the scalar head carried an all-zero salt - which is not self-distinguishing (the KV head block
+salt is also all-zero: phv[0]=0, layer 0, part 0, cell 0). The probe read it as a real KV fact and
+served geometry bytes from a KV buffer; the re-hash caught it (fail-closed, as designed), and every
+sibling restore then silently paid a full store retry. The writer now seeds the scalar grid's
+first salt before the walk. Other blocks' salts - and their chunk keys - are byte-identical to
+before, so no park era is invalidated by this fix.
+
+Gate (`park_disk_boot_test`, ms01, ship-byte): new s5c arm - a 200,000-cell live-shape image
+spilled, then restored against its RAM twin. Byte-identical restore; 582 blocks (155.8 MiB)
+served from RAM, 3.4 MiB from store; the assertion floor is every COMPLETE 4096-cell KV block
+(6 layers x k+v x 48 = 576). A divergent donor (one byte flipped inside a salt-covered block)
+restores byte-identical from the store with exactly one `delta_events` bump. Suite: **56 checks
+passed** (was 51); targeted ctest 26/27 - the one failure is `expert_cache_segmented_test`
+opening 0.09 GiB of expert cache while :8181 holds ms01's VRAM (known per-node constraint,
+unrelated to park).
+
+A/B (same file, same box, ms01 boot-test): warm 200k-cell restore 55-57 ms store-only vs
+52 ms delta-served; cold delta 102 ms vs cold store 158 ms. Bytes moved from the store fell
+~98% (159.2 MiB -> 3.4 MiB for a twin restore). Transport speed was already at the pageable
+ceiling (§190) - this is the fewer-bytes lever, and it composes with everything upstream.
+
+Files: `conversation_park_disk.{hpp,cpp}` (ReadStats, donor index in read_v2, probe + retry,
+writer salt seed, counters), `generate.cpp` (call-site donor hoist + guard + `STRATA_PARK_DELTA`),
+`park_disk_boot_test.cpp` (s5c arm). Ship md5 (local == ms01): park_disk.cpp `1c0f1993…`,
+hpp `4b0c1bb4…`, generate.cpp `6ef2054a…`, boot_test.cpp `234e0e5e…`.

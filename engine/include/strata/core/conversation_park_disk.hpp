@@ -107,7 +107,9 @@ public:
     // Re-reads the matched file (identity, limits, payload hash - all of it). Null on any failure; a file that
     // fails VALIDATION is deleted from the tier, a file that merely could not be read (RAM preflight, io) is
     // kept for a later turn. The caller restores the image through conversation_snapshot_validate/restore.
-    std::optional<SavedConversation> load(Match m, std::string& error);
+    // S5c: donors = guarded RAM siblings that can serve salt-matched blocks without touching the store.
+    std::optional<SavedConversation> load(Match m, std::string& error,
+                                          const std::vector<const SavedConversation*>* donors = nullptr);
 
     // The matched entry's tokens: for the caller's own covers/prefix arithmetic.
     std::vector<int32_t> ids(uint64_t serial) const;
@@ -120,6 +122,11 @@ public:
     uint64_t spills() const { return spills_; }
     uint64_t loads() const { return loads_; }
     uint64_t drops() const { return drops_; }
+    // S5c lifetime totals: store reads vs salt-to-donor RAM serves across all v2 restores.
+    uint64_t delta_blocks() const { return delta_blocks_; }
+    uint64_t delta_bytes() const { return delta_bytes_; }
+    uint64_t delta_events() const { return delta_events_; }   // donor-disagreement retries (want: ~0)
+    uint64_t disk_read_bytes() const { return disk_read_bytes_; }
 
 private:
     // M-C3b v2: a shared chunk key - a 128-bit content digest over one 16 MiB block of the payload
@@ -170,9 +177,15 @@ private:
     };
 
     void write_v2(const Write& w, const SessionFileIdentity& id, Finished& f);   // falls through to a v1 write itself
+    // S5c: bytes a restore pulled from the store vs from a guarded RAM donor (salt-verified, re-hashed
+    // the same way: the source never skips integrity).
+    struct ReadStats { uint64_t disk_blocks = 0, disk_bytes = 0, ram_blocks = 0, ram_bytes = 0; };
+    // donors (S5c): parked RAM images whose buffers stay alive (and immobile) across the call - the
+    // caller guards them; a donor's prefix ladder is recomputed here from its ids (cheap: hashes only).
     bool read_v2(const std::string& path, const SessionFileIdentity& id, const SessionReadLimits& limits,
                  SavedConversation& image, size_t& bytes, std::string& error, SessionStatus& st,
-                 std::vector<PdKey>* keys, ViewFeed* vf = nullptr);
+                 std::vector<PdKey>* keys, ViewFeed* vf = nullptr,
+                 const std::vector<const SavedConversation*>* donors = nullptr, ReadStats* rs = nullptr);
     // M-C5 pass 1: header/table scan of a v2 file: the chunk keys it names, no payload read, no
     // identity check: a quarantined foreign file's keys shield shared bytes from the boot sweep.
     bool scan_v2_keys(const std::string& path, std::vector<PdKey>& keys, std::string& error) const;
@@ -201,6 +214,7 @@ private:
     size_t bytes_ = 0;              // queued + written bytes on disk
     uint64_t next_serial_ = 1;
     uint64_t spills_ = 0, loads_ = 0, drops_ = 0;
+    uint64_t delta_blocks_ = 0, delta_bytes_ = 0, disk_read_bytes_ = 0, delta_events_ = 0;   // S5c
 
     std::mutex write_mtx_;          // identity cache only (worker + load)
     std::optional<SessionFileIdentity> identity_;
