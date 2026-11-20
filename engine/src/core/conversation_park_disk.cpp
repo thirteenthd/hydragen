@@ -1191,6 +1191,9 @@ static intptr_t pd_pread_direct(int fd, void* dst, size_t n, long long off) {
 #else
 static int pd_open_ro_direct(const std::string& p) { return pd_open_ro(p); }
 static bool pd_fd_is_direct(int) { return false; }
+// Never reached on Windows (pd_fd_is_direct is false above), but the pull lambda's
+// ternary must compile on both platforms: mirror the buffered read.
+static intptr_t pd_pread_direct(int fd, void* dst, size_t n, long long off) { return pd_pread(fd, dst, n, off); }
 #endif
 
 bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, const SessionReadLimits& limits,

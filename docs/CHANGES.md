@@ -742,3 +742,18 @@ change for single-guard callers: the pre-existing seven guard arms pass
 unchanged. Binary note: the prod exe predates this fix; a config-only
 workaround (`HG_PARK_COW=0`) was rejected on purpose - it changes the
 park-disk config binding and would quarantine the store.
+
+## §192 — prebuilt-2 Windows port: the S5a direct-read ternary needed a third stub (2026-11-20)
+
+Building the current main as the Windows prod engine (CUDA 13.5, MSVC, fat
+arch 86-real/89-real/120, the installer's exact flags) failed on one
+identifier: `pd_pread_direct`. The S5a unbuffered path is Linux-only by
+design and the Windows side stubbed `pd_open_ro_direct` and
+`pd_fd_is_direct` - but the pull lambda's three-way read
+(inline / direct / buffered) references `pd_pread_direct` too, and a branch
+that can never execute must still compile. The Windows block now stubs all
+three; the buffered path remains the Windows transport (the NO_BUFFERING
+variant stays the documented follow-up). Linux is byte-identical to the
+stubbed line (same 51-check boot test), and the Windows tree built clean to
+`strata 0.1.60` - this is the prebuilt-2 binary line replacing prebuilt-1
+(`fe70cb5`, 0.1.59).
