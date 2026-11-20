@@ -757,3 +757,21 @@ variant stays the documented follow-up). Linux is byte-identical to the
 stubbed line (same 51-check boot test), and the Windows tree built clean to
 `strata 0.1.60` - this is the prebuilt-2 binary line replacing prebuilt-1
 (`fe70cb5`, 0.1.59).
+
+## §193 — prebuilt-2 live in prod: 0.1.60-fork on the 3090 with an honest VRAM pin (2026-11-20)
+
+The production engine is now the §181-§192 line (commit `7e9f12cc`, `strata
+0.1.60`, fat sm_86+sm_89+sm_120+PTX). The old binary and its park store are
+kept beside it: `runtime/hydragen-0.1.59-fe70cb5.bak.exe` and
+`park-disk-pre-prebuilt2-backup/` (19 entries) - the identity era changed
+with the engine version, so the store re-derives from traffic.
+
+The config fix rides the same restart: `--expert-cache 12288` was a silent
+over-request that clamped to 6839 slots (12.98 GiB pinned, 720 MiB idle
+free, mid-request allocation warnings as low as 17 MiB). The pin is now
+stated honestly as `--expert-cache 6144` with `--vram-reserve-mib 2816`:
+boot accepted it with **no clamp line**, 6453 experts resident on the
+device, park-disk ON with a clean index (0 refused, 0 quarantined), and the
+4-point needle battery ran `4/4` on engine 0.1.60 - needles recovered at
+depths 2 500/6 000/12 000/22 000 words (prompt 18 995/46 993/96 994/186 994
+tokens) with `overflow_fields={}`.
