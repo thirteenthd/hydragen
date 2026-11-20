@@ -688,3 +688,27 @@ its salt `(ph, L, part, c0)`, so a salt-to-donor index can skip store reads
 entirely when a RAM sibling already holds those bytes - the feed's per-chunk
 re-hash validates the donor bytes for free. That is the corrected target;
 design recorded, no code shipped here.
+
+## §190 — Restore-side pinned staging: implemented, measured, rejected (2026-11-20)
+
+The restore path reads park files into pageable heap and copied to the GPU
+with plain `cudaMemcpyAsync`, so it was hypothesized that the driver's
+pageable bounce cost real time - the spill side already stages through a
+pinned double buffer (`ParkAsync`) and the asymmetry looked like an oversight.
+A restore pin-ring (two pinned 4 MiB pieces, DMA queued on the private copy
+stream, FIFO slot bookkeeping, `STRATA_RESTORE_PINNED` kill switch) was built
+and measured on the 3080 Ti arm against the same scenario with tracing on
+both paths - the 96,949-token unique-head conversation, ~915 MiB of part
+buffers, pinned staging vs the pageable path with identical call sites:
+
+- pageable parts: `13,460-13,720 MiB/s` (~1 ms per 16 MiB part);
+- pin-ring parts: `9,060-9,580 MiB/s` (~2 ms per part).
+
+The pageable path already saturates the PCIe window on this host - modern
+drivers pipeline their own pinned bounce - and the ring's extra CPU-to-pinned
+memcpy makes it net ~30 % slower. The hypothesis is rejected on Linux; the
+ring was reverted, not shipped. (The older WDDM-pageable-penalty folklore was
+never re-measured here and stays untested on the Windows prod box; if a prod
+restore ever profile H2D-bound rather than read-bound, that is when it gets
+re-examined.) The real lever for bytes that never need to travel stays S5c's
+pull-time salt-to-donor reuse.
