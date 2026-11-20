@@ -415,7 +415,9 @@ function renderParkDisk(d) {
   if (d.enabled) {
     const cap = d.budget_mib ? d.budget_mib * 1048576 : 0;
     $("pd-mem-text").textContent = cap ? `${gb(d.bytes)} / ${gb(cap)} GB` : `${gb(d.bytes)} GB (free space only)`;
-    $("pd-mem-bar").style.width = cap ? pct(d.bytes, cap) : "100%";
+    // "free space only" has no denominator: a full bar means something IS parked, an empty grey
+    // track means nothing is — never full-green over an empty folder (dashboard zero-state law).
+    $("pd-mem-bar").style.width = cap ? pct(d.bytes, cap) : (d.bytes > 0 ? "100%" : "0%");
   }
   $("pd-sum").textContent = d.enabled
     ? `${fmt(d.entries)} conversation image${d.entries === 1 ? "" : "s"} on disk` : "off";

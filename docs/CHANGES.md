@@ -562,3 +562,12 @@ re-capture) is recorded as the follow-up - it is also the ownership layer S2b
 concurrent requests landed on separate slots; `/slots` reported
 `held_tokens` 317/318 and `idle_s` 0.1/0.0 on the two released slots, null on
 the two never used.
+
+## §185 — Park-disk bar zero state: empty store draws the grey track, not full green (2026-11-20)
+
+With the "free space only" budget the Park disk tier progress bar was hardcoded
+to 100% width, so an empty store rendered full green - reading like a full
+drive. That mode has no denominator, so the bar now fills only when something
+IS parked (`bytes > 0 ? 100% : 0%`); an empty store shows the empty track.
+Budget-denominated bars keep the used/cap ratio unchanged. Recorded as the
+dashboard zero-state law in docs/laws/dashboard-ui-laws.md.

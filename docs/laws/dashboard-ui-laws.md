@@ -35,3 +35,7 @@
 - /metrics park_disk comes from serve parsing the engine's stderr park-disk
   log lines (ParkDiskLog in serve/server.py); a new engine log verb needs a
   matching regex there, and serve must be restarted for parser changes.
+- Dashboard zero-state law (user, 2026-11-20): the Park disk tier bar under a
+  "free space only" budget has no denominator - a FULL green bar means
+  something IS parked, 0% width (grey track) means nothing is; never
+  full-green over an empty folder.
