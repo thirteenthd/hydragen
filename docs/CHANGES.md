@@ -606,3 +606,35 @@ restart, restored byte-identical (~1200 chunks). 41 checks, exit 0.
 Ops note: park files are bound to a config fingerprint; changing any fingerprint
 input (e.g. the conversation-cache budget) quarantines the existing store as
 designed - the files survive on disk and re-serve when the config returns.
+
+## §187 — Reads yield by UNREAD tokens, not raw prompt length (#656b, 2026-11-20)
+
+#656's give-way rule compares a waiting request's raw prompt length (×2)
+against the active reader's. A continuation of a 128,979-token conversation
+must read only its new turn (~25 tokens this test; ~500 in the production
+case), but it measures as "long": it never triggers BYIELD, and
+STRATA_ADMIT_SHORT_FIRST mis-ranks it the same way. Continuations queue
+behind cold full reads for the whole read.
+
+`_unread(e)`: prompt length minus the longest leading-token match against
+`slot_held` plus `_recent_reads` (the last `2 × batch` admitted prompts; a
+conversation's prefix outlives its slot - `slot_held` is cleared the moment
+a new admission lands there, which an earlier cut of this change measured
+at `best=0` on every call). Batch admissions now carry the prompt token
+list in the wait entry regardless of STRATA_COALESCE_PREFILL; solo
+admissions push it to the mirror. BYIELD and the admission classifier use
+`_unread`; `STRATA_YIELD_UNREAD=0` restores the raw-length rule exactly.
+The estimate can only shorten an entry, never lengthen it, and falls back
+to the raw length when no prompt is carried or no prefix matches.
+
+Live on the 3060 Ti benchmark node (2 slots): cold A1 (`128,959` tokens)
+completes; cold B (`93,956`) starts; 8 s later A2 (A1's conversation,
+`128,979` tokens, ~25 unread):
+
+- raw rule: A2 wall `36.5 s`, completes after B (`40.9 s`);
+- unread rule: A2 wall `12.3 s`, completes while B is still reading; B
+  `44.9 s` (+10%, resumed mid-read at `cached 23,808`);
+- `STRATA_YIELD_UNREAD=0` reproduces `36.5 s` (escape hatch verified).
+
+A2's usage figures are unchanged (`cached 114,688` of `128,979`): the
+change moves admission order only, never what is read or reused.

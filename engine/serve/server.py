@@ -1428,6 +1428,10 @@ class StrataEngine:
         # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
         # the slot that has its start (the engine checks it again); when the slot was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
+        # #656b: the prompts recently admitted, newest last: a conversation's cached prefix outlives its slot (the
+        # engine's conversation cache re-serves it), but slot_held is overwritten the moment a new admission lands.
+        # _unread consults both, so a continuation's estimate survives a cold request taking its slot.
+        self._recent_reads: collections.deque = collections.deque(maxlen=2 * self.batch)
         self.slot_used = [0.0] * self.batch
         self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
         # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
@@ -2230,14 +2234,17 @@ class StrataEngine:
 
     def _admit_next(self):
         """STRATA_ADMIT_SHORT_FIRST=<tokens> (the caller holds slot_cv): the new request that takes the control lines
-        next - one whose prompt is at most that long (it reads little) before a longer one, in arrival order within
-        each; a longer one that has waited STRATA_ADMIT_MAX_WAIT_S counts as short (it is never held back for good).
-        Off (unset or 0): whoever gets the lock first, as before.  Only the order changes, never what is read."""
+        next - one whose UNREAD tokens (see _unread: prompt length minus the longest prefix a slot already holds) are
+        at most that long (it reads little) before a longer one, in arrival order within each; a longer one that has
+        waited STRATA_ADMIT_MAX_WAIT_S counts as short (it is never held back for good).  Off (unset or 0): whoever
+        gets the lock first, as before.  Only the order changes, never what is read.  #656b: a 100k continuation
+        with 99.5k already in a slot reads ~500 tokens, and is short by this measure (it was "long" by raw length,
+        which starved continuations behind cold full reads).  STRATA_YIELD_UNREAD=0 restores the raw-length rule."""
         now = time.monotonic()
         ordered = [e for e in self.wait_lens if len(e) > 2 and e[2]]
         if not ordered:
             return None
-        return min(ordered, key=lambda e: (0 if e[0] <= ADMIT_SHORT_FIRST or now - e[1] >= ADMIT_MAX_WAIT_S else 1,
+        return min(ordered, key=lambda e: (0 if self._unread(e) <= ADMIT_SHORT_FIRST or now - e[1] >= ADMIT_MAX_WAIT_S else 1,
                                            e[1]))
 
     SOLO_AGAIN_MAX = 2      # how often a request left alone in a slot goes back to the solo path
@@ -2253,10 +2260,46 @@ class StrataEngine:
         with self.slot_cv:
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
 
+    @staticmethod
+    def _prefix_agree(h, p) -> int:
+        """the number of leading tokens h and p share (binary slice compare: streams reach 100k tokens, as pick_slot
+        already does for slot choice)."""
+        lo, hi = 0, min(len(h), len(p))
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if h[:mid] == p[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    UNREAD_ON = staticmethod(lambda: os.environ.get("STRATA_YIELD_UNREAD", "1") != "0")
+
+    def _unread(self, e) -> int:
+        """#656b: how many tokens a waiting entry must still READ: its prompt length minus the longest prefix any
+        slot already holds (a continuation is a turn's tokens, not its whole context).  Entries carry the prompt
+        token list (e[3]); without it (or the prompt not a token list) the estimate falls back to the raw length,
+        which is the pre-#656b rule, so the estimate can only ever make a request look shorter than before by
+        as much as a real prefix match."""
+        p = e[3] if len(e) > 3 else None
+        if not (isinstance(p, list) and p) or not self.UNREAD_ON():
+            return e[0]
+        best = 0
+        for src in (self.slot_held[:self.batch] + list(self._recent_reads)):
+            h = src
+            if h:
+                a = self._prefix_agree(h, p)
+                if a > best:
+                    best = a
+                    if best == len(p):
+                        break
+        return max(e[0] - best, 0)
+
     def _shorter_waiting(self, plen: int) -> bool:
-        """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to."""
+        """#656: someone waits for the control lines whose UNREAD tokens (not raw prompt length - #656b) are under
+        half this one's: worth giving way to."""
         with self.slot_cv:
-            return any(e[0] * 2 <= plen for e in self.wait_lens)
+            return any(self._unread(e) * 2 <= plen for e in self.wait_lens)
 
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
@@ -2293,7 +2336,7 @@ class StrataEngine:
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
         ok = yield from self._take_control(cancel, len(prompt), new=True,
-                                           prompt=prompt if (COALESCE_PREFILL > 1 and not embeddings) else None)
+                                           prompt=prompt if not embeddings else None)
         if not ok:
             self._release_preslot(cancel)
             return
@@ -2312,7 +2355,7 @@ class StrataEngine:
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
-                    ok = yield from self._take_control(cancel, len(prompt))
+                    ok = yield from self._take_control(cancel, len(prompt), prompt=prompt if not embeddings else None)
                     if not ok:
                         return
                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
@@ -2333,6 +2376,7 @@ class StrataEngine:
                     if started is not None:
                         started()
                     phase = "solo"
+                    self._recent_reads.append(prompt)
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
                     self._ctl_erred = False
                     def others():
@@ -2431,7 +2475,7 @@ class StrataEngine:
                             if cancel.is_set():
                                 return
                             if not holding:
-                                ok = yield from self._take_control(cancel, len(prompt))
+                                ok = yield from self._take_control(cancel, len(prompt), prompt=prompt if not embeddings else None)
                                 if not ok:
                                     return
                                 holding, born = True, self.gen
@@ -2472,6 +2516,7 @@ class StrataEngine:
                     if started is not None:
                         started()
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
+                    self._recent_reads.append(prompt)
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
                     self._ctl_erred = False
