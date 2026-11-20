@@ -426,12 +426,16 @@ public:
         return i == SIZE_MAX ? nullptr : &entries_[i];
     }
     // While a borrowed entry (the donor) is being restored, parking the outgoing conversation must not evict or drop
-    // it: guard() it.  When the outgoing image fits only without it, make_room refuses before evicting anything and
-    // guard_blocked() says so: the caller then takes the entry as before, so the conversation that was active a
-    // moment ago keeps its place.
-    void guard(uint64_t serial) { guarded_ = serial; guard_blocked_ = false; }
-    void unguard() { guarded_ = 0; }
+    // it: guard() it.  Guards NEST as a stack (§191): a borrow guard on the donor stays in effect under an inner
+    // anchor guard. The single-slot version broke when M-C10c's ParkAnchorGuard mounted inside a borrow - the inner
+    // guard clobbered the outer one, make_room evicted the donor mid-park, and the restore died ("restoring a
+    // borrowed conversation prefix: gone"; prod crashes 2026-11-18 x2 and 2026-11-20). When the outgoing image fits
+    // only without the guarded entries, make_room refuses before evicting anything and guard_blocked() says so: the
+    // caller then takes the entry as before, so the conversation that was active a moment ago keeps its place.
+    void guard(uint64_t serial) { guarded_.push_back(serial); guard_blocked_ = false; }
+    void unguard() { if (!guarded_.empty()) guarded_.pop_back(); }
     bool guard_blocked() const { return guard_blocked_; }
+    bool is_guarded(uint64_t s) const { for (const uint64_t g : guarded_) if (g == s) return true; return false; }
     size_t borrowed() const { return borrowed_; }
     void count_borrow() { ++borrowed_; }
 
@@ -451,9 +455,11 @@ public:
     // with take() but still alive during the exchange; count it against RAM too.
     bool make_room(size_t incoming, size_t held = 0) {
         if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
-        auto stays = [&](size_t i) { return entries_[i].pinned() || is_view_donor(i) || (guarded_ != 0 && serials_[i] == guarded_); };
-        if (guarded_ != 0 && index_of(guarded_) != SIZE_MAX) {
-            // with everything else gone, would it fit beside the entries that stay (the guarded donor and any pinned
+        auto stays = [&](size_t i) { return entries_[i].pinned() || is_view_donor(i) || is_guarded(serials_[i]); };
+        bool guarded_here = false;
+        for (const uint64_t g : guarded_) if (index_of(g) != SIZE_MAX) { guarded_here = true; break; }
+        if (guarded_here) {
+            // with everything else gone, would it fit beside the entries that stay (the guarded donors and any pinned
             // shared prefix)?  If not, evict nothing
             size_t kept = 0, kept_bytes = 0;
             for (size_t i = 0; i < entries_.size(); ++i)
@@ -485,7 +491,7 @@ public:
         // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
         for (size_t i = 0; i < entries_.size(); ++i) {
             // M-C10: a donor whose anchored child is still resident is not a candidate
-            if (entries_[i].pinned() || is_view_donor(i) || (guarded_ != 0 && serials_[i] == guarded_)) continue;
+            if (entries_[i].pinned() || is_view_donor(i) || is_guarded(serials_[i])) continue;
             if (!evict_slot(i, 0)) return false;
             release_free_heap();   // #5697 (upstream 0.1.60): hand the freed segments back
             return true;
@@ -508,7 +514,7 @@ public:
                 for (size_t k = 0; k < entries_.size(); ++k)
                     if (k != i && k != j && entries_[k].view_donor >= 0 &&
                         entries_[k].view_donor == (int64_t) serials_[j]) { other_child = true; break; }
-                if (!other_child && !entries_[j].pinned() && !(guarded_ != 0 && serials_[j] == guarded_)) evict_slot(j, depth + 1);
+                if (!other_child && !entries_[j].pinned() && !is_guarded(serials_[j])) evict_slot(j, depth + 1);
                 break;
             }
         }
@@ -563,7 +569,7 @@ public:
             for (const auto& c : e.checkpoints)
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
             if (e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest) &&
-                !(guarded_ != 0 && serials_[i] == guarded_)) {
+                !is_guarded(serials_[i])) {
                 bytes_ -= e.bytes();
                 erase(i);
                 ++dropped;
@@ -594,7 +600,7 @@ public:
             for (const auto& c : e.checkpoints)
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
             if (e.cvec != cvec || !deepest || deepest->ids.empty() || !held(*deepest) ||
-                (guarded_ != 0 && serials_[i] == guarded_))
+                is_guarded(serials_[i]))
                 continue;
             for (const auto& c : e.checkpoints)
                 if (!held(c)) return true;
@@ -646,7 +652,7 @@ private:
     bool drop_oldest() {
         // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
         for (size_t i = 0; i < entries_.size(); ++i) {
-            if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
+            if (entries_[i].pinned() || is_guarded(serials_[i])) continue;
             bytes_ -= entries_[i].bytes();
             erase(i);
             ++evictions_;
@@ -662,7 +668,8 @@ private:
     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
     std::deque<SavedConversation> entries_; // least recently active first
     std::deque<uint64_t> serials_;          // entries_[i]'s identity, never reused
-    uint64_t next_serial_ = 1, guarded_ = 0;
+    uint64_t next_serial_ = 1;
+    std::vector<uint64_t> guarded_;   // guard stack (§191): outer borrow guard + inner anchor guard nest
     bool guard_blocked_ = false;
     ConversationKvReuse reuse_;
     SegmentPoolBudget* pool_ = nullptr;   // STRATA_PARK_SEGPOOL_MIB (not owned)

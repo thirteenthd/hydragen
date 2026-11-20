@@ -712,3 +712,33 @@ never re-measured here and stays untested on the Windows prod box; if a prod
 restore ever profile H2D-bound rather than read-bound, that is when it gets
 re-examined.) The real lever for bytes that never need to travel stays S5c's
 pull-time salt-to-donor reuse.
+
+## §191 — Crash fix: cache guards nest; the park anchor guard no longer clobbers the borrow donor guard (2026-11-20)
+
+Prod (3090, `HG_PARK_COW=1`, `--batch 4`) died three times with
+`restoring a borrowed conversation prefix: gone` and `exit code 1` -
+2026-11-18 14:00, 18:23, and 2026-11-20 13:19 - each pair of serve errors
+being one engine death hitting two concurrent requests, each crash log
+showing `park COW anchor mounted` followed by `evictions=N` immediately
+before the failure.
+
+The chain: the borrow path guards the donor (`conversations.guard
+(parked.serial)` - parking the outgoing conversation must not evict it),
+then `park_current` runs, and inside `park_source` M-C10c's `ParkAnchorGuard`
+guards its CoW anchor. The cache's guard was a single scalar slot, and the
+anchor comment asserted "parking and restoring never interleave in this
+loop" - the borrow path is exactly the case where they do. The inner guard
+overwrote the outer one, `make_room` found the donor unguarded and evicted
+it under admission pressure, and the restore's `find(parked.serial)` came
+back null - fatal by contract ("validated above and guarded while parking").
+
+Fix: the guard is now a small stack. `guard()` pushes, `unguard()` pops
+its own entry, and every eviction, drop, and refusal predicate consults
+`is_guarded(serial)`, so a donor stays held under any number of inner
+anchor guards. `conversation_cache_test` gains a nesting arm that parks
+three entries, guards two under a second guard, and pins both survival
+and selective release (the 2026-11-20 crash is the scenario). No behavior
+change for single-guard callers: the pre-existing seven guard arms pass
+unchanged. Binary note: the prod exe predates this fix; a config-only
+workaround (`HG_PARK_COW=0`) was rejected on purpose - it changes the
+park-disk config binding and would quarantine the store.

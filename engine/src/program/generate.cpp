@@ -13124,8 +13124,9 @@ int main(int argc, char** argv) {
             // park is not yet an entry the selectors (evict_oldest, the donor cascade) can see, so a
             // REGISTERED child leaving could cascade the donor out as its "last child" and the fresh
             // park's mount dies mid-admission (run63: 3 anchor losses per 3 passes with M-C10+M-C10b
-            // loaded - donors with no registered children at all). The guard is single-slot by design;
-            // parking and restoring never interleave in this loop.
+            // loaded - donors with no registered children at all). Guards nest (§191): when a borrow
+            // already holds the donor, this anchor guard stacks on top of it instead of replacing it -
+            // the single-slot version clobbered the donor guard and the restore died (prod crash).
             struct ParkAnchorGuard {
                 strata::core::ConversationCache& c; bool on;
                 ~ParkAnchorGuard() { if (on) c.unguard(); }
