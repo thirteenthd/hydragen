@@ -571,3 +571,38 @@ drive. That mode has no denominator, so the bar now fills only when something
 IS parked (`bytes > 0 ? 100% : 0%`); an empty store shows the empty track.
 Budget-denominated bars keep the used/cap ratio unchanged. Recorded as the
 dashboard zero-state law in docs/laws/dashboard-ui-laws.md.
+
+## §186 — Park-disk container v3 (BCS): content-addressed chunks + salted lineage keys; two boot-refuse bugfixes (2026-11-20)
+
+The v2 park store re-wrote whole-conversation files and could not share prefix
+state. v3 (BCS: block/content/chunk/salt container) stores KV blocks as
+content-addressed chunk files and records per-entry lineage salts, so sibling
+sessions with a shared prefix spill as deltas. Notarized live on the 3060 Ti
+benchmark node (96,949-token unique park + shared-head trio, RAM-pressure
+admission eviction):
+
+- spill: `96596 tokens, 2196.1 MiB` (full parent) then two siblings at
+  `1.4 MiB` and `1.2 MiB` - dedup deltas, store `7880 chunks, 4.1 GiB`;
+- restart: `index 3 files, 6.2 GiB, 0 refused, 0 quarantined, rebuilt in 6222 ms`;
+- restore from the chunk store: `97012 tokens, 1.4 MiB read in 984 ms` and
+  `96596 tokens, 2196.1 MiB read in 1087 ms`.
+
+Two defects found while the writer was live and fixed in the same change, each
+of which had made the boot walk refuse every v3 file it wrote:
+
+1. the payload counter in the streaming walk counted only the scalar region -
+   KV block bytes were never added, so the header's payload field disagreed
+   with the table sum (`table and file size disagree (entries 12612573 vs
+   payload 9181, ...)`; the refuse verb now names all four compared terms);
+2. the read-side pull loop opened a chunk file for INLINE blocks (`kind == 0`,
+   bytes live in the `.ses` body): `errno 2` -> `a chunk file is missing or
+   truncated`. Blob open + per-block re-hash now apply to chunk entries only;
+   inline integrity rides on the payload hash, as in v2.
+
+`park_disk_boot_test` gains a live-shape arm: a 200k-cell full spill plus
+shared-head children written by the real writer, re-indexed in-boot and after
+restart, restored byte-identical (~1200 chunks). 41 checks, exit 0.
+
+Ops note: park files are bound to a config fingerprint; changing any fingerprint
+input (e.g. the conversation-cache budget) quarantines the existing store as
+designed - the files survive on disk and re-serve when the config returns.

@@ -1292,6 +1292,67 @@ bool session_payload_blocks(const SavedConversation& image,
     return true;
 }
 
+bool session_payload_bcs(const SavedConversation& image,
+                         const std::function<bool(uint64_t soff, const uint8_t* p, size_t n)>& on_scalar,
+                         const std::function<bool(size_t kv_idx, int part, uint64_t seg_off,
+                                                 const uint8_t* p, size_t n)>& on_kv_seg,
+                         uint64_t& payload_bytes, std::string& error) {
+    // mirrors put_payload's byte order exactly; scalars and KV segments never interleave inside one
+    // buffer, but the scalar stream does interleave with the per-buffer size prefixes and the KV
+    // headers: callers must treat region offsets as the full stream offsets.
+    uint64_t off = 0;
+    bool refused = false;
+    const auto item = [&](const void* p, size_t c) {
+        if (!refused && c) on_scalar(off, static_cast<const uint8_t*>(p), c);
+        off += c;
+    };
+    const auto i64 = [&](int64_t v) { item(&v, 8); };
+    const auto u64 = [&](uint64_t v) { item(&v, 8); };
+    const auto chk = [&](const ConversationCheckpoint& c) {
+        const auto vec = [&](const auto& v) {
+            const uint64_t n = v.size();
+            u64(n);
+            if (n) item(v.data(), n * sizeof(typename std::remove_reference_t<decltype(v)>::value_type));
+        };
+        vec(c.ids);
+        u64(c.imgs.size());
+        for (const auto& k : c.imgs) { i64(k.start); u64(k.hash); }
+        vec(c.gdn); vec(c.ple); vec(c.tails); vec(c.dead); vec(c.block_pos);
+        u64(c.used);
+    };
+    for (int64_t g : image.geometry) i64(g);
+    i64(image.layer_lo); i64(image.layer_hi);
+    const uint64_t cvec = image.cvec ? 1 : 0;
+    item(&cvec, 8);
+    chk(image.live);
+    u64(image.checkpoints.size());
+    for (const auto& c : image.checkpoints) chk(c);
+    u64(image.kv.size());
+    for (size_t li = 0; li < image.kv.size() && !refused; ++li) {
+        const ConversationKv& k = image.kv[li];
+        for (int64_t v : {int64_t(k.format), k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim}) i64(v);
+        const ConversationBuffer* bufs[5] = { &k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled };
+        for (int part = 0; part < 5; ++part) {
+            const ConversationBuffer& b = *bufs[part];
+            const uint64_t n = b.size();
+            item(&n, 8);
+            if (!n) continue;
+            const bool ok = b.visit(0, (size_t)n,
+                                    [&](const uint8_t* p, size_t c, size_t so) {
+                                        if (refused) return false;
+                                        off += c;   // KV body bytes count toward the payload: the writer charges its
+                                                    // table from the sink bytes, so the header must count them too.
+                                        on_kv_seg(li, part, (uint64_t)so, p, c);
+                                        return true;
+                                    });
+            if (!ok) { refused = true; break; }
+        }
+    }
+    if (refused) { if (error.empty()) error = "session bcs: the sink refused"; return false; }
+    payload_bytes = off;
+    return true;
+}
+
 bool session_payload_unblocks(uint64_t payload_bytes, uint64_t payload_hash,
                               const std::function<bool(uint8_t* dst, size_t n)>& pull,
                               SavedConversation& image, const SessionReadLimits& limits, std::string& error,

@@ -235,6 +235,14 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes);
 // buffers) as (offset, ptr, len) blocks WITHOUT a file, and feed blocks back through the SAME bounded
 // parser with the SAME payload-hash check the v1 trailer carries. Both refuse what session_file_read's
 // limits would refuse; neither writes anything: the tier decides per block where the bytes live.
+// S5b (BCS): structured payload walk for the v3 container. Byte order is exactly put_payload's;
+// the caller sees non-KV scalar spans (region-offset, ptr, len) and KV buffer segments with layer
+// ordinal, part (0 k, 1 v, 2 k_scale, 3 v_scale, 4 pooled) and the segment's offset inside its buffer.
+bool session_payload_bcs(const SavedConversation& image,
+                         const std::function<bool(uint64_t soff, const uint8_t* p, size_t n)>& on_scalar,
+                         const std::function<bool(size_t kv_idx, int part, uint64_t seg_off,
+                                                 const uint8_t* p, size_t n)>& on_kv_seg,
+                         uint64_t& payload_bytes, std::string& error);
 bool session_payload_blocks(const SavedConversation& image,
                             const std::function<bool(uint64_t off, const uint8_t* p, size_t n)>& on_block,
                             uint64_t& payload_bytes, std::string& error);

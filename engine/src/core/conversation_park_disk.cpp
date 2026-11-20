@@ -68,6 +68,15 @@ constexpr uint64_t kPd2HashSeed1 = 0x9E3779B97F4A7C15ull;
 // (mask 22 bits) and 16 MiB forces one - so a session's blocks are ~2048 at worst for a 4 GiB image,
 // inside the 2048-entry table; larger images overflow and fall back to v1, fail-closed as always.
 constexpr uint64_t kPd2CutMask = (1ull << 21) - 1;   // M-C3b1d: mean cut 2 MiB; keeps a 131k image under the 2048-entry table
+// S5b (BCS) container v3. KV blocks are token-aligned: cells [c0, c0+4096) of ONE buffer of ONE
+// QSA layer (up to 16 MiB); the scalar region cuts at a fixed 256 KiB grid from the region start.
+// A block's key digests its SALT (prefix token hash, layer ordinal, part, cell offset) plus its
+// bytes, so two sessions sharing a conversation head share block keys by construction - flat blob
+// refcounts (blobs_) are the whole dedup contract; the v2 view-lineage machinery is gone.
+// The salt travels in each table entry (64 B) so the reader can re-hash served bytes against it.
+constexpr uint64_t kPd3Ent = 64, kPd3TblArea = 262144, kPd3Body = kPd2Hdr + kPd3TblArea;
+constexpr uint64_t kPd3MaxBlocks = kPd3TblArea / kPd3Ent;
+constexpr size_t kPd3KvCells = 4096, kPd3Cut = 256u << 10, kPd3MinBlob = 64u << 10;
 constexpr size_t kPd2CutMin = 512u << 10;   // M-C3b1d: 6 MiB equal spans need cuts well below 2 MiB
 inline const uint64_t* pd_gear_table() {
     static const uint64_t* g = [] {
@@ -875,7 +884,7 @@ void ParkDisk::write_v2(const Write& w, const SessionFileIdentity& id, Finished&
     const std::string tmp = w.path + ".tmp";
     const int fd = pd_create_new(tmp);
     if (fd < 0) { to_v1(); return; }
-    std::vector<uint8_t> front(kPd2Body, 0);   // header + zero-filled table area; the body streams after
+    std::vector<uint8_t> front(kPd3Body, 0);   // header + zero-filled table area; the body streams after
     if (pd_write(fd, front.data(), front.size()) != (intptr_t) front.size()) {
         pd_close(fd);
         pd_unlink(tmp);
@@ -889,16 +898,14 @@ void ParkDisk::write_v2(const Write& w, const SessionFileIdentity& id, Finished&
                                          // flush time (scalar fields, counts): copy them at once or the chunk
                                          // file stores whatever the stack held later, not the payload
         size_t slen = 0;
-        uint64_t gear = 0;                                       // rolling hash over the open block
+        uint8_t salt[32] = {};                                   // S5b: the open block's salt
+        bool has_salt = false;
         uint64_t inline_bytes = 0, saved = 0;
         std::vector<uint8_t> table;
         std::vector<PdKey> keys;
         std::vector<std::pair<PdKey, uint64_t>> created;
         bool failed = false, overflow = false;
-        std::vector<uint64_t> view_parents;
     } c;
-    std::unordered_map<const void*, const Write::ViewSpan*> vmap;
-    for (const auto& v : w.views) vmap[v.p] = &v;
     const auto abort_v2 = [&](void) {
         pd_close(fd);
         pd_unlink(tmp);
@@ -909,13 +916,14 @@ void ParkDisk::write_v2(const Write& w, const SessionFileIdentity& id, Finished&
 
     const auto flush_block = [&](void) {
         if (c.slices.empty()) return;
-        if (c.table.size() + kPd2Ent > kPd2TblArea) { c.overflow = true; return; }
+        if (c.table.size() + kPd3Ent > kPd3TblArea) { c.overflow = true; return; }
         const size_t len = c.slen;
         SessionHasher h0(0), h1(kPd2HashSeed1);
+        h0.update(c.salt, 32); h1.update(c.salt, 32);            // S5b: the salt keys the block
         for (const auto& [p, n] : c.slices) { h0.update(p, n); h1.update(p, n); }
         const PdKey key{h0.digest(), h1.digest()};
         bool blobbed = false;
-        if (len >= (64u << 10)) {           // worth a chunk file: below this the table cost beats the dedup
+        if (len >= kPd3MinBlob) {           // worth a chunk file: below this the table cost beats the dedup
             const std::string bp = blob_path(key);
             if (pd_exists(bp)) {
                 blobbed = true;
@@ -946,89 +954,122 @@ void ParkDisk::write_v2(const Write& w, const SessionFileIdentity& id, Finished&
                 if (pd_write(fd, p, n) != (intptr_t) n) { c.failed = true; return; }
             c.inline_bytes += len;
         }
-        uint8_t ent[kPd2Ent] = {};
+        uint8_t ent[kPd3Ent] = {};
         ent[0] = blobbed ? 1 : 0;
         std::memcpy(ent + 8, &len, 8);
         std::memcpy(ent + 16, &key.k0, 8);
         std::memcpy(ent + 24, &key.k1, 8);
-        c.table.insert(c.table.end(), ent, ent + kPd2Ent);
+        std::memcpy(ent + 32, c.salt, 32);
+        c.table.insert(c.table.end(), ent, ent + kPd3Ent);
         c.slices.clear();
         c.slen = 0;
-        c.gear = 0;
+        c.has_salt = false;
+    };
+    // S5b: open a new block with a salt: (prefix token hash, layer ordinal, part, cell offset).
+    // layer/part -1 mark a scalar-region block. The previous block flushes first.
+    const auto put_salt = [&](uint64_t ph, int64_t L, uint32_t part, int64_t c0) {
+        flush_block();
+        if (c.failed || c.overflow) return;
+        std::memset(c.salt, 0, 32);
+        std::memcpy(c.salt + 0, &ph, 8);
+        std::memcpy(c.salt + 8, &L, 8);
+        std::memcpy(c.salt + 16, &part, 4);
+        std::memcpy(c.salt + 24, &c0, 8);
+        c.has_salt = true;
     };
 
-    // M-C7: a view entry may only name a parent that HAS a disk file. The donor is cache-side;
-    // if it was never spilled (pinned donors never evict), a view entry would dangle: the next
-    // boot's table cannot resolve the parent, the file is refused, and the refuse cascades.
-    // Snapshot the published set here (brief lock); unpublished view spans fall through to the
-    // normal content-defined chunk path: bytes dedup by hash, correctness over lineage.
-    std::unordered_set<uint64_t> published;
+    // prefix ladder: phv[i] = hash of the first min(i * kPd3KvCells, ids) tokens. Two sessions with
+    // an identical conversation head produce identical phv values for as long as their ids agree, so
+    // the SAME cell range of the SAME buffer of the SAME layer digests to the SAME key: dedup for
+    // siblings is structural, and a diverging head is just a key miss (bytes differ -> different key).
+    std::vector<uint64_t> phv;
     {
-        std::lock_guard<std::mutex> g(mtx_);
-        for (const auto& cp : cache_to_park_) published.insert(static_cast<uint64_t>(cp.first));
+        uint64_t maxc = 1;
+        for (const auto& k : w.image.kv) maxc = std::max<uint64_t>(maxc, (uint64_t) std::max<int64_t>(k.cells, 1));
+        phv.resize((size_t) ((maxc + kPd3KvCells - 1) / kPd3KvCells) + 2);
+        SessionHasher hh(0);
+        phv[0] = 0;
+        const auto& ids = w.image.live.ids;
+        size_t have = 0;
+        for (size_t i = 1; i < phv.size(); ++i) {
+            const size_t want = std::min<size_t>(i * kPd3KvCells, ids.size());
+            if (want > have) hh.update(ids.data() + have, (want - have) * sizeof(*ids.data()));
+            have = want;
+            phv[i] = hh.digest();
+        }
     }
+
     uint64_t payload = 0;
     SessionHasher phash(0);
     std::string werr;
-    const uint64_t* gear_tab = pd_gear_table();
-    bool walk_ok = session_payload_blocks(w.image, [&](uint64_t, const uint8_t* p, size_t n) -> bool {
-        phash.update(p, n);
-        // M-C3b3: a view span: the payload and its hash cover the bytes either way, a table entry just stands
-        // in for them; the block stream never mixes a view with chunked bytes (flush first, entry, continue).
-        if (const auto m = vmap.find(p); m != vmap.end() && m->second->len == n && published.count(m->second->parent)) {
-            flush_block();
-            if (c.failed || c.overflow) return false;
-            if (c.table.size() + kPd2Ent > kPd2TblArea) { c.overflow = true; return false; }
-            uint8_t ent[kPd2Ent] = {};
-            ent[0] = 2;
-            std::memcpy(ent + 8, &n, 8);
-            std::memcpy(ent + 16, &m->second->parent, 8);
-            const uint64_t aux = m->second->aux;
-            std::memcpy(ent + 24, &aux, 8);
-            c.table.insert(c.table.end(), ent, ent + kPd2Ent);
-            c.saved += n;
-            if (std::find(c.view_parents.begin(), c.view_parents.end(), m->second->parent) == c.view_parents.end())
-                c.view_parents.push_back(m->second->parent);
-            return true;
-        }
-        if (n <= 256) {   // M-C5: copy short spans now: their source is a put_* temporary that dies before flush
-            c.arena.emplace_back(reinterpret_cast<const char*>(p), n);
-            p = reinterpret_cast<const uint8_t*>(c.arena.back().data());
-        }
-        while (n) {
-            size_t run = 0;                        // bytes of this span to take before the next cut decision
-            if (c.slen < kPd2CutMin) {
-                run = std::min(n, kPd2CutMin - c.slen);
-            } else {
-                const size_t room = kPd2Block - c.slen;
-                run = n < room ? n : room;         // scan at most to the forced cut
-                for (size_t i = 0; i < run; ++i) {
-                    c.gear = (c.gear << 1) + gear_tab[p[i]];
-                    if (!(c.gear & kPd2CutMask)) { run = i + 1; break; }
+    // scalar region: fixed 256 KiB grid from the region start; KV buffers: cell-aligned blocks.
+    uint64_t next_cut = kPd3Cut, sblk = 0;
+    int64_t cur_L = INT64_MIN; int cur_part = -1; uint64_t cur_b = UINT64_MAX;
+    const bool walk_ok = session_payload_bcs(w.image,
+        [&](uint64_t off, const uint8_t* p, size_t n) -> bool {
+            phash.update(p, n);
+            if (n <= 256) {   // M-C5: copy short spans now: their source dies before flush
+                c.arena.emplace_back(reinterpret_cast<const char*>(p), n);
+                p = reinterpret_cast<const uint8_t*>(c.arena.back().data());
+            }
+            uint64_t soff_cur = off;
+            while (n) {
+                const size_t take = std::min(n, (size_t) (next_cut - soff_cur));
+                c.slices.emplace_back(p, take);
+                c.slen += take;
+                p += take; n -= take; soff_cur += take;
+                if (soff_cur >= next_cut) {
+                    put_salt(0, -1, 0xFFFFFFFFu, (int64_t) sblk);
+                    if (c.failed || c.overflow) return false;
+                    next_cut += kPd3Cut; ++sblk;
                 }
             }
-            c.slices.emplace_back(p, run);
-            c.slen += run;
-            p += run;
-            n -= run;
-            if (c.slen == kPd2Block) flush_block();
-            if (c.failed || c.overflow) return false;
-        }
-        return true;
-    }, payload, werr);
+            return true;
+        },
+        [&](size_t li, int part, uint64_t seg_off, const uint8_t* p, size_t n) -> bool {
+            phash.update(p, n);
+            const ConversationKv& k = w.image.kv[li];
+            const ConversationBuffer* bp = part == 0 ? &k.k : part == 1 ? &k.v : part == 2 ? &k.k_scale
+                                       : part == 3 ? &k.v_scale : &k.pooled;
+            const size_t bsz = bp->size();
+            size_t block_bytes;
+            if (k.cells > 0 && bsz % (size_t) k.cells == 0)
+                block_bytes = (bsz / (size_t) k.cells) * kPd3KvCells;    // uniform stride: cell-aligned
+            else
+                block_bytes = bsz ? bsz : 1;                             // non-uniform: one whole-buffer block
+            while (n) {
+                const uint64_t b = seg_off / block_bytes;
+                if (!c.has_salt || cur_L != (int64_t) li || cur_part != part || cur_b != b) {
+                    put_salt(phv[(size_t) ((b * kPd3KvCells) / kPd3KvCells) < phv.size()
+                                    ? (size_t) ((b * kPd3KvCells) / kPd3KvCells) : phv.size() - 1],
+                             (int64_t) li, (uint32_t) part, (int64_t) (b * kPd3KvCells));
+                    if (c.failed || c.overflow) return false;
+                    cur_L = (int64_t) li; cur_part = part; cur_b = b;
+                }
+                const size_t take = std::min<uint64_t>(n, (b + 1) * block_bytes - seg_off);
+                c.slices.emplace_back(p, take);
+                c.slen += take;
+                p += take; n -= take; seg_off += take;
+                if (seg_off % block_bytes == 0) {   // the block is complete: publish it
+                    flush_block();
+                    if (c.failed || c.overflow) return false;
+                }
+            }
+            return true;
+        }, payload, werr);
     if (walk_ok) flush_block();   // the last, short block
     if (!walk_ok || c.failed || c.overflow || c.table.empty()) { abort_v2(); return; }
 
     if (pd_pwrite(fd, c.table.data(), c.table.size(), (long long) kPd2Hdr) != (intptr_t) c.table.size()) { abort_v2(); return; }
     uint8_t h[kPd2Hdr] = {};
     std::memcpy(h, kPd2Magic, 8);
-    const uint32_t ver = 2, hdr = (uint32_t) kPd2Body;
+    const uint32_t ver = 3, hdr = (uint32_t) kPd3Body;
     std::memcpy(h + 8, &ver, 4);
     std::memcpy(h + 12, &hdr, 4);
     std::memcpy(h + 16, &id.model, 8);
     std::memcpy(h + 24, &id.config, 8);
     const uint64_t serial = w.serial, tokens = w.image.live.ids.size(),
-                   ph = phash.digest(), nblocks = c.table.size() / kPd2Ent;
+                   ph = phash.digest(), nblocks = c.table.size() / kPd3Ent;
     std::memcpy(h + 32, &serial, 8);
     std::memcpy(h + 40, &tokens, 8);
     std::memcpy(h + 48, &payload, 8);
@@ -1043,7 +1084,7 @@ void ParkDisk::write_v2(const Write& w, const SessionFileIdentity& id, Finished&
     if (pd_rename(tmp, w.path) != 0) {
         pd_unlink(tmp);
         for (const auto& [k, len] : c.created) pd_unlink(blob_path(k));
-        f.error = std::string("park v2 rename: ") + std::strerror(errno);
+        f.error = std::string("park v3 rename: ") + std::strerror(errno);
         return;
     }
     f.ok = true;
@@ -1051,8 +1092,8 @@ void ParkDisk::write_v2(const Write& w, const SessionFileIdentity& id, Finished&
     f.all_keys = std::move(c.keys);
     f.created = std::move(c.created);
     f.saved = c.saved;
-    f.view_parents = std::move(c.view_parents);
 }
+
 
 
 // ---------------------------------------------------------------------------
@@ -1150,9 +1191,6 @@ static intptr_t pd_pread_direct(int fd, void* dst, size_t n, long long off) {
 #else
 static int pd_open_ro_direct(const std::string& p) { return pd_open_ro(p); }
 static bool pd_fd_is_direct(int) { return false; }
-// Windows stays buffered until the NO_BUFFERING/OVERLAPPED variant lands: same
-// read semantics as pd_pread below, so the call sites are platform-identical.
-static intptr_t pd_pread_direct(int fd, void* dst, size_t n, long long off) { return pd_pread(fd, dst, n, off); }
 #endif
 
 bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, const SessionReadLimits& limits,
@@ -1178,33 +1216,39 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
     std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&serial, h + 32, 8);
     std::memcpy(&tokens, h + 40, 8); std::memcpy(&payload, h + 48, 8); std::memcpy(&phash, h + 56, 8);
     std::memcpy(&nblocks, h + 64, 8); std::memcpy(&inline_total, h + 72, 8); std::memcpy(&hh, h + 80, 8);
-    if (ver != 2 || hdr != (uint32_t) kPd2Body || session_hash64(h, 80, 0) != hh) {
-        st.error = SessionError::invalid; error = "park v2: bad header"; return false;
+    if (ver != 3 || hdr != (uint32_t) kPd3Body || session_hash64(h, 80, 0) != hh) {
+        st.error = SessionError::invalid; error = "park v3: superseded version or bad header"; return false;
     }
     if (model != id.model || config != id.config) {
         st.error = SessionError::foreign; error = "park v2: bound to another model or configuration"; return false;
     }
-    if (nblocks == 0 || nblocks > kPd2MaxBlocks) { st.error = SessionError::invalid; error = "park v2: bad block count"; return false; }
-    std::vector<uint8_t> tbl((size_t) nblocks * kPd2Ent);
+    if (nblocks == 0 || nblocks > kPd3MaxBlocks) { st.error = SessionError::invalid; error = "park v2: bad block count"; return false; }
+    std::vector<uint8_t> tbl((size_t) nblocks * kPd3Ent);
     if (pd_pread(ctx.fd, tbl.data(), tbl.size(), (long long) kPd2Hdr) != (intptr_t) tbl.size()) { st.error = SessionError::io; error = "park v2: table read"; return false; }
-    struct Ent2 { uint8_t kind; uint64_t len, k0, k1; };
+    struct Ent2 { uint8_t kind; uint64_t len, k0, k1; uint8_t salt[32]; };
     std::vector<Ent2> ents;
     ents.resize((size_t) nblocks);
     uint64_t sum = 0, itot = 0;
     for (uint64_t i = 0; i < nblocks; ++i) {
-        const uint8_t* e = tbl.data() + (size_t) i * kPd2Ent;
+        const uint8_t* e = tbl.data() + (size_t) i * kPd3Ent;
         Ent2& en = ents[(size_t) i];
         en.kind = e[0];
         std::memcpy(&en.len, e + 8, 8);
         std::memcpy(&en.k0, e + 16, 8);
         std::memcpy(&en.k1, e + 24, 8);
-        if (en.kind > 2 || en.len == 0 || en.len > kPd2Block) { st.error = SessionError::invalid; error = "park v2: bad table entry"; return false; }
+        std::memcpy(en.salt, e + 32, 32);
+        if (en.kind > 1 || en.len == 0 || en.len > kPd2Block) { st.error = SessionError::invalid; error = "park v2: bad table entry"; return false; }
         if (sum > UINT64_MAX - en.len) { st.error = SessionError::invalid; error = "park v2: table sum overflows"; return false; }
         sum += en.len;
         if (en.kind == 0) itot += en.len;
     }
-    if (sum != payload || itot != inline_total || sb.size != kPd2Body + inline_total) {
-        st.error = SessionError::invalid; error = "park v2: table and file size disagree"; return false;
+    if (sum != payload || itot != inline_total || sb.size != kPd3Body + inline_total) {
+        st.error = SessionError::invalid;
+        error = std::string("park v2: table and file size disagree (entries ") + std::to_string(sum) +
+                " vs payload " + std::to_string(payload) + ", inline " + std::to_string(itot) +
+                " vs " + std::to_string(inline_total) + ", size " + std::to_string((uint64_t)sb.size) +
+                " vs " + std::to_string(kPd3Body + inline_total) + ")";
+        return false;
     }
     if (limits.max_file_bytes != UINT64_MAX && payload > limits.max_file_bytes) {
         st.error = SessionError::invalid; error = "park v2: over this engine's read limit"; return false;
@@ -1219,27 +1263,13 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
     // own key is RECOMPUTED while its bytes serve the parser: a mutated chunk fails closed here
     struct Feed {
         std::vector<Ent2>::const_iterator it;
-        uint64_t body_off = kPd2Body;
+        uint64_t body_off = kPd3Body;
         int* bfp;
-        bool missing = false, bad_chunk = false, no_parent = false;
-        uint64_t bad_parent = 0;   // M-C6b: the serial that went missing (refuse line)
-    } feed{ents.begin(), kPd2Body, &ctx.bfd, false, false, false};
+        bool missing = false, bad_chunk = false;
+    } feed{ents.begin(), kPd3Body, &ctx.bfd, false, false};
     uint64_t block_left = 0, block_off = 0;
-    bool hashing = false, inline_blk = false, view_blk = false;
-    // M-C3b3: view ranges serve from the parent's live buffers (b3a copy; b3b turns this into shared views)
-    const auto take_view = [&](uint8_t* dst, size_t n) -> bool {
-        if (vf == nullptr || vf->cur_img == nullptr || vf->cur_aux == UINT64_MAX) return false;
-        const size_t i = (size_t) (vf->cur_aux >> 3), part = (size_t) (vf->cur_aux & 7);
-        if (i >= vf->cur_img->kv.size()) return false;
-        const ConversationKv& k = vf->cur_img->kv[i];
-        const ConversationBuffer* b = part == 0 ? &k.k : part == 1 ? &k.v : part == 2 ? &k.k_scale
-                                  : part == 3 ? &k.v_scale : part == 4 ? &k.pooled : nullptr;
-        if (b == nullptr || vf->cur_off + n > b->size()) return false;
-        bool ok = b->visit(vf->cur_off, n, [&](const uint8_t* q, size_t c, size_t) {
-            std::memcpy(dst, q, c); dst += c; return true; });
-        if (ok) vf->cur_off += n;
-        return ok;
-    };
+    bool hashing = false, inline_blk = false;
+    const uint8_t* cur_salt = nullptr;   // S5b: the salt of the blob being served (into its table entry)
     PdKey cur{};
     bool cur_direct = false;
     SessionHasher bh(0), bh1(kPd2HashSeed1);
@@ -1249,43 +1279,30 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
                 if (feed.it == ents.end()) return false;   // the payload asks for more than the table holds
                 const Ent2& e = *feed.it;
                 inline_blk = e.kind == 0;
-                view_blk = e.kind == 2;
                 block_left = e.len;
                 block_off = 0;
-                if (inline_blk) hashing = false;
-                else if (view_blk) {
-                    hashing = false;   // M-C6a: a view block is not chunk bytes: stop hashing the PREVIOUS
-                                       // chunk here. Left armed, its parent-fed bytes digested against the
-                                       // prior key and any chunk->view interleave self-flagged bad_chunk,
-                                       // fail-closed deleting whole lineage families at boot.
-                    if (vf != nullptr && (vf->cur_par != e.k0 || vf->cur_aux != e.k1)) {
-                        vf->cur_img = view_image(e.k0, id, limits, *vf, error, st);
-                        vf->cur_par = e.k0;
-                        vf->parents_seen.push_back(e.k0);   // M-C6b: remember for the boot pin pass
-                        vf->cur_aux = e.k1;
-                        vf->cur_off = 0;
-                    }
-                    if (vf == nullptr || vf->cur_img == nullptr) { feed.no_parent = true; feed.bad_parent = e.k0; return false; }
-                }
-                else {
+                if (inline_blk) {
+                    // inline blocks stream from the .ses body; they have no chunk file and their
+                    // integrity rides on the payload hash — no store open, no per-block re-hash.
+                    hashing = false;
+                } else {
                     if (*feed.bfp >= 0) pd_close(*feed.bfp);
                     *feed.bfp = pd_open_ro_direct(blob_path(PdKey{e.k0, e.k1}));
                     cur_direct = *feed.bfp >= 0 && pd_fd_is_direct(*feed.bfp);
-                    if (*feed.bfp < 0) { std::fprintf(stderr, "park disk: dbg miss open %s errno %d\n", blob_path(PdKey{e.k0, e.k1}).c_str(), errno); feed.missing = true; return false; }
+                    if (*feed.bfp < 0) { feed.missing = true; return false; }
                     cur = PdKey{e.k0, e.k1};
-                    bh = SessionHasher(0);
-                    bh1 = SessionHasher(kPd2HashSeed1);
+                    cur_salt = e.salt;                       // S5b: re-hash served bytes against the entry's salt
+                    bh = SessionHasher(0);  bh.update(cur_salt, 32);
+                    bh1 = SessionHasher(kPd2HashSeed1);  bh1.update(cur_salt, 32);
                     hashing = true;
                 }
             }
             const size_t take = std::min(n, block_left);
-            const intptr_t r = view_blk ? (take_view(dst, take) ? (intptr_t) take : -1)
-                          : inline_blk ? pd_pread(ctx.fd, dst, take, (long long) feed.body_off)
+            const intptr_t r = inline_blk ? pd_pread(ctx.fd, dst, take, (long long) feed.body_off)
                           : cur_direct ? pd_pread_direct(*feed.bfp, dst, take, (long long) block_off)
                                        : pd_pread(*feed.bfp, dst, take, (long long) block_off);
             if (r != (intptr_t) take) {
                 if (inline_blk) { /* short body read below */ }
-                else if (view_blk) feed.no_parent = true;
                 else feed.missing = true;
                 return false;
             }
@@ -1305,8 +1322,7 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
     };
     SessionError pkind = SessionError::invalid;
     if (!session_payload_unblocks(payload, phash, pull, image, limits, error, &pkind)) {
-        if (feed.no_parent) { st.error = SessionError::invalid; error = "park v2: a view's parent file is gone (orphan, parent " + std::to_string(feed.bad_parent) + ")"; }
-        else if (feed.missing) { st.error = SessionError::invalid; error = "park v2: a chunk file is missing or truncated"; }
+        if (feed.missing) { st.error = SessionError::invalid; error = "park v2: a chunk file is missing or truncated"; }
         else if (feed.bad_chunk) { st.error = SessionError::invalid; error = "park v2: a chunk failed its key (corrupt)"; }
         else { st.error = pkind; if (error.empty()) error = "park v2: parse failed"; }
         return false;   // M-C5: classify foreign (permanent) vs invalid (corrupt) vs io/memory (retry later)
@@ -1367,7 +1383,7 @@ bool ParkDisk::scan_v2_keys(const std::string& path, std::vector<PdKey>& keys, s
     const int fd = pd_open_ro(path);
     if (fd < 0) { error = "park v2 scan: open: " + std::string(std::strerror(errno)); return false; }
     const PdStat sb = pd_fstat(fd);
-    bool ok = sb.ok && sb.size >= kPd2Body;
+    bool ok = sb.ok && sb.size >= kPd3Body;
     uint8_t h[kPd2Hdr];
     if (ok && pd_pread(fd, h, kPd2Hdr, 0) != (intptr_t) kPd2Hdr) ok = false;
     uint32_t ver = 0, hdr = 0;
@@ -1375,23 +1391,23 @@ bool ParkDisk::scan_v2_keys(const std::string& path, std::vector<PdKey>& keys, s
     if (ok) {
         std::memcpy(&ver, h + 8, 4); std::memcpy(&hdr, h + 12, 4);
         std::memcpy(&nblocks, h + 64, 8); std::memcpy(&hh, h + 80, 8);
-        ok = std::memcmp(h, kPd2Magic, 8) == 0 && ver == 2 && hdr == (uint32_t) kPd2Body &&
-             session_hash64(h, 80, 0) == hh && nblocks >= 1 && nblocks <= kPd2MaxBlocks;
+        ok = std::memcmp(h, kPd2Magic, 8) == 0 && ver == 3 && hdr == (uint32_t) kPd3Body &&
+             session_hash64(h, 80, 0) == hh && nblocks >= 1 && nblocks <= kPd3MaxBlocks;
     }
     std::vector<uint8_t> tbl;
     if (ok) {
-        tbl.resize((size_t) nblocks * kPd2Ent);
+        tbl.resize((size_t) nblocks * kPd3Ent);
         if (pd_pread(fd, tbl.data(), tbl.size(), (long long) kPd2Hdr) != (intptr_t) tbl.size()) ok = false;
     }
     pd_close(fd);
-    if (!ok) { error = "park v2 scan: not a structurally valid v2 file"; return false; }
+    if (!ok) { error = "park v3 scan: not a structurally valid v3 file"; return false; }
     for (uint64_t i = 0; i < nblocks; ++i) {
-        const uint8_t* e = tbl.data() + (size_t) i * kPd2Ent;
+        const uint8_t* e = tbl.data() + (size_t) i * kPd3Ent;
         const uint8_t kind = e[0];
         uint64_t len = 0, k0 = 0, k1 = 0;
         std::memcpy(&len, e + 8, 8); std::memcpy(&k0, e + 16, 8); std::memcpy(&k1, e + 24, 8);
-        if (kind > 2 || len == 0 || len > kPd2Block) { error = "park v2 scan: bad table entry"; return false; }
-        if (kind == 1) keys.push_back(PdKey{k0, k1});   // kind 2 names a parent SERIAL: that file shields its own keys
+        if (kind > 1 || len == 0 || len > kPd2Block) { error = "park v3 scan: bad table entry"; return false; }
+        if (kind == 1) keys.push_back(PdKey{k0, k1});
     }
     return true;
 }

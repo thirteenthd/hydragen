@@ -93,6 +93,28 @@ SavedConversation make_image(uint8_t seed, size_t ntok) {
     return s;
 }
 
+// live-shape geometry: 200k cells, 64 B/cell k/v, 4 B/cell scales (non-uniform size on
+// purpose: exercises the whole-buffer block path), 6 layers -> ~600 salted blocks/spill.
+SavedConversation make_live_image(uint8_t seed, size_t ntok) {
+    SavedConversation s;
+    for (size_t i = 0; i < s.geometry.size(); ++i) s.geometry[i] = int64_t(100 + i);
+    s.layer_lo = 0; s.layer_hi = 48;
+    s.cvec = false;
+    s.live = checkpoint(ntok, seed);
+    for (int layer = 0; layer < 6; ++layer) {
+        ConversationKv kv;
+        kv.format = 2; kv.cells = (int64_t) ntok; kv.heads = 2; kv.head_dim = 32;
+        kv.page_size = 64; kv.pooled_rows = 0; kv.idx_dim = 128;
+        kv.k = pattern(ntok * 64, uint8_t(seed + layer * 8));
+        kv.v = pattern(ntok * 64, uint8_t(seed + 1 + layer * 8));
+        kv.k_scale = pattern(ntok * 4 - 17, uint8_t(seed + 2 + layer * 8));   // non-uniform
+        kv.v_scale = pattern(ntok * 4, uint8_t(seed + 3 + layer * 8));
+        s.kv.push_back(std::move(kv));
+    }
+    return s;
+}
+
+
 bool same_checkpoint(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
     return a.ids == b.ids && a.imgs == b.imgs && a.gdn == b.gdn && a.ple == b.ple && a.tails == b.tails &&
            a.dead == b.dead && a.block_pos == b.block_pos && a.used == b.used && b.stage_parts.empty();
@@ -373,6 +395,40 @@ int main() {
         check(!fs::exists(planted), "boot8: the completed walk swept the planted orphan");
         check(list_ses(dir).size() == 1, "boot8: no file was lost across the whole sequence");
     }
+
+
+    // ---- live-shape arm (live-N repro): thousands of salted blocks, non-uniform scale buffers,
+    // scalar regions > 1 MiB; spill, restart, and the boot validator must ACCEPT the files the
+    // v3 writer wrote (the live N pass refused 2 of 3 with "table and file size disagree").
+    const fs::path dir2 = fs::temp_directory_path() / "mc5_boot_test_store_live";
+    fs::remove_all(dir2);
+    fs::create_directories(dir2);
+    SavedConversation origL = make_live_image(21, 200000), origM = make_live_image(22, 200000);
+    {
+        ParkDisk pd;
+        pd.init(ParkDisk::Options{dir2.string(), 0, 0, true}, ident(M1, C1), ok_limits());
+        g_pd = &pd;
+        pd.spill(SavedConversation(origL), -1);
+        wait_for([&] { return list_ses(dir2).size() == 1; }, "live: L published");
+        pd.spill(SavedConversation(origM), -1);
+        wait_for([&] { return list_ses(dir2).size() == 2; }, "live: M published");
+        std::printf("live arm: %zu chunks\n", list_chunks(dir2).size());
+        g_pd = nullptr;
+    }
+    {
+        ParkDisk pd;
+        pd.init(ParkDisk::Options{dir2.string(), 0, 0, true}, ident(M1, C1), ok_limits());
+        check(pd.entries() == 2, "live: restart re-indexes both v3 files (live-N reject repro)");
+        std::string error;
+        const auto m = pd.best(origL.live.ids, {}, false);
+        check(m.tokens == (int64_t) origL.live.ids.size(), "live: L matches after restart");
+        const auto img = pd.load(m, error);
+        check(img && same(*img, origL), "live: byte-identical restore after restart");
+        if (!img) std::printf("live arm load error: %s\n", error.c_str());
+        g_pd = nullptr;
+    }
+    fs::remove_all(dir2);
+
 
     // ---- v1 arm (no chunk tier): foreign identity quarantines the plain file too
     const fs::path dir1 = fs::temp_directory_path() / "mc5_boot_test_store_v1";
