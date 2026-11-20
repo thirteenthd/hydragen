@@ -662,3 +662,29 @@ resumed with `cached 84,480` (no re-read), C2 at 67,584, resumed `cached
 slower (piece-transition tax) - hence default off; it is a fairness dial,
 not a throughput one. `YIELDS_MAX` (2) caps each request's yields; the
 #656b unread rule and the gate share that cap.
+
+## §189 — S5c audit: the v2 view-entry mechanism is inert; the lineage path is pinned by test (2026-11-20)
+
+S5c's delta-restore step assumed the v2 park format's explicit view entries
+(`kind == 2` table rows pointing at a parent's chunks). Building donor
+adoption onto it surfaced that the pull lambda has no `kind == 2` branch at
+all: the view writer was added in `12cbf447` and deleted by this fork's own
+§186 (`0ccaab99`) - `git log -S "ent[0] = 2"` proves both ends. Since §186 a
+RAM shared-store child spills through the lineage path, and because v3
+sharing is structural (salted content keys), the child adds **zero new chunk
+files**: identical parents means identical keys. The donor plumbing built
+against the dead path was reverted, not shipped.
+
+`park_disk_boot_test` gains a `v3lin` arm pinning that truth: a view child's
+spill re-verifies its kept spans against the file parent, the store dedups
+to zero new chunks, and restore comes back byte-identical. This is the
+first direct test coverage of RAM CoW view-child serialization. The suite
+is now 51 checks (was 41). The stub for parent-image lookup returns false
+with a comment saying why: no v3 writer emits those entries, so the dead
+path must not grow back.
+
+What S5c actually means in v3 terms: at pull time every table entry carries
+its salt `(ph, L, part, c0)`, so a salt-to-donor index can skip store reads
+entirely when a RAM sibling already holds those bytes - the feed's per-chunk
+re-hash validates the donor bytes for free. That is the corrected target;
+design recorded, no code shipped here.

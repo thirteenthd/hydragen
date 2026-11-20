@@ -27,7 +27,9 @@ using namespace strata::core;
 namespace fs = std::filesystem;
 
 // The park-disk view-adoption call is engine-side (conversation_snapshot.cpp, which links GPU restore code);
-// this test spills no view children, so that branch never runs. A link stub keeps the test CPU-only.
+// since container v3 (S5b/186) NO writer emits kind==2 view table entries (sibling sharing is structural:
+// salted content-addressed chunks dedup identically-hashed blocks), so this branch never runs. A link stub
+// keeps the test CPU-only.
 namespace strata::core {
 bool conversation_kv_share_views(SavedConversation& img, const SavedConversation& donor,
                                  const std::vector<std::array<size_t, 5>>& keep, size_t* reused_bytes) {
@@ -449,6 +451,57 @@ int main() {
         check(pd.entries() == 0, "v1: foreign files are not indexed");
         check(list_ses(dir1).size() == 1, "M-C5: a foreign v1 file is QUARANTINED, not deleted");
     }
+
+    // ---- v3 lineage arm (S5c discovery, 2026-11-20): a RAM CoW view child spills through the
+    // lineage path, but container v3 writes NO kind==2 view entries: the child's blocks salt and
+    // digest IDENTICALLY to the parent's (prefix-ladder salt), so the store dedups them to zero new
+    // chunk files. Restoring the child re-reads only those shared chunks and is byte-identical.
+    // (Pre-v3 the child would reassemble its parent through view_image; that machinery is inert
+    // since 0ccaab99 - this arm pins the fact.)
+    const fs::path dirv = fs::temp_directory_path() / "mc5_boot_test_store_views";
+    fs::remove_all(dirv);
+    fs::create_directories(dirv);
+    {
+        ParkDisk pd;
+        pd.init(ParkDisk::Options{dirv.string(), 0, 0, true}, ident(M1, C1), ok_limits());
+        g_pd = &pd;
+        SavedConversation P = make_image(21, 1000);
+        const SavedConversation Pcopy(P);
+        SavedConversation C = make_image(22, 1000);
+        C.live.ids.push_back(2000);   // a distinct child conversation over the shared head bytes
+        for (size_t i = 0; i < C.kv.size(); ++i) {
+            const size_t n = P.kv[i].k.size();
+            check(C.kv[i].k.adopt_shared(P.kv[i].k, n), "v3lin: adopt_shared parent k prefix");
+            C.kv[i].k.resize_for_overwrite(n);   // fully shared: the whole k part views the parent
+        }
+        const SavedConversation Ccopy(C);
+        const std::vector<int32_t> cids = C.live.ids;
+        size_t nsp = 0;
+        C.kv[0].k.head_spans([&](const uint8_t* q, size_t l) { ++nsp; });
+        check(nsp > 0, "v3lin: child buffer has borrowed head spans pre-spill");
+        // The borrowed()/view contract: spans stay views only while the DONOR image is alive (prod
+        // pins view_donor holders in the RAM cache; the test mirrors that by keeping P alive here).
+        // The parent's park RECORD spills from an independent copy so P itself is never moved-from.
+        pd.spill(SavedConversation(Pcopy), 101);
+        wait_for([&] { return list_ses(dirv).size() == 1; }, "v3lin: parent published");
+        const size_t chunks_after_P = list_chunks(dirv).size();
+        C.view_donor = 101;
+        pd.spill(std::move(C), -1);
+        wait_for([&] { return list_ses(dirv).size() == 2; }, "v3lin: child published");
+        check(pd.entries() == 2, "v3lin: two entries");
+        check(list_chunks(dirv).size() == chunks_after_P,
+              "v3lin: v3 dedups the child's shared blocks to zero new chunks");
+        {
+            const auto m = pd.best(cids, {}, false);
+            check(m.tokens == (int64_t) cids.size(), "v3lin: child matches");
+            std::string error;
+            const auto img = pd.load(m, error);
+            check(img.has_value(), "v3lin: child restores reading only the shared chunks");
+            if (img) check(same(*img, Ccopy), "v3lin: restore is byte-identical");
+        }
+        g_pd = nullptr;
+    }
+    fs::remove_all(dirv);
 
     std::printf("park_disk_boot_test: %d checks passed\n", checks);
     fs::remove_all(dir);
