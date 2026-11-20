@@ -367,6 +367,10 @@ try:
 except ValueError:
     ADMIT_SHORT_FIRST = 0
 ADMIT_MAX_WAIT_S = _timeout_env("STRATA_ADMIT_MAX_WAIT_S", 30.0) or 0.0
+try:
+    YIELD_AFTER_S = max(0.0, float(os.environ.get("STRATA_YIELD_AFTER_S") or 0))
+except ValueError:
+    YIELD_AFTER_S = 0.0
 # STRATA_COALESCE_PREFILL=N (research, PAR-H; needs the engine's BCO / BCOK lines): a request that takes the control lines
 # for its admission also sends the prompts of up to N-1 requests still waiting for them (BCO <slot> <ids>, into free slots
 # it reserves for them); the engine reads all the prompts in ONE layer-major pass, so the experts a layer streams are
@@ -2299,7 +2303,13 @@ class StrataEngine:
         """#656: someone waits for the control lines whose UNREAD tokens (not raw prompt length - #656b) are under
         half this one's: worth giving way to."""
         with self.slot_cv:
-            return any(self._unread(e) * 2 <= plen for e in self.wait_lens)
+            # #656c: STRATA_YIELD_AFTER_S=<seconds> (0: off): a waiter that has simply waited long enough
+            # yields it too, whatever its length - the engine takes a BYIELD at its next piece boundary and
+            # the part read stays in the slot (the resumption reuses it), so two comparable cold reads
+            # interleave instead of serializing; YIELDS_MAX still caps one request's yields.
+            now = time.monotonic()
+            return any(self._unread(e) * 2 <= plen or
+                       (YIELD_AFTER_S > 0 and now - e[1] >= YIELD_AFTER_S) for e in self.wait_lens)
 
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)

@@ -638,3 +638,27 @@ completes; cold B (`93,956`) starts; 8 s later A2 (A1's conversation,
 
 A2's usage figures are unchanged (`cached 114,688` of `128,979`): the
 change moves admission order only, never what is read or reused.
+
+## §188 — Wait-age-gated yield: comparable cold reads interleave (STRATA_YIELD_AFTER_S, default off; 2026-11-20)
+
+An audit of the claim "the engine holds the control lines across all ten
+prompt chunks of a batch read" found the engine side already mitigated:
+`batch_read_piece` (include/strata/program/batch_read.hpp) reads prompts in
+pieces, and at every piece boundary the engine drains its stdin queue -
+taking BSTOP, BYIELD (`give_way`, which keeps the part read in the slot for
+reuse) - before the next piece (generate.cpp ~19166-19190). What actually
+holds is serve's own ctl mutex, and BYIELD pierces it at the next boundary.
+
+What remained true: `#656`'s rule (`unread x 2 <= this read's length`) never
+fires for two comparable COLD reads, so cold requests serialize at full
+read latency each. Measured on the 3060 Ti arm, two 93,956-token cold reads
+8 s apart: first `39.6 s`, second `64.4 s` wall (25 s dead wait).
+
+`STRATA_YIELD_AFTER_S=<seconds>` (0/unset: off): a waiter aged past the gate
+earns a BYIELD whatever its length. Measured with the gate at 10 s: the two
+reads ping-ponged once each - C1 yielded at its 84,480-token mark and
+resumed with `cached 84,480` (no re-read), C2 at 67,584, resumed `cached
+67,584`; both progressed concurrently. Cost: whole-batch completion ~5 %
+slower (piece-transition tax) - hence default off; it is a fairness dial,
+not a throughput one. `YIELDS_MAX` (2) caps each request's yields; the
+#656b unread rule and the gate share that cap.
