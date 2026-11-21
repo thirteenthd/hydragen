@@ -940,3 +940,38 @@ test 62 checks; targeted ctest park/session/conversation/file/buffer 20/20 — n
 four `conversation_snapshot*` tests need an idle GPU (they abort with `CUDA: out of
 memory` while a serve holds the card; same constraint as the segmented-cache test).
 Files: `engine/src/program/generate.cpp`.
+
+
+## 197. S5d-v2 prewarm through the adaptive tier's own picker — wired, proven, and bounded by the same wall as 190
+
+195 shipped the histogram; the ms01 churn (196) showed the free-slot prewarm claim
+stages nothing on a saturated cache: `park prewarm: 0 experts staged, 18-23 refused
+(no slot free)`. The fix is not a second eviction path. The adaptive tier already
+picks its swaps from decayed per-expert `usage` counts (candidates at usage>=2.0,
+coldest victims, `adapt_min_gain`, `adapt_swaps` budget, pinned/peer/helper
+protected). Prewarm v2 seeds the park's hot set straight into those counts: at a
+disk restore, up to 512 hot indices get `usage = max(current, 64 + count)`, and the
+tier's own measured policy swaps them in on its next round. The tier's protection of
+pinned experts is inherited, not re-implemented. Kill switch:
+`STRATA_PARK_PREWARM_BOOST=0` (the free-slot claim is untouched).
+
+Measured on ms01 (same churn as 196):
+
+- The hook acts: `park prewarm: 0 experts staged, 22 refused (no slot free),
+  25-380 usage-boosted` per restore; the tier swaps through them (1,020 -> 1,347
+  experts swapped in across the run, 85-216 ms/round).
+- The payoff is noise-level here, and the reason is now on the record: decode enters
+  the resumed conversation at **97.0-97.6% cache hit**; only 1.8% of routed experts
+  cross PCIe at all, so the miss cost prewarm can remove is bounded under a
+  quarter-second per window on this box — while the restore's 19-21 s wall sits in
+  restore setup and window queue behind sibling streams, not in expert residency.
+  `park disk: spilled ... (5 entries, 4.5 GiB on disk)` writes only ~0.6-0.8 MiB per
+  46k-token park because COW views hold the KV bytes.
+- No regression: restore walls 18.9-20.9 s vs 18.8-21.2 s before, `restore_qc_fail=0`.
+
+So S5d's chain (record -> manifest -> spill -> read -> tier hint) is complete and
+inert-by-arithmetic on 12 GB nodes exactly where 190's "only lever = fewer bytes"
+already said the expert path is thin; it pays where a cache has headroom and misses
+actually dominate — which on this program's fleet means the 24 GB production box.
+Gates at ship bytes (`generate.cpp` md5 `699dca53…`, local↔ms01 identical): boot 62
+checks, targeted ctest 20/20 (idle GPU). Files: `engine/src/program/generate.cpp`.

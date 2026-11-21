@@ -17668,13 +17668,17 @@ int main(int argc, char** argv) {
                             }
                         }
                         // S5d: the park's histogram pre-stages the experts this conversation was routing
-                        // when it parked. Slots are only claimed when free (this never evicts anyone),
-                        // and the fill queues its H2D on the cache stream, so the resumed conversation's
-                        // windows stop paying those stalls. blob + fill_slot is the same pair the window
-                        // admission path itself uses, and it runs here, on the same thread (windows and
-                        // admission serialize their cache work on this thread). Capped: 32 experts a
-                        // layer, 512 total, and STRATA_PARK_PREWARM_MIB (default 256) of blobs, so the
-                        // resume's synchronous host reads stay inside a window's stall budget.
+                        // when it parked. Two halves:
+                        //  - free-slot claim (unchanged): a still-free cache slot is filled synchronously;
+                        //    on a saturated cache this claims nothing (this never evicts anyone).
+                        //  - S5d-v2 usage boost: the hot set is seeded into the adaptive tier's decayed
+                        //    `usage` counts, so the tier's OWN picker (measured policy: usage>=2.0 candidates,
+                        //    coldest victims, adapt_min_gain, adapt_swaps budget, pinned/peer/helper
+                        //    protected) swaps them in on its next round. One eviction policy, no second
+                        //    path, and the tier's protection of pinned experts is inherited.
+                        //    STRATA_PARK_PREWARM_BOOST=0 leaves the claim alone. Capped: 32 experts a
+                        //    layer, 512 total, and STRATA_PARK_PREWARM_MIB (default 256) of blobs, so the
+                        //    resume's synchronous host reads stay inside a window's stall budget.
                         static const bool pd_prewarm = [] {
                             const char* v = hg_getenv("STRATA_PARK_PREWARM");
                             return v == nullptr || v[0] != '0';
@@ -17695,7 +17699,11 @@ int main(int argc, char** argv) {
                                 std::vector<int64_t> per_layer((size_t) g.n_layers, 0);
                                 const auto& xpl = strata::kernels::cpu::expert_layout();
                                 const cudaStream_t cs = (cudaStream_t) drive.d.cache_stream;
-                                int64_t staged = 0, refused = 0; double mib = 0.0;
+                                int64_t staged = 0, refused = 0, boosted = 0; double mib = 0.0;
+                                static const bool pd_boost = [] {
+                                    const char* v = hg_getenv("STRATA_PARK_PREWARM_BOOST");
+                                    return v == nullptr || v[0] != '0';
+                                }();
                                 bool stop_prewarm = false;
                                 for (const auto& hc : hot) {
                                     if (staged >= 512 || mib >= (double) prewarm_mib) break;
@@ -17717,10 +17725,22 @@ int main(int argc, char** argv) {
                                     per_layer[(size_t) l2]++;
                                     mib += (double) xpl.blob_bytes(l2) / (1024.0 * 1024.0);
                                 }
-                                if (staged || refused || stop_prewarm)
+                                // S5d-v2: seed the tier's usage counts with the park's hot set. The claim above
+                                // staged what was free for nothing; the boost makes the adaptive tier's own
+                                // picker swap in the rest on its next round, under its measured gain/budget
+                                // policy and its own protection of pinned, peer- and helper-held experts.
+                                if (pd_boost && !drive.d.usage.empty())
+                                    for (const auto& hc : hot) {
+                                        if (boosted >= 512) break;
+                                        float& uu = drive.d.usage[(size_t) hc.second];
+                                        const float want = 64.0f + (float) hc.first;
+                                        if (uu < want) { uu = want; ++boosted; }
+                                    }
+                                if (staged || refused || boosted || stop_prewarm)
                                     std::fprintf(stderr, "strata serve: park prewarm: %lld experts staged (%.1f MiB), "
-                                                 "%lld refused (no slot free)%s\n",
+                                                 "%lld refused (no slot free), %lld usage-boosted%s\n",
                                                  (long long) staged, mib, (long long) refused,
+                                                 (long long) boosted,
                                                  stop_prewarm ? " (stopped by a fill failure)" : "");
                             }
                         }
