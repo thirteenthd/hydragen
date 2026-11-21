@@ -21390,8 +21390,9 @@ int main(int argc, char** argv) {
                     const strata::core::QsaState& st = ss.qsa_states[ss.qsa_ord0 + j];
                     h_tail = hash_dev(st.idx_tail, z.tail, h_tail);
                     h_dead = hash_dev(st.idx_dead, z.dead, h_dead);
-                    h_pool = hash_dev(st.idx_pooled, (size_t) (L / qs.idx_block) * qs.idx_dim * 4, h_pool);
-                    h_pool_full = hash_dev(st.idx_pooled, (size_t) (L > 0 ? L / qs.idx_block + 1 : 0) * qs.idx_dim * 4,
+                    const size_t pool_w = qs.idx_dim * (qs.idx_pool_f16 ? 2 : 4);   // S7-3: the pool's bytes
+                    h_pool = hash_dev(st.idx_pooled, (size_t) (L / qs.idx_block) * pool_w, h_pool);
+                    h_pool_full = hash_dev(st.idx_pooled, (size_t) (L > 0 ? L / qs.idx_block + 1 : 0) * pool_w,
                                            h_pool_full);
                     // KV streaming: the host copy is the identity layout and holds every cell
                     for (const auto& [pool, w] : kv_arrays(st)) {

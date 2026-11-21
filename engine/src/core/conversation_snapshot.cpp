@@ -56,12 +56,16 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
     // snapshot or prompt checkpoint taken with the rotation never restores into one without it, nor the reverse.
     // (Q4_0 is always rotated: nothing to tell apart; without the rotation the format is the one it always was.)
     const int rotated = st.kv_rot && !st.kv_q4 && !st.kv_hybrid ? 16 : 0;
-    l = {(st.kv_hybrid ? 3 : qsa_kv_format(st)) + rotated, cells, pooled, s.page_size, 0, 0, 0, 0, 0};
+    // S7-3 (+32): the pooled indexer keys as IEEE halfs (STRATA_IDX_POOL_F16) - the bytes of one format mean
+    // nothing to a state of the other, exactly the rotated-INT8 rule: a snapshot or park taken in one format
+    // never restores into a state of the other; every restore site below compares this int whole.
+    const int pool_f16 = s.idx_pool_f16 ? 32 : 0;
+    l = {(st.kv_hybrid ? 3 : qsa_kv_format(st)) + rotated + pool_f16, cells, pooled, s.page_size, 0, 0, 0, 0, 0};
     using conversation_detail::product;
     if (!product(l.data, {(uint64_t) cells, (uint64_t) g.n_head_kv, per}) ||
         !product(l.scales, {(uint64_t) cells, (uint64_t) g.n_head_kv,
                            int8_keys && !st.kv_q4 ? (uint64_t) (g.head_dim / 64) * 2 : 0}) ||
-        !product(l.pooled, {(uint64_t) pooled, (uint64_t) g.idx_key_dim, sizeof(float)})) {
+        !product(l.pooled, {(uint64_t) pooled, (uint64_t) g.idx_key_dim, sizeof(float) / (s.idx_pool_f16 ? 2 : 1)})) {
         error = "conversation snapshot: K/V byte count overflow";
         return false;
     }
@@ -328,7 +332,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
             const int64_t arows = at / strata::kernels::qsa_real_shapes().idx_block;
             anchor_part = {&anchor->k, &anchor->v, &anchor->k_scale, &anchor->v_scale, &anchor->pooled};
             for (size_t i = 0; i < 5; ++i)
-                anchor_keep[i] = i == 4 ? (index ? size_t(arows) * g.idx_key_dim * 4 : 0)
+                anchor_keep[i] = i == 4 ? (index ? size_t(arows) * g.idx_key_dim * (strata::kernels::qsa_real_shapes().idx_pool_f16 ? 2 : 4) : 0)
                                         : (l.cells ? (sizes[i] / size_t(l.cells)) * size_t(ac) : 0);
             for (size_t i = 0; i < 5; ++i)
                 if (anchor_keep[i] > anchor_part[i]->size()) {
@@ -343,7 +347,8 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     for (size_t i = 0; i < dst.size(); ++i) {
         // Recopy the partial page and the indexer's moving spare row. Completed
         // pages/rows strictly before the first rewritten token remain identical.
-        const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
+        const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim
+                                       * (strata::kernels::qsa_real_shapes().idx_pool_f16 ? 2 : 4) : 0)
                                   : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
         const size_t anc = anchor ? anchor_keep[i] : 0;

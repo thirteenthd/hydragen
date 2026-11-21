@@ -1009,3 +1009,65 @@ entry. Probe: ms01 `s2b_probe2.sh`, bands `c4_s2bA.log` / `c4_s2bB.log`. Note fo
 future batch-8 runs on 12 GB boxes: arm A's guard logged `min_memavail_gib 1.9` with
 a 6,144 MiB park budget at `--kv-resident 8192` — RAM, not VRAM, is where batch 8
 will bind first.
+
+## 199. S7-3: the pooled indexer-key table can be stored FP16 — +175 resident experts at batch 2, quality held
+
+The ladder's last capacity lever: the per-conversation indexer-key pool is
+`pooled_rows x idx_dim x 4 B x 12 QSA layers` — 201.5 MiB per 131k slot, the largest
+per-slot VRAM block after the KV pools. `STRATA_IDX_POOL_F16=1` halves it; fmt=0 stays
+the default and is byte-identical to every earlier build.
+
+Numerics first, per the design note: upstream's dormant probe (`STRATA_IDX_FP16_CHECK`,
+rounds the pool values and re-selects with the unmodified FP32 kernels — exactly what an
+FP16 store reads back) ran on ms01 against the canonical config: `FP16 indexer keys:
+82048 of 89544 selections identical; where the selection is sparse, 99.9864% of cells
+shared (64932 queries)`; the full quality battery passed 7/7 with rounding on. The ~8%
+differing selections are block-boundary score flips on sparse selections; outputs held.
+
+Implementation: one value, read once in `qsa_real_shapes()`, so allocation, reservation
+math, boot memset, QC-hash width, the snapshot/park format flag **+32** (a pool taken in
+one format never restores into the other) and every kernel site agree by construction.
+`pool_put` / `pool_get` / `pool4` are the only sanctioned accessors: round once at store,
+expand exactly on read, scorer accumulation order untouched. HIP/Metal builds are forced
+to the FP32 pool. The checkpoint spare-row rewind rounds host-side through a new
+`qsa_pool_round_copy`.
+
+The live pool writer is NOT qsa.cu: `layer_verify_compatible()` hard-requires the native
+QSA indexer, and every boot's verify graph appends through
+`native_qsa_indexer_append_steps` (verify.cpp, three sites). The first A/B round died
+exactly there — refusing fmt=1 inside the native indexer's geometry THROW validators made
+every request fail with `verify layer 3: native QSA indexer requires fixed geometry...`.
+The fix converts the native indexer instead: `append_body`/`append`/`append_layers`/
+`append_first`/`append_blocks` templated on the pooled element type, `pool_put` the only
+write, host wrappers dispatch on the flag, span checks in real bytes. Law recorded:
+geometry guards are validators, not eligibility filters — a feature refusal belongs where
+the caller picks the path.
+
+Verdict on ms01 (ctx131k, `--batch 2`, canonical config, serve bytes = this commit):
+
+| gate / band | fmt=0 | fmt=1 |
+|---|---|---|
+| boot test / ctest subset | 62/62 + 20/20 | 62/62 + 20/20 |
+| boot sizing input | 5.09 GiB free | 5.37 GiB free |
+| expert cache | 2548 slots / 4.16 GiB | 2723 slots / 4.44 GiB |
+| quality battery | 7/7 | 7/7 |
+| C4 harness needle | 4/4 | 4/4 |
+| C4 wall / agg decode | 502.1 s / 6.7 tok/s | 575.2 s / 7.1 tok/s |
+| ttft p50 / p95 | 51.6 / 107.5 s | 50.0 / 113.9 s |
+| guard pauses / min MemAvailable | 0 / 7.6 GiB | 0 / 8.0 GiB |
+
++175 expert slots (+6.9%) land for free at batch 2; the saving doubles with every added
+conversation slot (~101 MiB/slot at 131k), which is where batch 4 and the 24 GB prod
+card collect it. The C4 walls are not directly comparable: the probe-blessed ~8%
+selection flips change completion lengths (3,348 vs 4,103 completion tokens) and which
+park waves run, and a second fmt=0 run on the same bytes wall-ed 579.5 s against 502.1 s.
+Per-token decode was slightly better on fmt=1 (7.1 vs 6.7 tok/s aggregate); no quality
+or guard regressions. Watch-item: one `max_stall_gap` of 134.3 s appeared in the fmt=1
+harness (6.9 s in fmt=0) — single occurrence, park/restore-interaction class, not yet
+characterized.
+
+Probe: ms01 `s73_ab.sh` round 5, bands `c4_s73a.log` / `c4_s73b.log`, battery tags
+`s73a`/`s73b`, boot lines in `strata-m25-iq3xxs-lan-cow.log` under the `S73AB 16:`
+window. A driver law learned the same day: a `flock` guard's fd leaks into every child —
+the round-1 daemonized serve held the A/B lock for hours as an invisible holder behind
+serve's inherited fd; child launches must close it (`200>&-`).

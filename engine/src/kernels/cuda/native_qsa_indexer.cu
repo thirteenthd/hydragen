@@ -21,6 +21,7 @@
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/core/geometry.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/kernels/f16_bits.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <atomic>
@@ -36,6 +37,11 @@ std::atomic<bool> enabled{false};
 constexpr int D = 128, R = 4, ROT = 64, THREADS = 256;
 static_assert(D == strata::core::kCompiledGeometry.idx_key_dim && R == strata::core::kCompiledGeometry.idx_block && ROT == strata::core::kCompiledGeometry.n_rot,
               "native_qsa_indexer is compiled for core/geometry.hpp");
+// S7-3: the pooled indexer-key table can be stored FP16 (STRATA_IDX_POOL_F16). pool_put is the only
+// sanctioned way to write the table; the F32 overload is a plain store, so the F32 build is byte-identical.
+__device__ __forceinline__ void pool_put(float* pool, std::size_t i, float v) { pool[i] = v; }
+__device__ __forceinline__ void pool_put(uint16_t* pool, std::size_t i, float v) { pool[i] = f16_from_f32(v); }
+
 __device__ float warp_sum(float x) {
 #pragma unroll
     for (int offset = 16; offset; offset >>= 1)
@@ -45,12 +51,12 @@ __device__ float warp_sum(float x) {
 // TAB (#280, STRATA_ROPE_TABLE=1): the angles from the session's float64 table.  The host launches <false> whenever
 // no table applies - the default - so the default kernel is 0.1.31's code exactly (the table read is not in it;
 // with it merely skipped at run time, the compiled default path changed its results).
-template <bool TAB>
+template <bool TAB, typename P>
 __device__ __forceinline__ void append_body(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
                         int pos_stride, int n_steps,
                         int pos_base, const float* __restrict__ gamma, float epsilon,
                         float* __restrict__ tail, float* __restrict__ dead,
-                        float* __restrict__ pooled, int32_t* __restrict__ block_pos,
+                        P* __restrict__ pooled, int32_t* __restrict__ block_pos,
                         int max_cells, float theta_scale, float freq_scale, float corr_low,
                         float corr_high, float ext_factor, float mscale,
                         const int32_t* __restrict__ mtab, const RopeTab& rt) {
@@ -106,9 +112,9 @@ __device__ __forceinline__ void append_body(const float* __restrict__ raw, const
                         const float a = values[pair], z = values[pair + ROT / 2];
                         y = d < ROT / 2 ? a * c - z * s : a * s + z * c;
                     }
-                    pooled[std::size_t(b) * D + d] = y;
+                    pool_put(pooled, std::size_t(b) * D + d, y);
                     if (pos == 0) dead[d] = y;
-                    else pooled[std::size_t(b + 1) * D + d] = dead[d];
+                    else pool_put(pooled, std::size_t(b + 1) * D + d, dead[d]);
                     if (d == 0 && pos != 0) *block_pos = rope_pos;
                 }
             }
@@ -116,21 +122,21 @@ __device__ __forceinline__ void append_body(const float* __restrict__ raw, const
         if (n_steps > 1) __syncthreads();
     }
 }
-template <bool TAB>
+template <bool TAB, typename P>
 __global__ void append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
                         int pos_stride, int n_steps,
                         int pos_base, const float* __restrict__ gamma, float epsilon,
                         float* __restrict__ tail, float* __restrict__ dead,
-                        float* __restrict__ pooled, int32_t* __restrict__ block_pos,
+                        P* __restrict__ pooled, int32_t* __restrict__ block_pos,
                         int max_cells, float theta_scale, float freq_scale, float corr_low,
                         float corr_high, float ext_factor, float mscale,
                         const int32_t* __restrict__ mtab, RopeTab rt) {
-    append_body<TAB>(raw, pos_dev, pos_stride, n_steps, pos_base, gamma, epsilon, tail, dead, pooled, block_pos, max_cells,
+    append_body<TAB, P>(raw, pos_dev, pos_stride, n_steps, pos_base, gamma, epsilon, tail, dead, pooled, block_pos, max_cells,
                      theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, mtab, rt);
 }
 // engine-latency: the commit's appends of several QSA layers in one launch, one block per layer (blockIdx.x); each block
 // first restores its layer's tail from the window's snapshot (the commit's copy_from_mapped), then runs append's body
-template <bool TAB>
+template <bool TAB, typename P>
 __global__ void append_layers(const float* __restrict__ raw0, long long raw_stride, const int32_t* __restrict__ pos_dev,
                               int pos_stride, int n_steps, int pos_base, float epsilon, QsaIndexerLayers L, int max_cells,
                               float theta_scale, float freq_scale, float corr_low, float corr_high, float ext_factor,
@@ -141,8 +147,8 @@ __global__ void append_layers(const float* __restrict__ raw0, long long raw_stri
         for (int j = threadIdx.x; j < (R - 1) * D; j += blockDim.x) tail[j] = L.tail_src[i][j];
         __syncthreads();
     }
-    append_body<TAB>(raw0 + (long long) i * raw_stride, pos_dev, pos_stride, n_steps, pos_base, L.gamma[i], epsilon, tail,
-                     L.dead[i], L.pooled[i], L.block_pos[i], max_cells, theta_scale, freq_scale, corr_low, corr_high,
+    append_body<TAB, P>(raw0 + (long long) i * raw_stride, pos_dev, pos_stride, n_steps, pos_base, L.gamma[i], epsilon, tail,
+                     L.dead[i], reinterpret_cast<P*>(L.pooled[i]), L.block_pos[i], max_cells, theta_scale, freq_scale, corr_low, corr_high,
                      ext_factor, mscale, mtab, rt);
 }
 // ---- C-2: the batched append.  The pooled key of a completed block b (its last cell pos = 4b+3), computed with
@@ -182,9 +188,9 @@ __device__ __forceinline__ float norm_scale(float mean, float* partials, int d) 
     return square_sum;
 }
 // cell 0 of a sequence: the spare (every gather index names cell 0), written to pooled[0] and dead
-template <bool TAB>
+template <bool TAB, typename P>
 __global__ void append_first(const float* __restrict__ raw, const float* __restrict__ gamma, float epsilon,
-                             float* __restrict__ dead, float* __restrict__ pooled, float theta_scale,
+                             float* __restrict__ dead, P* __restrict__ pooled, float theta_scale,
                              float freq_scale, float corr_low, float corr_high, float ext_factor, float mscale,
                              const int32_t* __restrict__ mtab, RopeTab rt) {
     const int d = threadIdx.x;
@@ -205,13 +211,13 @@ __global__ void append_first(const float* __restrict__ raw, const float* __restr
     if (d >= D) return;
     const float y = pooled_value<TAB>(values, d, 0, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale,
                                  mtab, true, rt);
-    pooled[d] = y;
+    pool_put(pooled, d, y);
     dead[d] = y;
 }
-template <bool TAB>
+template <bool TAB, typename P>
 __global__ void append_blocks(const float* __restrict__ raw, int64_t n, int64_t p0, int pos_base,
                               const float* __restrict__ gamma, float epsilon, const float* __restrict__ tail,
-                              const float* __restrict__ dead, float* __restrict__ pooled, int32_t* __restrict__ block_pos,
+                              const float* __restrict__ dead, P* __restrict__ pooled, int32_t* __restrict__ block_pos,
                               int64_t first_block, int64_t last_block, float theta_scale, float freq_scale,
                               float corr_low, float corr_high, float ext_factor, float mscale,
                               const int32_t* __restrict__ mtab, RopeTab rt) {
@@ -236,10 +242,10 @@ __global__ void append_blocks(const float* __restrict__ raw, int64_t n, int64_t 
     __syncthreads();
     if (d >= D) return;
     const int rope_pos = pos_base + R * (int) b;
-    pooled[std::size_t(b) * D + d] = pooled_value<TAB>(values, d, rope_pos, theta_scale, freq_scale, corr_low, corr_high,
-                                                  ext_factor, mscale, mtab, false, rt);
+    pool_put(pooled, std::size_t(b) * D + d, pooled_value<TAB>(values, d, rope_pos, theta_scale, freq_scale, corr_low, corr_high,
+                                                  ext_factor, mscale, mtab, false, rt));
     if (b == last_block) {
-        pooled[std::size_t(b + 1) * D + d] = dead[d];
+        pool_put(pooled, std::size_t(b + 1) * D + d, dead[d]);
         if (d == 0) *block_pos = rope_pos;
     }
 }
@@ -277,22 +283,35 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
         rope_scaling_invalid(scaling) != nullptr)
         throw std::invalid_argument("native QSA indexer requires fixed geometry, aligned position base, positive capacity/epsilon, valid frequency/scaling and explicit stream");
     const std::size_t pos_span = (n_steps == 1 || pos_stride <= 0) ? 4 : (std::size_t(n_steps - 1) * pos_stride + 1) * 4;
+    const std::size_t pool_bytes = std::size_t(max_cells/R+1) * D * (s.idx_pool_f16 ? 2 : 4);   // S7-3: F16 halves the table
     const Span spans[] = {{raw,std::size_t(n_steps)*D*4},{relative_pos_device,pos_span},{gamma,D*4},{b.tail,(R-1)*D*4},
-        {b.dead,D*4},{b.pooled,std::size_t(max_cells/R+1)*D*4},{b.block_pos,4}};
+        {b.dead,D*4},{b.pooled,pool_bytes},{b.block_pos,4}};
     for (const auto& span : spans) validate(span);
     for (int i = 0; i < 7; ++i) for (int j = i + 1; j < 7; ++j)
         if (overlaps(spans[i], spans[j])) throw std::invalid_argument("native QSA indexer buffers overlap");
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
     const RopeKernelArgs k = scaling.kernel_args(ROT);   // none: the identity constants
     const RopeTab rt = rope_table_for(scaling);
-    if (rt.cos != nullptr)
-        append<true><<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,relative_pos_device,pos_stride,n_steps,pos_base,gamma,epsilon,
-            b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,k.freq_scale,
-            k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,mrope_table(),rt);
-    else
-        append<false><<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,relative_pos_device,pos_stride,n_steps,pos_base,gamma,epsilon,
-            b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,k.freq_scale,
-            k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,mrope_table(),rt);
+    const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    if (rt.cos != nullptr) {
+        if (s.idx_pool_f16)
+            append<true,uint16_t><<<1,THREADS,0,st>>>(raw,relative_pos_device,pos_stride,n_steps,pos_base,gamma,epsilon,
+                b.tail,b.dead,reinterpret_cast<uint16_t*>(b.pooled),b.block_pos,int(max_cells),theta_scale,k.freq_scale,
+                k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,mrope_table(),rt);
+        else
+            append<true,float><<<1,THREADS,0,st>>>(raw,relative_pos_device,pos_stride,n_steps,pos_base,gamma,epsilon,
+                b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,k.freq_scale,
+                k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,mrope_table(),rt);
+    } else {
+        if (s.idx_pool_f16)
+            append<false,uint16_t><<<1,THREADS,0,st>>>(raw,relative_pos_device,pos_stride,n_steps,pos_base,gamma,epsilon,
+                b.tail,b.dead,reinterpret_cast<uint16_t*>(b.pooled),b.block_pos,int(max_cells),theta_scale,k.freq_scale,
+                k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,mrope_table(),rt);
+        else
+            append<false,float><<<1,THREADS,0,st>>>(raw,relative_pos_device,pos_stride,n_steps,pos_base,gamma,epsilon,
+                b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,k.freq_scale,
+                k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,mrope_table(),rt);
+    }
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
@@ -311,7 +330,7 @@ void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_strid
         const std::size_t pos_span = (n_steps == 1 || pos_stride <= 0) ? 4 : (std::size_t(n_steps - 1) * pos_stride + 1) * 4;
         const Span spans[] = {{raw0 + (std::size_t) i * (std::size_t) raw_stride, std::size_t(n_steps)*D*4},
             {relative_pos_device,pos_span},{layers.gamma[i],D*4},{layers.tail[i],(R-1)*D*4},{layers.dead[i],D*4},
-            {layers.pooled[i],std::size_t(max_cells/R+1)*D*4},{layers.block_pos[i],4}};
+            {layers.pooled[i],std::size_t(max_cells/R+1)*D*(s.idx_pool_f16 ? 2 : 4)},{layers.block_pos[i],4}};   // S7-3: F16 halves the table
         for (const auto& span : spans) validate(span);
         for (int a = 0; a < 7; ++a) for (int b = a + 1; b < 7; ++b)
             if (overlaps(spans[a], spans[b])) throw std::invalid_argument("native QSA indexer buffers overlap");
@@ -320,14 +339,25 @@ void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_strid
     const RopeKernelArgs k = scaling.kernel_args(ROT);
     const RopeTab rt = rope_table_for(scaling);
     const cudaStream_t st = static_cast<cudaStream_t>(stream);
-    if (rt.cos != nullptr)
-        append_layers<true><<<n_layers, THREADS, 0, st>>>(raw0, (long long) raw_stride, relative_pos_device, pos_stride, n_steps,
-            pos_base, epsilon, layers, int(max_cells), theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
-            k.attn_factor, mrope_table(), rt);
-    else
-        append_layers<false><<<n_layers, THREADS, 0, st>>>(raw0, (long long) raw_stride, relative_pos_device, pos_stride, n_steps,
-            pos_base, epsilon, layers, int(max_cells), theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
-            k.attn_factor, mrope_table(), rt);
+    if (rt.cos != nullptr) {
+        if (s.idx_pool_f16)
+            append_layers<true,uint16_t><<<n_layers, THREADS, 0, st>>>(raw0, (long long) raw_stride, relative_pos_device, pos_stride, n_steps,
+                pos_base, epsilon, layers, int(max_cells), theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
+                k.attn_factor, mrope_table(), rt);
+        else
+            append_layers<true,float><<<n_layers, THREADS, 0, st>>>(raw0, (long long) raw_stride, relative_pos_device, pos_stride, n_steps,
+                pos_base, epsilon, layers, int(max_cells), theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
+                k.attn_factor, mrope_table(), rt);
+    } else {
+        if (s.idx_pool_f16)
+            append_layers<false,uint16_t><<<n_layers, THREADS, 0, st>>>(raw0, (long long) raw_stride, relative_pos_device, pos_stride, n_steps,
+                pos_base, epsilon, layers, int(max_cells), theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
+                k.attn_factor, mrope_table(), rt);
+        else
+            append_layers<false,float><<<n_layers, THREADS, 0, st>>>(raw0, (long long) raw_stride, relative_pos_device, pos_stride, n_steps,
+                pos_base, epsilon, layers, int(max_cells), theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
+                k.attn_factor, mrope_table(), rt);
+    }
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
@@ -341,7 +371,8 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
                                      float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s, int64_t max_cells,
                                      const RopeScaling& scaling, void* stream) {
     if (n <= 0) return;
-    if (!stream || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT || p0 < 0 || p0 + n > max_cells ||
+    if (!stream || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT ||
+        p0 < 0 || p0 + n > max_cells ||
         max_cells > INT32_MAX || pos_base < 0 || pos_base % R || int64_t(pos_base) + max_cells > INT32_MAX ||
         !std::isfinite(epsilon) || epsilon <= 0.0f || rope_scaling_invalid(scaling) != nullptr)
         throw std::invalid_argument("native QSA indexer (batch): bad geometry, positions, parameters or scaling");
@@ -352,22 +383,42 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
     const int32_t* mtab = mrope_table();
     const RopeTab rt = rope_table_for(scaling);
     if (p0 == 0) {
-        if (rt.cos != nullptr)
-            append_first<true><<<1, THREADS, 0, st>>>(raw, gamma, epsilon, b.dead, b.pooled, theta_scale,
-                                                      fsf, cl, ch, ef, ms, mtab, rt);
-        else
-            append_first<false><<<1, THREADS, 0, st>>>(raw, gamma, epsilon, b.dead, b.pooled, theta_scale,
-                                                       fsf, cl, ch, ef, ms, mtab, rt);
+        if (rt.cos != nullptr) {
+            if (s.idx_pool_f16)
+                append_first<true,uint16_t><<<1, THREADS, 0, st>>>(raw, gamma, epsilon, b.dead, reinterpret_cast<uint16_t*>(b.pooled), theta_scale,
+                                                          fsf, cl, ch, ef, ms, mtab, rt);
+            else
+                append_first<true,float><<<1, THREADS, 0, st>>>(raw, gamma, epsilon, b.dead, b.pooled, theta_scale,
+                                                          fsf, cl, ch, ef, ms, mtab, rt);
+        } else {
+            if (s.idx_pool_f16)
+                append_first<false,uint16_t><<<1, THREADS, 0, st>>>(raw, gamma, epsilon, b.dead, reinterpret_cast<uint16_t*>(b.pooled), theta_scale,
+                                                          fsf, cl, ch, ef, ms, mtab, rt);
+            else
+                append_first<false,float><<<1, THREADS, 0, st>>>(raw, gamma, epsilon, b.dead, b.pooled, theta_scale,
+                                                          fsf, cl, ch, ef, ms, mtab, rt);
+        }
     }
     // completed blocks: those whose last cell (4b+3) lies in [p0, p0 + n)
     const int64_t first = p0 <= R - 1 ? 0 : (p0 - (R - 1) + R - 1) / R;       // the smallest b with 4b+3 >= p0
     const int64_t hi = p0 + n - 1 >= R - 1 ? (p0 + n - 1 - (R - 1)) / R : -1;   // the largest b with 4b+3 <= p0+n-1
-    if (hi >= first && rt.cos != nullptr)
-        append_blocks<true><<<(unsigned) (hi - first + 1), THREADS, 0, st>>>(raw, n, p0, pos_base, gamma, epsilon,
-            b.tail, b.dead, b.pooled, b.block_pos, first, hi, theta_scale, fsf, cl, ch, ef, ms, mtab, rt);
-    else if (hi >= first)
-        append_blocks<false><<<(unsigned) (hi - first + 1), THREADS, 0, st>>>(raw, n, p0, pos_base, gamma, epsilon,
-            b.tail, b.dead, b.pooled, b.block_pos, first, hi, theta_scale, fsf, cl, ch, ef, ms, mtab, rt);
+    if (hi >= first) {
+        if (rt.cos != nullptr) {
+            if (s.idx_pool_f16)
+                append_blocks<true,uint16_t><<<(unsigned) (hi - first + 1), THREADS, 0, st>>>(raw, n, p0, pos_base, gamma, epsilon,
+                    b.tail, b.dead, reinterpret_cast<uint16_t*>(b.pooled), b.block_pos, first, hi, theta_scale, fsf, cl, ch, ef, ms, mtab, rt);
+            else
+                append_blocks<true,float><<<(unsigned) (hi - first + 1), THREADS, 0, st>>>(raw, n, p0, pos_base, gamma, epsilon,
+                    b.tail, b.dead, b.pooled, b.block_pos, first, hi, theta_scale, fsf, cl, ch, ef, ms, mtab, rt);
+        } else {
+            if (s.idx_pool_f16)
+                append_blocks<false,uint16_t><<<(unsigned) (hi - first + 1), THREADS, 0, st>>>(raw, n, p0, pos_base, gamma, epsilon,
+                    b.tail, b.dead, reinterpret_cast<uint16_t*>(b.pooled), b.block_pos, first, hi, theta_scale, fsf, cl, ch, ef, ms, mtab, rt);
+            else
+                append_blocks<false,float><<<(unsigned) (hi - first + 1), THREADS, 0, st>>>(raw, n, p0, pos_base, gamma, epsilon,
+                    b.tail, b.dead, b.pooled, b.block_pos, first, hi, theta_scale, fsf, cl, ch, ef, ms, mtab, rt);
+        }
+    }
     append_tail<<<R - 1, D, 0, st>>>(raw, n, p0, b.tail);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));

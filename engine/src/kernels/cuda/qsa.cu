@@ -46,6 +46,7 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/rope.hpp"
+#include <type_traits>
 #include "strata/kernels/mrope.hpp"
 
 #include <cuda_runtime.h>
@@ -152,10 +153,27 @@ __global__ void kv_append_kernel(uint16_t* __restrict__ k_pool, uint16_t* __rest
 /// `pos`, which forced `pos` to be a host scalar, which meant a captured graph would replay the first token's
 /// position forever.  Doing it here reads the position from `pos_dev` like every other kernel, so the grid and
 /// the arguments are the same for every token and the graph replays correctly.
+// S7-3 pool access helpers.  `pool_put`/`pool_get` are the ONLY sanctioned way in and out of the pooled
+// indexer-key table: FP32 storage is today, byte for byte; `uint16_t` storage (IEEE half, the house
+// `f16_bits` form) holds the same values rounded ONCE, after the rotation, exactly like the
+// STRATA_IDX_FP16_CHECK probe rounds them before scoring - so the probe's measured selection agreement
+// IS this format's numerics.  `pool_get` expands exactly: no rounding on read, and the scorer kernels'
+// accumulation order is unchanged.
+__device__ __forceinline__ void pool_put(float* p, size_t i, float v) { p[i] = v; }
+__device__ __forceinline__ void pool_put(uint16_t* p, size_t i, float v) { p[i] = f16_from_f32(v); }
+__device__ __forceinline__ float pool_get(const float* p, size_t i) { return p[i]; }
+__device__ __forceinline__ float pool_get(const uint16_t* p, size_t i) { return f32_from_f16(p[i]); }
+
+
+// P = float: today, byte for byte - every `if constexpr` below keeps the FP32 path compiling exactly as it
+// was.  P = uint16_t (S7-3, STRATA_IDX_POOL_F16): the completed row is staged in shared right after the
+// mean, rotated in f32, and rounded ONCE to f16 on the store; the spare row is rounded straight from
+// `dead`.  Values match the STRATA_IDX_FP16_CHECK probe exactly.
+template <typename P>
 __global__ void indexer_key_append_kernel(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
                                           int pos_base, const float* __restrict__ w_k_norm, float eps,
                                           float* __restrict__ tail, float* __restrict__ dead,
-                                          float* __restrict__ pooled, int32_t* __restrict__ block_pos,
+                                          P* __restrict__ pooled, int32_t* __restrict__ block_pos,
                                           int idx_dim, int r, int n_rot, const float* __restrict__ cos_tab,
                                           const float* __restrict__ sin_tab, const int32_t* __restrict__ mtab) {
     extern __shared__ double s_mean[];   // idx_dim doubles
@@ -196,7 +214,7 @@ __global__ void indexer_key_append_kernel(const float* __restrict__ raw, const i
         // as this kernel once did, left `dead` and `pooled[0]` the only unscaled keys of a scaled cache.
         if (d < n_rot) y *= cos_tab[d % (n_rot / 2)];
         dead[d] = y;
-        pooled[d] = y;
+        pool_put(pooled, (size_t) d, y);
     }
 
     if (slot != r - 1) return;
@@ -217,9 +235,17 @@ __global__ void indexer_key_append_kernel(const float* __restrict__ raw, const i
     const double inv = __ddiv_rn(1.0, __dsqrt_rn(ss / (double) idx_dim + (double) eps));
 
     const int b = pos / r;
+    float* s_row = nullptr;   // S7-3 f16 form: the staged pre-rounding row (shared, after the mean)
+    if constexpr (std::is_same_v<P, uint16_t>)
+        s_row = reinterpret_cast<float*>(reinterpret_cast<char*>(s_mean) + (size_t) idx_dim * sizeof(double));
+    if constexpr (!std::is_same_v<P, uint16_t>) {
     pooled[(size_t) b * idx_dim + d] = (float) (m * inv * (double) w_k_norm[d]);
     // The spare slot MOVES to b+1 and is rewritten with the same constant value.
     pooled[(size_t) (b + 1) * idx_dim + d] = dead[d];
+    } else {
+        s_row[d] = (float) (m * inv * (double) w_k_norm[d]);
+        pool_put(pooled, (size_t) (b + 1) * idx_dim + d, dead[d]);
+    }
     // The rotation position for this row, kept because a capture reader and the debug dumps want it.  It is the
     // block's first cell's POSITION, `pos_base + b*r`, and NOT the cell index `b*r`.
     if (d == 0) *block_pos = (int32_t) (pos_base + b * r);
@@ -234,11 +260,19 @@ __global__ void indexer_key_append_kernel(const float* __restrict__ raw, const i
     // every shape and every magnitude), and it comes from `pos_base`, which is constant for a sequence.
     const int half = n_rot / 2;
     if (d < half) {
-        float* row = pooled + (size_t) b * idx_dim;
         const size_t toff = (size_t) mrope_pos(mtab, pos_base + b * r, d) * half;
         // THE SAME `rope_neox_pair` THE STANDALONE ROPE KERNEL USES.  A second transcription of the pairing is
         // what this project keeps finding written down wrong.
-        rope_neox_pair(row[d], row[half + d], cos_tab[toff + d], sin_tab[toff + d], row[d], row[half + d]);
+        if constexpr (!std::is_same_v<P, uint16_t>) {
+            float* row = pooled + (size_t) b * idx_dim;
+            rope_neox_pair(row[d], row[half + d], cos_tab[toff + d], sin_tab[toff + d], row[d], row[half + d]);
+        } else {
+            rope_neox_pair(s_row[d], s_row[half + d], cos_tab[toff + d], sin_tab[toff + d], s_row[d], s_row[half + d]);
+        }
+    }
+    if constexpr (std::is_same_v<P, uint16_t>) {
+        __syncthreads();   // the staged row is complete only now; ONE round to f16, after the rotation
+        pool_put(pooled, (size_t) b * idx_dim + d, s_row[d]);
     }
 }
 
@@ -246,7 +280,8 @@ __global__ void indexer_key_append_kernel(const float* __restrict__ raw, const i
 
 /// One warp per indexer head, one block per pooled row; thread 0 sums the relu'd dots IN HEAD ORDER and maps
 /// the row's score onto its cells.  The reference's Relu is PER HEAD, so the dots cannot be summed first.
-__global__ void qsa_index_kernel(const float* __restrict__ pooled,
+template <typename P>
+__global__ void qsa_index_kernel(const P* __restrict__ pooled,
                                  const float* __restrict__ q_idx, const float* __restrict__ bias,
                                  int idx_n_head, int idx_dim, long long r,
                                  const int32_t* __restrict__ step, float* __restrict__ cell_scores) {
@@ -266,7 +301,7 @@ __global__ void qsa_index_kernel(const float* __restrict__ pooled,
 
     double acc = 0.0;
     for (int d = lane; d < idx_dim; d += 32)
-        acc = __dadd_rn(acc, __dmul_rn((double) pooled[(size_t) b * idx_dim + d],
+        acc = __dadd_rn(acc, __dmul_rn((double) pool_get(pooled, (size_t) b * idx_dim + d),
                                        (double) q_idx[(size_t) wid * idx_dim + d]));
     for (int o = 16; o > 0; o >>= 1) acc = __dadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, o));
     if (lane == 0) s_dot[wid] = acc;
@@ -526,6 +561,19 @@ inline unsigned grid_for(long long n, int threads) {
 
 }  // namespace
 
+// S7-3 host-callable: FP32 values -> f16 pool storage, the same `pool_put` round the append kernel uses.
+__global__ void qsa_pool_round_kernel(const float* __restrict__ src, uint16_t* __restrict__ dst, int64_t n) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        pool_put(dst, (size_t) i, src[i]);
+}
+void qsa_pool_round_copy(void* dst, const float* src, int64_t count, void* stream) {
+    if (count <= 0) return;
+    const int blocks = (int) std::min<int64_t>((count + 255) / 256, 4096);
+    qsa_pool_round_kernel<<<(unsigned) blocks, 256, 0, (cudaStream_t) stream>>>(src, (uint16_t*) dst, count);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_pool_round_copy: %s\n", cudaGetErrorString(e)); std::exit(1); }
+}
+
 /// THE STEP STATE, UPLOADED.  Every kernel below reads its per-token counts from here rather than from a kernel
 /// argument, because a CUDA graph bakes arguments in at capture time - see the long note in `qsa.hpp`.  This
 /// module-level buffer is what lets the OLD host-scalar signatures keep working unchanged while the kernels
@@ -613,8 +661,12 @@ void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, 
     // THE GRID IS `max_blocks`, A CONSTANT - not this token's `n_bid + 1`.  The kernel returns for
     // `b > n_bid`, so the surplus blocks cost a launch and nothing else.
     const int threads = 32 * (int) s.idx_n_head;
-    qsa_index_kernel<<<(unsigned) max_blocks, threads, 0, (cudaStream_t) stream>>>(
-        pooled, q_idx, bias, (int) s.idx_n_head, (int) s.idx_dim, s.idx_block, step, cell_scores);
+    if (s.idx_pool_f16)
+        qsa_index_kernel<uint16_t><<<(unsigned) max_blocks, threads, 0, (cudaStream_t) stream>>>(
+            reinterpret_cast<const uint16_t*>(pooled), q_idx, bias, (int) s.idx_n_head, (int) s.idx_dim, s.idx_block, step, cell_scores);
+    else
+        qsa_index_kernel<float><<<(unsigned) max_blocks, threads, 0, (cudaStream_t) stream>>>(
+            pooled, q_idx, bias, (int) s.idx_n_head, (int) s.idx_dim, s.idx_block, step, cell_scores);
     check_launch("qsa_index");
     if (stream == nullptr) check_sync("qsa_index");
 }
@@ -727,13 +779,20 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
     if (b.tail == nullptr || b.dead == nullptr || b.pooled == nullptr || b.block_pos == nullptr)
         fail("indexer_key_append: the indexer buffers are not all set (tail/dead/pooled/block_pos)");
     const int threads = (int) s.idx_dim;
-    const size_t smem = (size_t) s.idx_dim * sizeof(double);
+    const size_t smem = (size_t) s.idx_dim * sizeof(double) +
+                        (s.idx_pool_f16 ? (size_t) s.idx_dim * sizeof(float) : 0);   // S7-3: the staged row
     // **ONE LAUNCH, NO HOST BRANCH ON THE POSITION.**  The completion rotation is inside the kernel now.  The
     // arguments here are identical for every token, which is the property a CUDA graph needs: this function can
     // be captured and replayed, and the position arrives through `pos_dev` like every other kernel's data.
-    indexer_key_append_kernel<<<1, threads, smem, (cudaStream_t) stream>>>(
-        raw, pos_dev, (int) pos_base, w_k_norm, eps, b.tail, b.dead, b.pooled, b.block_pos, (int) s.idx_dim,
-        (int) s.idx_block, (int) s.n_rot, cos_tab, sin_tab, mrope_table());
+    if (s.idx_pool_f16)
+        indexer_key_append_kernel<uint16_t><<<1, threads, smem, (cudaStream_t) stream>>>(
+            raw, pos_dev, (int) pos_base, w_k_norm, eps, b.tail, b.dead,
+            reinterpret_cast<uint16_t*>(b.pooled), b.block_pos, (int) s.idx_dim,
+            (int) s.idx_block, (int) s.n_rot, cos_tab, sin_tab, mrope_table());
+    else
+        indexer_key_append_kernel<float><<<1, threads, smem, (cudaStream_t) stream>>>(
+            raw, pos_dev, (int) pos_base, w_k_norm, eps, b.tail, b.dead, b.pooled, b.block_pos, (int) s.idx_dim,
+            (int) s.idx_block, (int) s.n_rot, cos_tab, sin_tab, mrope_table());
     check_launch("indexer_key_append");
     if (stream == nullptr) check_sync("indexer_key_append");
 }
