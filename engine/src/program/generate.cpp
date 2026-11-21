@@ -15446,6 +15446,10 @@ int main(int argc, char** argv) {
             // It rides the slot's park as the manifest's advisory histogram (see `hist_encode`), so a
             // twin that restores from that park can pre-stage the experts this conversation was using.
             std::vector<uint8_t> exp_hist;
+            // S4-v2: when it last went idle-cached (epoch: never). STRATA_SLOT_DETACH_MS parks and unattaches
+            // a conversation whose slot has been idle past this - the slot is then free for a waiting request
+            // instead of paying park-before-overwrite on its admission path.
+            Clock::time_point t_idle{};
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
         // (pd_hist_on and the S5d hist link are declared up by park_source; same body)
@@ -15717,37 +15721,37 @@ int main(int argc, char** argv) {
         // Parking is an optimization like a checkpoint (#3350): a skip and a failed snapshot (a host or device
         // allocation that ran out) are logged and the slot is overwritten as before.  Nothing here ends the request
         // or the engine.
-        auto park_slot = [&](int b) {
+        auto park_slot = [&](int b) -> bool {   // true: the conversation is now safe in the parked tier
             BSlot& sl = bs[(size_t) b];
-            if (!conversations.enabled() || sl.active || !sl.cached || sl.img || sl.ids.empty()) return;
+            if (!conversations.enabled() || sl.active || !sl.cached || sl.img || sl.ids.empty()) return false;
             auto prefix_of = [&](const std::vector<int32_t>& whole) {
                 return whole.size() >= sl.ids.size() && std::equal(sl.ids.begin(), sl.ids.end(), whole.begin());
             };
             const bool in_main = live_ok && cvec_cached == sl.cvec && prefix_of(live) &&
                                  imgs_below(live_imgs, (int64_t) sl.ids.size()).empty();
-            if (in_main || conversations.holds(sl.ids, {}, sl.cvec)) return;
+            if (in_main || conversations.holds(sl.ids, {}, sl.cvec)) return true;   // already held: safe to detach
             if (conversations.supersedes_richer(sl.ids, {}, sl.checks, sl.cvec)) {
                 // its park would drop (as superseded) the main session's copy of this conversation, and with it the checkpoints the slot
                 // does not hold - an agent's system-prompt root that the next requests borrow (#4420, as 0.2.6 did: the slot is overwritten)
                 std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (a parked copy of its "
                                      "conversation holds checkpoints the slot does not; it stays)\n", b);
-                return;
+                return false;
             }
             if (use_mtp && !batch_mtp) {   // no draft K/V of its own: an image without it would not restore beside the drafter
                 std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (its %zu tokens "
                                      "have no per-slot draft K/V without --batch-mtp)\n", b, sl.ids.size());
-                return;
+                return false;
             }
             if (cudaDeviceSynchronize() != cudaSuccess) {
                 std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (device sync "
                                      "failed)\n", b);
-                return;
+                return false;
             }
             std::string why;
             if (batch_mtp && !batch_df2 && !slot_mtp[(size_t) b]->idle(why)) {
                 std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (%s)\n",
                              b, why.c_str());
-                return;
+                return false;
             }
             const size_t n_st = stages.size();
             static const std::vector<ImgKey> no_imgs;
@@ -15758,7 +15762,7 @@ int main(int argc, char** argv) {
             src.counts = sl.exp_hist.empty() ? nullptr : &sl.exp_hist;   // S5d: the park carries the slot's expert hits
             for (size_t k = 1; k < bslot_ss.size(); ++k) src.stage_sessions.push_back(bslot_ss[k][(size_t) b].get());
             try {
-                if (park_source(src, 0)) return;
+                if (park_source(src, 0)) return true;
                 // the snapshot failed (the copy's own memory, as in #3350): the slot is not touched, so go on without
                 // the image; a non-sticky allocation error is cleared, a sticky one comes back from the next call
                 std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (%s)\n",
@@ -15768,6 +15772,47 @@ int main(int argc, char** argv) {
             } catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking slot %d\n", b);
             }
+            return false;
+        };
+        // S4-v2: the attach/detach seam.  What an idle slot holds (its conversation and its checkpoints) belongs to
+        // the parked tier while the conversation waits between turns: park it, hand its checkpoints back, and the
+        // slot stands fully unattached, so a waiting request finds a free slot instead of paying park-before-
+        // overwrite on its admission path.  The slot's resident KV window (bslot_ss, sized at boot; the captured
+        // verify graphs hold its pointers) stays the slot's own - v1 detaches the conversation, not the bytes.
+        // This is also the single ownership point where S2b's shared-head adoption and its refcounts will live.
+        const int64_t slot_detach_ms = [] { const char* e = std::getenv("STRATA_SLOT_DETACH_MS");
+            return e != nullptr && e[0] != '\0' ? (int64_t) std::atoll(e) : 0; }();   // 0 (default): off, byte-identical
+        auto detach_slot = [&](int b) -> bool {
+            BSlot& sl = bs[(size_t) b];
+            if (!park_slot(b)) return false;   // the conversation must be safe in the parked tier first
+            const size_t ndet = sl.ids.size();
+            for (ConvCheckpoint& c : sl.checks)
+                if (ckpt_pool.on()) ckpt_pool.give(std::move(c));   // (STRATA_CKPT_POOL)
+            sl = BSlot{};
+            std::fprintf(stderr, "strata serve: conversation cache: slot %d detached idle (%zu tokens to the parked tier)\n",
+                         b, ndet);
+            return true;
+        };
+        // a sweep over the idle slots; run where a request just ended (the completion has been emitted, so the
+        // park cost lands in the engine's idle time and never on an arrival's TTFT).  partial reads stay attached:
+        // their resend plan lives in the slot (v1 does not resume a yielded read from the parked tier).
+        auto sweep_idle_detach = [&] {
+            if (slot_detach_ms <= 0) return;
+            const Clock::time_point tsw = Clock::now();
+            size_t nsw = 0; long long oldest = -1;
+            for (size_t b = 0; b < bs.size(); ++b) {
+                const BSlot& s2 = bs[b];
+                if (s2.active || !s2.cached || s2.partial ||
+                    s2.t_idle.time_since_epoch().count() == 0 ||
+                    std::chrono::duration_cast<std::chrono::milliseconds>(tsw - s2.t_idle).count() < slot_detach_ms)
+                    continue;
+                oldest = std::max(oldest, (long long) std::chrono::duration_cast<std::chrono::milliseconds>(tsw - s2.t_idle).count());
+                if (detach_slot((int) b)) ++nsw;
+            }
+            size_t ncache = 0;
+            for (const BSlot& s2 : bs) if (s2.cached && !s2.active) ++ncache;
+            std::fprintf(stderr, "strata batch: S4v2 sweep: detached %zu, idle-cached slots %zu, oldest idle %lld ms\n",
+                         nsw, ncache, oldest);
         };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
@@ -15991,7 +16036,9 @@ int main(int argc, char** argv) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
                         sl.active = false;
-                        sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
+                        sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;   // S4-v2: stamp idle, then sweep stale slots (off unless STRATA_SLOT_DETACH_MS)
+                    if (sl.cached) sl.t_idle = Clock::now();
+                    sweep_idle_detach();
                         break;
                     }
                     sl.x = y;
@@ -16301,7 +16348,9 @@ int main(int argc, char** argv) {
                         sl.draft_ready = false;
                         // a cache again (#857), as on the pipelined path without drafts: final once its commits have run
                         // (pmtp_settle, before anything reads the slot's sessions)
-                        sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
+                        sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;   // S4-v2: stamp idle, then sweep stale slots (off unless STRATA_SLOT_DETACH_MS)
+                    if (sl.cached) sl.t_idle = Clock::now();
+                    sweep_idle_detach();
                         break;
                     }
                     sl.x = y;
@@ -16448,7 +16497,9 @@ int main(int argc, char** argv) {
                         // a pipelined slot is a cache again (#857: a request left alone in its slot goes back to the solo path with its
                         // drafts): its state is final once its last window has left the last stage.  A later group window whose pad
                         // row writes this slot clears the flag (below, where the group starts), so a stale state is never reused
-                        sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
+                        sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;   // S4-v2: stamp idle, then sweep stale slots (off unless STRATA_SLOT_DETACH_MS)
+                    if (sl.cached) sl.t_idle = Clock::now();
+                    sweep_idle_detach();
                     } else {
                         sl.x = y;
                         sl.p += 1;
@@ -18831,7 +18882,8 @@ int main(int argc, char** argv) {
                         sl = BSlot{};
                         s5d_cur = &sl.exp_hist;   // S5d: this slot now serves the incoming read
                         sl.ids.assign(c->ids.begin(), c->ids.end() - 1);
-                        sl.cached = true;
+                        sl.cached = true;   // S4-v2: an admitted read's slot starts its idle clock too
+                        sl.t_idle = Clock::now();
                         sl.cvec = want_cvec;
                         std::printf("BCOK %d %lld\n", c->slot, (long long) sl.ids.size());
                     }
@@ -18953,7 +19005,8 @@ int main(int argc, char** argv) {
                         sl = BSlot{};
                         s5d_cur = &sl.exp_hist;   // S5d: the continued read owns this slot's hits now
                         sl.ids = std::move(pre);
-                        sl.cached = true;
+                        sl.cached = true;   // S4-v2: an admitted read's slot starts its idle clock too
+                        sl.t_idle = Clock::now();
                         sl.partial = true;
                         sl.partial_from0 = read_from == 0 || resumed_from0;
                         if (planned) sl.partial_plan = plan;   // the resend reads the rest in these chunks

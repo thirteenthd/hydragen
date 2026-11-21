@@ -886,3 +886,57 @@ tolerant read), `expert_source.{hpp,cpp}` (dispatch recording), `generate.cpp`
 `6ece8211…`, conversation_park_disk.hpp `8d70e718…`, expert_source.hpp `b7358482…`,
 conversation_park_disk.cpp `e9970078…`, expert_source.cpp `b4c29d25…`,
 park_disk_boot_test.cpp `a5aef446…`, generate.cpp `19c2428e…`.
+
+
+## 196. S4-v2 idle-detach: an idle conversation leaves its slot — park spill and the S5d histogram chain proven end-to-end on live traffic
+
+The S4 design note reframed the ceiling: what caps concurrent sessions is slot
+ownership, not bytes. This lands the attach/detach seam at v1 and retires the
+design's open questions empirically.
+
+Seam: `BSlot` gains `t_idle`, stamped at every busy→free transition (both read-admission
+paths stamp too). `detach_slot(b)` = guarded park (`park_slot` now returns whether the
+conversation is provably safe in the parked tier) + checkpoints returned to `ckpt_pool`
++ slot reset. The slot's resident KV window (`bslot_ss`, boot-sized; the verify graphs
+capture its pointers) stays owned by the slot — **v1 detaches conversations, not
+bytes**. A sweep runs at the three busy→free batch completion sites and never on an
+arrival path (TTFT law). One knob: `STRATA_SLOT_DETACH_MS`, default 0 = byte-identical
+control. This is the single ownership point where S2b's shared-head refcount will sit.
+
+Measured on ms01 (RTX 3080 Ti, `--batch 4 --kv-resident 8192`, four concurrent waves
+of unique-head ~36k-token conversations; concurrency is a prerequisite for this whole
+test surface — with sequential traffic the run logged no batch-completion lines at
+all, so slot machinery never ran):
+
+- Detach fires under traffic: `slot 1 detached idle (46394 tokens to the parked tier)`
+  — 5 detaches in the ON arm; correctness `restore_qc_fail=0` through
+  detach+spill+restore in every arm (prime-list recall checks).
+- **Disk spill end-to-end**: 5 `.ses` spilled (`park disk: spilled 45963 tokens, 0.6
+  MiB in 3051 ms (3 entries, 3.4 GiB on disk)`), and every spilled manifest carries an
+  S5d histogram (`hdr88: off=862784 len=17222` — ≈5.7k hot cells for a 46k-token
+  conversation). §195's record→manifest→spill→read chain now has no unproven link.
+- Restore economics: 46k-token twins restore in **19–21 s** (parked tier, RAM + spill
+  mix) vs **55–105 s** for the same-size cold prefill.
+- A/B (off vs 15000 ms): wall-neutral at this shape — W2 wave average 87.0 s off vs
+  90.3 s on; the sweep parks during sibling-stream decode, and prefill dominates a
+  4-slot 12 GB arena. v1's win is on the admission path (an arrival no longer pays
+  park-before-overwrite: ~1–3 s per arrival at 46k, more at 200k) and the ownership
+  layer — not wall time at this shape.
+- Guards hold by design: an agent-root conversation whose parked copy holds checkpoints
+  the slot does not is never detached (#4420), and a slot without per-slot draft K/V
+  never parks without `--batch-mtp`.
+
+S5d prewarm, same traffic: the hook runs on every disk restore —
+`park prewarm: 0 experts staged, 18–23 refused (no slot free)` — and stages nothing,
+because the adaptive tier holds 100% of expert-cache slots on 12 GB nodes even with a
+single idle stream. The non-destructive law (claim only free slots) makes prewarm
+inert where the cache is saturated; it can pay only where headroom exists (fresh boot
+before the tier fills, post-quarantine stores, `--expert-cache` below the working
+set). Preempting the coldest non-pinned slot instead would stage reliably but steals
+from whoever holds the slot — a policy decision, deferred.
+
+Gates at ship bytes (`generate.cpp` md5 `f9edc0ddf4f6…`, local↔ms01 identical): boot
+test 62 checks; targeted ctest park/session/conversation/file/buffer 20/20 — note the
+four `conversation_snapshot*` tests need an idle GPU (they abort with `CUDA: out of
+memory` while a serve holds the card; same constraint as the segmented-cache test).
+Files: `engine/src/program/generate.cpp`.
