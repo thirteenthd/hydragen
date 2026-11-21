@@ -3443,6 +3443,29 @@ static void exit_if_gpu_fatal(const std::string& err) {
     }
 }
 
+namespace {   // S5d serve state: the park block and the solo token loop are sibling scopes inside
+              // engine_main, so the histogram arrays live at file scope. Advisory only: one serve
+              // process serves one model; nothing correctness rides on these.
+std::vector<uint8_t>* s5d_cur = nullptr;   // the count array of the slot most recently taken over
+std::vector<uint8_t> live_hist;            // the live conversation's own hits (solo windows record here)
+std::vector<uint8_t*> hps((size_t) strata::kernels::kVerifyMaxT, nullptr);   // window rows -> live_hist
+uint8_t* hps_hist = nullptr;               // the array hps points at; re-filled when that changes
+const bool pd_hist_on = [] { const char* v = hg_getenv("STRATA_PARK_HIST"); return v == nullptr || v[0] != '0'; }();
+// S5d: point this window's rows at the live conversation's own counts. Called after every
+// per-window reset; wherever the batch loop points per row (15857) it overwrites this, which is
+// exactly right: a batch window's rows belong to different conversations.
+void s5d_point(strata::core::ExpertDispatch& d, int64_t n_layers) {
+    if (!pd_hist_on || n_layers <= 0 || d.n_expert <= 0) return;
+    if (live_hist.empty()) live_hist.assign((size_t) n_layers * (size_t) d.n_expert, 0);
+    if (uint8_t* hd = live_hist.data(); hd != hps_hist) {
+        std::fill(hps.begin(), hps.end(), hd);   // every row of a single-conversation window is its conversation
+        hps_hist = hd;
+    }
+    d.hist_ptrs = hps.data();
+    d.hist_n = (int64_t) hps.size();
+}
+}   // S5d serve state
+
 #if defined(STRATA_USE_HIP) && defined(_WIN32)
 static int engine_main(int argc, char** argv) {   // main() is at the end of this file (#3431)
 #else
@@ -12982,6 +13005,12 @@ int main(int argc, char** argv) {
         }
         // What a park captures: the main session's conversation (park_current) or an idle batch slot's (park_slot:
         // the reply it decoded, before an admission overwrites it).  One budget / admission / snapshot path for both.
+        // S5d: the expert-hit counts of the conversation currently being served. The batch windows
+        // record into each slot's exp_hist; this is the slot most recently taken over (a slot's
+        // exp_hist is reset by the takeover itself), so park_current can carry the outgoing
+        // conversation's histogram into its park. Advisory: nothing correctness rides on it.
+        // (s5d_cur, live_hist, hps, hps_hist and pd_hist_on are at file scope - the solo token
+        // loop reaches them from a sibling block; see above engine_main.)
         struct ParkSource {
             const std::vector<int32_t>& ids;
             const std::vector<ImgKey>& imgs;
@@ -12993,6 +13022,7 @@ int main(int argc, char** argv) {
             const strata::core::QsaState* draft_last;     ///< ... with the last stage's image (a split: the drafter's GPU)
             bool with_reuse;                              ///< the retained K/V describes this source (the main session's)
             std::string what;                             ///< the log's words after the token count ("", " from slot 1")
+            const std::vector<uint8_t>* counts = nullptr; ///< S5d: the slot's expert-hit counts (null: no manifest section)
         };
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
@@ -13300,6 +13330,17 @@ int main(int argc, char** argv) {
                                  (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
                     return true;
                 }
+                // S5d: the slot's expert-hit counts ride the park as the manifest's advisory section
+                // (encoded capped; never part of the payload or any hash - see hist_encode).
+                if (src.counts != nullptr) {
+                    std::vector<uint8_t> hb;
+                    if (strata::core::hist_encode(*src.counts, g.n_expert, hb)) {
+                        image.s5d_hist = std::move(hb);
+                        std::fprintf(stderr, "strata serve: park hist: %zu expert cells, %zu bytes (of %zu counts)%s\n",
+                                     image.s5d_hist.size() > 14 ? (image.s5d_hist.size() - 14) / 3 : 0,
+                                     image.s5d_hist.size(), src.counts->size(), src.what.empty() ? "" : src.what.c_str());
+                    }
+                }
                 const size_t snapshot_bytes = image.bytes();
                 const bool stored = conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens%s in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
@@ -13326,6 +13367,11 @@ int main(int argc, char** argv) {
             ParkSource src{live, live_imgs, checks, cvec_cached, ss, {},
                            (n_st > 0 && !mtp_first) || !use_mtp ? nullptr : &mtp.kv_state(),
                            use_mtp && !mtp_first && n_st > 0 ? &mtp.kv_state() : nullptr, true, ""};
+            // S5d: the outgoing conversation's expert hits ride its park (the slot that served it)
+            if (pd_hist_on) {
+                if (!live_hist.empty()) src.counts = &live_hist;   // the live conversation's own hits
+                else if (s5d_cur != nullptr && !s5d_cur->empty()) src.counts = s5d_cur;   // a borrowed/continued read inside its slot
+            }
             for (auto& st : stages) src.stage_sessions.push_back(&st->ss);
             return park_source(src, held);
         };
@@ -15072,7 +15118,8 @@ int main(int argc, char** argv) {
                     bool no_vram = false;
                     if (!ver.prepare(t, no_vram, werr)) { if (no_vram) continue; wok = false; break; }   // CUDA / HIP: the graph now (a size that finds no VRAM is left to the runtime rule); Metal: nothing to do
                     const Clock::time_point t0 = Clock::now();
-                    drive.d.layers = 0;
+                    drive.d.layers = 0; drive.d.hist_ptrs = nullptr; drive.d.hist_n = 0;   // S5d: windows record only where pointed
+                s5d_point(drive.d, g.n_layers);   // S5d: single-conversation windows point at the live counts (batch windows re-point per row)
                     drive.d.experts = 0;
                     drive.d.failed = false;
                     wok = ver.run(t, wtok.data(), 0, win_pool_fn, win_pool_user, wout.data(), werr) && !drive.d.failed;
@@ -15083,7 +15130,8 @@ int main(int argc, char** argv) {
                 }
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
-                drive.d.layers = 0;
+                drive.d.layers = 0; drive.d.hist_ptrs = nullptr; drive.d.hist_n = 0;   // S5d: windows record only where pointed
+                s5d_point(drive.d, g.n_layers);   // S5d: single-conversation windows point at the live counts (batch windows re-point per row)
                 drive.d.experts = 0;
                 drive.d.failed = false;
                 std::fprintf(stderr, "strata serve: window warm-up: ms per width %s, total %.0f ms%s%s\n", wlist.c_str(),
@@ -15394,8 +15442,13 @@ int main(int argc, char** argv) {
             // that state (a checkpoint, a parked conversation), so it is not kept as a cache when it ends
             bool tainted = false;
             ConvCheckpoint::PromptPlan partial_plan;   ///< --prefill-pipe: the segment it stopped in, read on in its chunks
+            // S5d: saturating u8 expert-hit counts ([layer*n_expert + expert]) this slot's windows routed.
+            // It rides the slot's park as the manifest's advisory histogram (see `hist_encode`), so a
+            // twin that restores from that park can pre-stage the experts this conversation was using.
+            std::vector<uint8_t> exp_hist;
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        // (pd_hist_on and the S5d hist link are declared up by park_source; same body)
         // STRATA_BATCH_DF2_DEFER=0: every round drafts for every slot, spare rows or not (the first measurement's behaviour, for the A/B)
         // STRATA_BATCH_DF2_CONF=P (default: --draft-conf, else 0.35; 0 off): a slot's draft rows stop where the product of the selector's probabilities falls below P;
         // STRATA_BATCH_DF2_MAXX=N: at most N draft rows a slot and window (default kDrafts)
@@ -15702,6 +15755,7 @@ int main(int argc, char** argv) {
                            (n_st > 0 && !mtp_first) || !batch_mtp || batch_df2 ? nullptr : &slot_mtp[(size_t) b]->kv_state(),
                            batch_mtp && !batch_df2 && !mtp_first && n_st > 0 ? &slot_mtp[(size_t) b]->kv_state() : nullptr, false,
                            " from slot " + std::to_string(b)};
+            src.counts = sl.exp_hist.empty() ? nullptr : &sl.exp_hist;   // S5d: the park carries the slot's expert hits
             for (size_t k = 1; k < bslot_ss.size(); ++k) src.stage_sessions.push_back(bslot_ss[k][(size_t) b].get());
             try {
                 if (park_source(src, 0)) return;
@@ -15808,9 +15862,24 @@ int main(int argc, char** argv) {
             if (S == 0) return true;
             const bool was_busy = strata::core::progress().busy.load();
             strata::core::progress().busy.store(true);
-            drive.d.layers = 0;
+            drive.d.layers = 0; drive.d.hist_ptrs = nullptr; drive.d.hist_n = 0;   // S5d: windows record only where pointed
+                s5d_point(drive.d, g.n_layers);   // S5d: single-conversation windows point at the live counts (batch windows re-point per row)
             drive.d.experts = 0;
             drive.d.failed = false;
+            // S5d: point this window's hits at each live slot's count array (row t -> slot rows[t];
+            // draft rows repeat their slot, and their hits counting for it is the honest reading).
+            // `hp` is persistent and never re-sized, so the pointers stay valid while a pipelined
+            // window still records from the last fill; entries past S are never read (hist_n bounds).
+            if (pd_hist_on) {
+                static std::vector<uint8_t*> hp((size_t) strata::kernels::kVerifyMaxT, nullptr);
+                for (int t = 0; t < S; ++t) {
+                    BSlot& q = bs[(size_t) rows[t]];
+                    if (q.exp_hist.empty()) q.exp_hist.assign((size_t) g.n_layers * (size_t) drive.d.n_expert, 0);
+                    hp[(size_t) t] = q.exp_hist.data();
+                }
+                drive.d.hist_ptrs = hp.data();
+                drive.d.hist_n = S;
+            }
             apply_pending(false);
             // --adapt-async: the round in flight moves on a step when its job and copies are done (or a due round starts).
             // Never between a prompt's chunks (its loan of cache slots and its chunks read the tables); a request drains
@@ -17547,6 +17616,63 @@ int main(int argc, char** argv) {
                                 }
                             }
                         }
+                        // S5d: the park's histogram pre-stages the experts this conversation was routing
+                        // when it parked. Slots are only claimed when free (this never evicts anyone),
+                        // and the fill queues its H2D on the cache stream, so the resumed conversation's
+                        // windows stop paying those stalls. blob + fill_slot is the same pair the window
+                        // admission path itself uses, and it runs here, on the same thread (windows and
+                        // admission serialize their cache work on this thread). Capped: 32 experts a
+                        // layer, 512 total, and STRATA_PARK_PREWARM_MIB (default 256) of blobs, so the
+                        // resume's synchronous host reads stay inside a window's stall budget.
+                        static const bool pd_prewarm = [] {
+                            const char* v = hg_getenv("STRATA_PARK_PREWARM");
+                            return v == nullptr || v[0] != '0';
+                        }();
+                        if (pd_prewarm && drive.d.cache != nullptr && drive.d.src != nullptr && !img->s5d_hist.empty()) {
+                            static const int64_t prewarm_mib = [] {
+                                const char* v = hg_getenv("STRATA_PARK_PREWARM_MIB");
+                                return v == nullptr ? (int64_t) 256 : std::max((int64_t) 0, (int64_t) std::atoll(v));
+                            }();
+                            std::vector<uint8_t> cnt;
+                            if (strata::core::hist_decode(img->s5d_hist, g.n_layers, g.n_expert, cnt)) {
+                                std::vector<std::pair<uint8_t, uint16_t>> hot;   // (count, layer*n_expert + expert)
+                                for (size_t i2 = 0; i2 < cnt.size(); ++i2)
+                                    if (cnt[i2]) hot.emplace_back(cnt[i2], (uint16_t) i2);
+                                std::sort(hot.begin(), hot.end(),
+                                          [](const std::pair<uint8_t, uint16_t>& a, const std::pair<uint8_t, uint16_t>& b)
+                                          { return a.first != b.first ? a.first > b.first : a.second < b.second; });
+                                std::vector<int64_t> per_layer((size_t) g.n_layers, 0);
+                                const auto& xpl = strata::kernels::cpu::expert_layout();
+                                const cudaStream_t cs = (cudaStream_t) drive.d.cache_stream;
+                                int64_t staged = 0, refused = 0; double mib = 0.0;
+                                bool stop_prewarm = false;
+                                for (const auto& hc : hot) {
+                                    if (staged >= 512 || mib >= (double) prewarm_mib) break;
+                                    const int64_t l2 = (int64_t) hc.second / g.n_expert, e2 = (int64_t) hc.second % g.n_expert;
+                                    if (l2 < 0 || l2 >= g.n_layers || per_layer[(size_t) l2] >= 32) continue;
+                                    if (drive.d.cache->slot_of(l2, e2) != strata::core::kNotResident) continue;
+                                    const int32_t cand = drive.d.cache->admit(l2, e2);
+                                    if (cand == strata::core::kNotResident) { ++refused; continue; }
+                                    const uint8_t* bb = drive.d.src->blob(l2, e2);
+                                    std::string ferr;
+                                    if (bb == nullptr ||
+                                            !drive.d.cache->fill_slot(cand, bb, cs, ferr, xpl.blob_bytes(l2))) {
+                                        stop_prewarm = true;   // same failure the window split would treat as fatal: stop the
+                                                                 // prewarm; the restore itself is untouched
+                                        break;
+                                    }
+                                    drive.d.src->note_async_read(bb, cs);
+                                    ++staged;
+                                    per_layer[(size_t) l2]++;
+                                    mib += (double) xpl.blob_bytes(l2) / (1024.0 * 1024.0);
+                                }
+                                if (staged || refused || stop_prewarm)
+                                    std::fprintf(stderr, "strata serve: park prewarm: %lld experts staged (%.1f MiB), "
+                                                 "%lld refused (no slot free)%s\n",
+                                                 (long long) staged, mib, (long long) refused,
+                                                 stop_prewarm ? " (stopped by a fill failure)" : "");
+                            }
+                        }
                         incoming.emplace(std::move(*img));
                         from_disk = true;
                     } else if (!derr.empty())
@@ -18169,7 +18295,8 @@ int main(int argc, char** argv) {
                 const size_t N = wins.size();
                 std::vector<int32_t> w0((size_t) S), w1((size_t) S), nx((size_t) S);
                 size_t l0 = 0, f0 = 0, l1 = 0, f1 = 0;   // stage 0 launched / finished, stage 1 launched / finished
-                drive.d.layers = 0;
+                drive.d.layers = 0; drive.d.hist_ptrs = nullptr; drive.d.hist_n = 0;   // S5d: windows record only where pointed
+                s5d_point(drive.d, g.n_layers);   // S5d: single-conversation windows point at the live counts (batch windows re-point per row)
                 drive.d.experts = 0;
                 drive.d.failed = false;
                 auto fail = [&](std::string why) -> bool {
@@ -18285,7 +18412,8 @@ int main(int argc, char** argv) {
                         win[(size_t) t] = (int32_t) cur[(size_t) (q + t)];
                         nxt[(size_t) t] = (int32_t) cur[(size_t) (q + t + 1)];
                     }
-                    drive.d.layers = 0;
+                    drive.d.layers = 0; drive.d.hist_ptrs = nullptr; drive.d.hist_n = 0;   // S5d: windows record only where pointed
+                s5d_point(drive.d, g.n_layers);   // S5d: single-conversation windows point at the live counts (batch windows re-point per row)
                     drive.d.experts = 0;
                     drive.d.failed = false;
                     if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
@@ -18684,6 +18812,7 @@ int main(int argc, char** argv) {
                             cudaDeviceSynchronize();
                         }
                         bs[(size_t) c->slot] = BSlot{};   // (it holds nothing until the read is done)
+                        s5d_cur = &bs[(size_t) c->slot].exp_hist;   // S5d: this slot now serves the incoming read
                     }
                     const auto tco = Clock::now();
                     std::fprintf(stderr, "strata batch: co-read starting: %zu more prompt(s) with this request's %lld tokens\n",
@@ -18700,6 +18829,7 @@ int main(int argc, char** argv) {
                     for (const CoReq* c : used) {
                         BSlot& sl = bs[(size_t) c->slot];
                         sl = BSlot{};
+                        s5d_cur = &sl.exp_hist;   // S5d: this slot now serves the incoming read
                         sl.ids.assign(c->ids.begin(), c->ids.end() - 1);
                         sl.cached = true;
                         sl.cvec = want_cvec;
@@ -18821,6 +18951,7 @@ int main(int argc, char** argv) {
                     if (can && copy_to_slot(ys, pre, ye)) {
                         BSlot& sl = bs[(size_t) ys];
                         sl = BSlot{};
+                        s5d_cur = &sl.exp_hist;   // S5d: the continued read owns this slot's hits now
                         sl.ids = std::move(pre);
                         sl.cached = true;
                         sl.partial = true;
@@ -19606,6 +19737,7 @@ int main(int argc, char** argv) {
             const int64_t dt_sw0 = ajob ? a_swapped : adapt_nswaps;
             int64_t dec_windows = 0, dec_T = 0;
             const int64_t decode_hits0 = drive.d.cache_hits;
+            live_hist.clear();   // S5d: a switch's park already read the previous conversation's counts; this request records fresh
             // CS-T: the RAM and file tiers of this request (the mmap source; 0 with the arena)
             const int64_t ram0 = src.ram_reads(), files0 = src.file_reads();
             const uint64_t file_bytes0 = src.file_read_bytes();
@@ -19691,7 +19823,8 @@ int main(int argc, char** argv) {
                 A.p = p;
                 A.tok[0] = x;
                 A.ready = true;
-                drive.d.layers = 0;
+                drive.d.layers = 0; drive.d.hist_ptrs = nullptr; drive.d.hist_n = 0;   // S5d: windows record only where pointed
+                s5d_point(drive.d, g.n_layers);   // S5d: single-conversation windows point at the live counts (batch windows re-point per row)
                 drive.d.experts = 0;
                 drive.d.failed = false;
                 // the adaptive tier beside the pipeline: the serial loop's rule and adapt() on a thread of its own (its
@@ -20487,7 +20620,8 @@ int main(int argc, char** argv) {
                                                     : drafts[(size_t) i - 1];
                 for (int i = 0; i < chain_n; ++i) window[(size_t) (T_mtp + i)] = cbuf[(size_t) i];
                 if (!keep_sync()) { std::printf("ERR %s\n", err.c_str()); return 1; }
-                drive.d.layers = 0;
+                drive.d.layers = 0; drive.d.hist_ptrs = nullptr; drive.d.hist_n = 0;   // S5d: windows record only where pointed
+                s5d_point(drive.d, g.n_layers);   // S5d: single-conversation windows point at the live counts (batch windows re-point per row)
                 drive.d.experts = 0;
                 drive.d.failed = false;
                 // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
@@ -21263,6 +21397,8 @@ int main(int argc, char** argv) {
                     if (ckpt_pool.on())
                         for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
                     sl = BSlot{};
+                    s5d_cur = &sl.exp_hist;   // S5d: the admitted request's hits record here; park_current parks them with its conversation
+                    if (pd_hist_on) sl.exp_hist = live_hist;   // S5d: the prompt's counts ride with the conversation into the slot; its window hits add on top (15844 keeps the size)
                     const auto tc2 = Clock::now();   // (the slot's old checkpoints freed)
                     sl.active = true;
                     sl.x = x;
@@ -21873,7 +22009,18 @@ int main(int argc, char** argv) {
         // running across tokens asks for layer 48 of a 48-layer file on the second token - which
         // `FileExpertSource` REFUSES rather than wrapping into layer 0's experts, and that refusal is the only
         // reason this was a clean error instead of a silently wrong second token.
-        drive.d.layers = 0;
+        drive.d.layers = 0; drive.d.hist_ptrs = nullptr; drive.d.hist_n = 0;   // S5d: windows record only where pointed
+                s5d_point(drive.d, g.n_layers);   // S5d: single-conversation windows point at the live counts (batch windows re-point per row)
+        if (pd_hist_on && g.n_layers > 0 && drive.d.n_expert > 0) {   // S5d: the solo window records at the live conversation's own array
+            if (live_hist.empty())
+                live_hist.assign((size_t) g.n_layers * (size_t) drive.d.n_expert, 0);
+            if (uint8_t* hd = live_hist.data(); hd != hps_hist) {
+                std::fill(hps.begin(), hps.end(), hd);   // every row of a solo window belongs to this conversation
+                hps_hist = hd;
+            }
+            drive.d.hist_ptrs = hps.data();
+            drive.d.hist_n = (int64_t) hps.size();
+        }
         drive.d.experts = 0;
         drive.d.failed = false;
         err.clear();
@@ -22655,7 +22802,8 @@ int main(int argc, char** argv) {
                 if (o.spec_corrupt > 0 && (++corrupt_counter % o.spec_corrupt) == 0) d = (d + 1) % (int32_t) n_vocab;
                 window[(size_t) i] = d;
             }
-            drive.d.layers = 0;
+            drive.d.layers = 0; drive.d.hist_ptrs = nullptr; drive.d.hist_n = 0;   // S5d: windows record only where pointed
+                s5d_point(drive.d, g.n_layers);   // S5d: single-conversation windows point at the live counts (batch windows re-point per row)
             drive.d.experts = 0;
             drive.d.failed = false;
             // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in

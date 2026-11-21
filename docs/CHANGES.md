@@ -818,3 +818,71 @@ Files: `conversation_park_disk.{hpp,cpp}` (ReadStats, donor index in read_v2, pr
 writer salt seed, counters), `generate.cpp` (call-site donor hoist + guard + `STRATA_PARK_DELTA`),
 `park_disk_boot_test.cpp` (s5c arm). Ship md5 (local == ms01): park_disk.cpp `1c0f1993…`,
 hpp `4b0c1bb4…`, generate.cpp `6ef2054a…`, boot_test.cpp `234e0e5e…`.
+
+## 195. S5d: the park manifest carries a per-conversation expert-hit histogram; a deep-resume pre-stages those experts
+
+The §190 law: fewer bytes fetched and fewer cold misses, not faster transport. S5c cut the
+BYTES of a restore. S5d cuts the MISS: a parked conversation now remembers which experts it
+was actually routing, and a resume stages them into the expert cache before the first window
+runs, instead of letting the early windows pay a cold PCIe miss per expert they touch.
+
+Recording (serve loop, free path): `ExpertDispatch` gains `hist_ptrs`/`hist_n`; the pool
+dispatch bumps a saturating u8 cell at `[layer*n_expert + expert]` for every routed id
+(`ids` is token-major: `k` ids per token, so row = `i / k`). The batch window site points
+`hist_ptrs[t]` at each live slot's `BSlot.exp_hist` (lazy-zeroed, dropped by `sl = BSlot{}` at
+takeover); every single-conversation window — the pipelined decode loop, the serial loops, the
+prompt rounds — calls `s5d_point`, which points all rows at one file-scope `live_hist`, the
+live conversation's own array, cleared at each request's decode start. (The park machinery and
+the token loops are sibling blocks of one function, so this state sits at file scope; one serve
+process, one model — advisory either way.) `STRATA_PARK_HIST=0` disables it (default ON).
+
+Manifest: `hist_encode` trims the flat array to the hottest 8192 nonzero cells
+(`S5DHv1` magic + u16 layers + u16 experts + u32 pairs + `(u16 idx, u8 count)` x pairs —
+23 bytes for a three-cell test conversation). The blob rides the `.ses` file right after the
+inline body; the v2/v3 header already hashed only `[0,80)`, so bytes 88/96 carry its
+`(offset, len)` UNHASHED, and the payload hash never covers it. Pre-S5d files hold zeros
+there - "no histogram" - so no park era is invalidated. A malformed section (offset not at
+`kPd3Body + inline_bytes`, length > 16 MiB, short read, geometry disagreeing with decode)
+degrades to "no histogram", never to a failed load: a wrong hint must not cost a restore.
+
+Prewarm (deep-resume): after a successful restore, `hist_decode` sorts cells hot-to-cold and
+stages up to 512 of them (max 32 per layer, `STRATA_PARK_PREWARM_MIB` default 256 MiB total)
+through the SAME `admit`/`fill_slot`/`note_async_read` trio the window admission path uses,
+on the same serve thread. Only FREE slots are claimed (`slot_of == kNotResident` and
+`admit != kNotResident`): prewarm never evicts a live expert, and a full cache just logs
+`refused`. A fill failure stops the prewarm only — the restore is untouched.
+`STRATA_PARK_PREWARM=0` disables it.
+
+Gate (`park_disk_boot_test`, ms01, ship-byte): new s5d arm — a 23-byte three-cell histogram
+spilled with a 60k-token conversation, restored byte-identically, blob round-tripped through
+the manifest; then ONE byte inside the section corrupted: the restore is still
+byte-identical and `hist_decode` refuses the blob (the hint is dropped, `herr` empty).
+Suite: **62 checks passed** (was 56); targeted ctest park/session/conversation/file/buffer
+**20/20**.
+
+Serve-path gaps the boot gate could not see: two A/B runs recorded NOTHING. First: the park
+that real traffic fires is `park_current` parking the `live` mirror, not the batch-slot park.
+Second (the one that mattered): serve's prompt prefill — 96,995 of a probe request's 97,059
+tokens, nearly all the routing — runs through the pipelined decode loop, and a short decode
+(`max_tokens=64`) is never admitted into a batch slot at all; pointing only batch windows
+recorded the 64-token floor. A park-time log line (`park hist: <cells> expert cells, <bytes>`)
+turned it measurable: with `s5d_point` at every window-reset site, ms01's ladder parked
+96,995 tokens carrying **3,267 nonzero expert cells (9,815 bytes of 24,576 counts)** — the
+conversation's hot set, recorded from real dispatch. Forcing a DISK spill for the restore A/B
+failed on ms01, not on S5d: every park that lands there is a shared-head conversation with a
+mounted COW anchor, so it is not evictable (`evicted 0, 1 still parked`), and over-budget
+replacement drops the old park in `make_room` without a spill write — budgets 1536 (admission
+refuses: `snapshot 2201 MiB exceeds available budget`), 4096 and 2500 produced no `.ses`. The
+spill path itself is the gate's, exercised at 62 checks. So the serve-level prewarm staging
+has never run under traffic yet: it rides the next store that carries histograms (prebuilt-3),
+where the counters will show it. ms01 stays the recording node; the park-scheduling shape
+(evictable unique parks via save-reclaim) is a measurement-harness problem, not an engine one.
+
+Files: `conversation_cache.hpp` (`SavedConversation.s5d_hist`),
+`conversation_park_disk.{hpp,cpp}` (`hist_encode`/`hist_decode`, manifest section write +
+tolerant read), `expert_source.{hpp,cpp}` (dispatch recording), `generate.cpp`
+(`BSlot.exp_hist`, window pointing, park encode, prewarm, kill switches),
+`park_disk_boot_test.cpp` (s5d arm). Ship md5 (local == ms01): conversation_cache.hpp
+`6ece8211…`, conversation_park_disk.hpp `8d70e718…`, expert_source.hpp `b7358482…`,
+conversation_park_disk.cpp `e9970078…`, expert_source.cpp `b4c29d25…`,
+park_disk_boot_test.cpp `a5aef446…`, generate.cpp `19c2428e…`.

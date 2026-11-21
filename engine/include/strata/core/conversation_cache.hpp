@@ -193,6 +193,10 @@ struct SavedConversation {
     // M-C3b3: the parked image views this RAM-cache slot's K/V prefixes (park CoW anchor); -1: none.
     // Memory-only bookkeeping: never serialized, never part of any hash.
     int64_t view_donor = -1;
+    // S5d: the session's expert hit histogram (opaque, advisory bytes produced by the serve loop).
+    // Never part of the payload: it rides the .ses manifest OUTSIDE the hashed payload, so it cannot
+    // break sibling dedup or identity - it only ever hints a prewarm. Malformed bytes restore empty.
+    std::vector<uint8_t> s5d_hist;
     // Runtime compatibility only; NOT a model/weights identity or disk schema.
     std::array<int64_t, 18> geometry{};
     // The session's layer carve the image was captured from ([0, n_layers) on one GPU); restore requires the same.

@@ -1088,6 +1088,16 @@ void ParkDisk::write_v2(const Write& w, const SessionFileIdentity& id, Finished&
     std::memcpy(h + 56, &ph, 8);
     std::memcpy(h + 64, &nblocks, 8);
     std::memcpy(h + 72, &c.inline_bytes, 8);
+    // S5d: the manifest's advisory expert-hit section rides AFTER the body, named by (off, len) in the
+    // header's reserved tail. It is deliberately outside the header hash (covers [0,80)) and outside
+    // the payload hash: wrong bytes must never fail a restore, they just drop the prewarm hint.
+    if (!w.image.s5d_hist.empty()) {
+        const uint64_t hoff = kPd3Body + c.inline_bytes, hlen = w.image.s5d_hist.size();
+        if (pd_pwrite(fd, w.image.s5d_hist.data(), w.image.s5d_hist.size(), (long long) hoff)
+                != (intptr_t) w.image.s5d_hist.size()) { abort_v2(); return; }
+        std::memcpy(h + 88, &hoff, 8);
+        std::memcpy(h + 96, &hlen, 8);
+    }
     const uint64_t hh = session_hash64(h, 80, 0);
     std::memcpy(h + 80, &hh, 8);
     if (pd_pwrite(fd, h, kPd2Hdr, 0) != (intptr_t) kPd2Hdr) { abort_v2(); return; }
@@ -1232,6 +1242,12 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
     std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&serial, h + 32, 8);
     std::memcpy(&tokens, h + 40, 8); std::memcpy(&payload, h + 48, 8); std::memcpy(&phash, h + 56, 8);
     std::memcpy(&nblocks, h + 64, 8); std::memcpy(&inline_total, h + 72, 8); std::memcpy(&hh, h + 80, 8);
+    // S5d: the advisory manifest section (off, len) rides in the header's unhashed tail. Files written
+    // before S5d have zeros there (the header is zero-initialized at write), which means "no histogram".
+    uint64_t hist_off = 0, hist_len = 0;
+    std::memcpy(&hist_off, h + 88, 8); std::memcpy(&hist_len, h + 96, 8);
+    if (hist_len && (hist_off != kPd3Body + inline_total || hist_len > (uint64_t) 16 << 20))
+        hist_len = 0;   // advisory: a malformed section just drops the hint, never fails the restore
     if (ver != 3 || hdr != (uint32_t) kPd3Body || session_hash64(h, 80, 0) != hh) {
         st.error = SessionError::invalid; error = "park v3: superseded version or bad header"; return false;
     }
@@ -1258,7 +1274,7 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
         sum += en.len;
         if (en.kind == 0) itot += en.len;
     }
-    if (sum != payload || itot != inline_total || sb.size != kPd3Body + inline_total) {
+    if (sum != payload || itot != inline_total || sb.size != kPd3Body + inline_total + hist_len) {
         st.error = SessionError::invalid;
         error = std::string("park v2: table and file size disagree (entries ") + std::to_string(sum) +
                 " vs payload " + std::to_string(payload) + ", inline " + std::to_string(itot) +
@@ -1476,6 +1492,11 @@ bool ParkDisk::read_v2(const std::string& path, const SessionFileIdentity& id, c
         else { st.error = pkind; if (error.empty()) error = "park v2: parse failed"; }
         return false;   // M-C5: classify foreign (permanent) vs invalid (corrupt) vs io/memory (retry later)
     }
+    if (hist_len) {   // S5d: the advisory section: a short read only loses the prewarm hint
+        std::vector<uint8_t> hist((size_t) hist_len);
+        if (pd_pread(ctx.fd, hist.data(), (size_t) hist_len, (long long) hist_off) == (intptr_t) hist_len)
+            image.s5d_hist = std::move(hist);
+    }
     if (vf != nullptr && !vf->images.empty()) {
         // M-C3b3b: a view-mounted child re-joins CoW right after assembly: each viewed region is verified
 // against the materialized parent and swapped for shared views (tails stay owned, byte-verified).
@@ -1557,6 +1578,59 @@ bool ParkDisk::scan_v2_keys(const std::string& path, std::vector<PdKey>& keys, s
         std::memcpy(&len, e + 8, 8); std::memcpy(&k0, e + 16, 8); std::memcpy(&k1, e + 24, 8);
         if (kind > 1 || len == 0 || len > kPd2Block) { error = "park v3 scan: bad table entry"; return false; }
         if (kind == 1) keys.push_back(PdKey{k0, k1});
+    }
+    return true;
+}
+
+// ---- S5d: expert-hit histogram wire format ---------------------------------------------
+// The section is advisory by construction (outside every hash, both at write and at read):
+// anything that fails a sanity check here degrades to "no histogram", never to a restore failure.
+bool hist_encode(const std::vector<uint8_t>& counts, int64_t n_expert, std::vector<uint8_t>& out) {
+    out.clear();
+    if (n_expert <= 0 || n_expert > 0xFFFF || counts.empty() || counts.size() % (size_t) n_expert != 0
+            || counts.size() / (size_t) n_expert > 0xFFFF)
+        return false;
+    std::vector<std::pair<uint16_t, uint8_t>> hot;   // (idx, count) for every nonzero cell
+    for (size_t i = 0; i < counts.size(); ++i)
+        if (counts[i]) hot.emplace_back((uint16_t) i, counts[i]);
+    if (hot.empty()) return false;                   // no hits: no section
+    if (hot.size() > 8192) {                         // prewarm cap: the hottest 8192 cells
+        std::nth_element(hot.begin(), hot.begin() + 8192, hot.end(),
+                         [](const std::pair<uint16_t, uint8_t>& a, const std::pair<uint16_t, uint8_t>& b)
+                         { return a.second > b.second; });
+        hot.resize(8192);
+    }
+    std::sort(hot.begin(), hot.end(),
+              [](const std::pair<uint16_t, uint8_t>& a, const std::pair<uint16_t, uint8_t>& b)
+              { return a.second != b.second ? a.second > b.second : a.first < b.first; });
+    out.insert(out.end(), {'S', '5', 'D', 'H', 'v', '1'});
+    const uint16_t nl = (uint16_t) (counts.size() / (size_t) n_expert), ne = (uint16_t) n_expert;
+    const uint32_t np = (uint32_t) hot.size();
+    out.insert(out.end(), (const uint8_t*) &nl, (const uint8_t*) &nl + 2);
+    out.insert(out.end(), (const uint8_t*) &ne, (const uint8_t*) &ne + 2);
+    out.insert(out.end(), (const uint8_t*) &np, (const uint8_t*) &np + 4);
+    for (const auto& hc : hot) {
+        out.insert(out.end(), (const uint8_t*) &hc.first, (const uint8_t*) &hc.first + 2);
+        out.push_back(hc.second);
+    }
+    return true;
+}
+
+bool hist_decode(const std::vector<uint8_t>& in, int64_t n_layers, int64_t n_expert,
+                 std::vector<uint8_t>& counts) {
+    counts.clear();
+    if (in.size() < 14 || std::memcmp(in.data(), "S5DHv1", 6) != 0 || n_layers <= 0 || n_expert <= 0
+            || n_layers > 0xFFFF || n_expert > 0xFFFF)
+        return false;
+    uint16_t nl = 0, ne = 0; uint32_t np = 0;
+    std::memcpy(&nl, in.data() + 6, 2); std::memcpy(&ne, in.data() + 8, 2); std::memcpy(&np, in.data() + 10, 4);
+    if ((int64_t) nl != n_layers || (int64_t) ne != n_expert || in.size() != 14 + (size_t) np * 3)
+        return false;
+    counts.assign((size_t) n_layers * (size_t) n_expert, 0);
+    for (uint32_t i = 0; i < np; ++i) {
+        uint16_t idx; std::memcpy(&idx, in.data() + 14 + i * 3, 2);
+        if ((size_t) idx >= counts.size()) return false;
+        counts[idx] = in.data()[14 + i * 3 + 2];
     }
     return true;
 }

@@ -526,6 +526,48 @@ check(imgA.has_value() && same(*imgA, Lcopy), "s5c: RAM-twin restore is byte-ide
             check(imgB.has_value() && same(*imgB, Lcopy), "s5c: a divergent donor retries from the store, byte-identical");
             check(pd.delta_events() - de0 == 1, "s5c: divergence recorded exactly once");
         }
+        // ---- S5d: the advisory expert-hit section rides the .ses manifest. It must (a) round-trip
+        // through spill+restore without disturbing the payload, and (b) a corrupted section must
+        // leave the restore byte-identical and the histogram simply refused - never a failed load.
+        {
+            SavedConversation D = make_image(41, 60000);
+            D.live.ids[5] = 999999;   // distinct id space: best() matches D's own conversation, not a prefix
+            std::vector<uint8_t> counts((size_t) D.kv.size() * 64, 0), blob;
+            counts[1 * 64 + 5] = 9; counts[3 * 64 + 7] = 200; counts[(D.kv.size() - 1) * 64 + 2] = 1;
+            check(hist_encode(counts, 64, blob) && !blob.empty(), "s5d: histogram encodes");
+            D.s5d_hist = blob;
+            const SavedConversation Dcopy(D);
+            pd.spill(SavedConversation(D), -1);
+            wait_for([&] { return list_ses(dirv).size() == 4; }, "s5d: D published");
+            const auto mD = pd.best(D.live.ids, {}, false);
+            std::string herr;
+            const auto imgD = pd.load(mD, herr);
+            check(imgD.has_value() && same(*imgD, Dcopy), "s5d: restore with histogram is byte-identical");
+            std::vector<uint8_t> got;
+            check(imgD && hist_decode(imgD->s5d_hist, D.kv.size(), 64, got) && got == counts,
+                  "s5d: histogram round-trips through the manifest");
+            // Break ONE byte inside the section: the file stays fully valid, the hint is refused.
+            bool broke = false;
+            for (const auto& p : list_ses(dirv)) {
+                std::fstream f((dirv / p).string(), std::ios::binary | std::ios::in | std::ios::out);
+                if (!f) continue;
+                uint8_t hb[128];
+                f.read((char*) hb, 128);
+                if (!f) continue;
+                uint64_t hoff = 0; std::memcpy(&hoff, hb + 88, 8);
+                if (!hoff) continue;   // only D carries a section
+                f.seekp((std::streamoff) (hoff + 6));
+                f.put('\x01');
+                f.close();
+                broke = (bool) f;
+                break;
+            }
+            check(broke, "s5d: one section byte corrupted");
+            const auto imgE = pd.load(mD, herr);
+            check(imgE.has_value() && same(*imgE, Dcopy), "s5d: a corrupted section never fails the restore");
+            std::vector<uint8_t> nogot;
+            check(!hist_decode(imgE->s5d_hist, D.kv.size(), 64, nogot), "s5d: corrupted section refused");
+        }
         g_pd = nullptr;
     }
     fs::remove_all(dirv);

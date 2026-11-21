@@ -33,6 +33,15 @@
 
 namespace strata::core {
 
+// S5d expert-hit histogram wire format. The serve loop keeps a per-slot flat array of saturating u8
+// counts indexed [layer*n_expert + expert]; this packs it into (u16 idx, u8 count) pairs, hottest
+// first, capped, so the park manifest carries only what a prewarm needs. The blob rides the .ses
+// manifest OUTSIDE every hash, so it is advisory by construction: hist_decode returns false on any
+// geometry disagreement and the prewarm simply does not happen.
+bool hist_encode(const std::vector<uint8_t>& counts, int64_t n_expert, std::vector<uint8_t>& out);
+bool hist_decode(const std::vector<uint8_t>& in, int64_t n_layers, int64_t n_expert,
+                 std::vector<uint8_t>& counts);
+
 class ParkDisk {
 public:
     struct Options {
