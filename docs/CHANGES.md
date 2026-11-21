@@ -975,3 +975,37 @@ already said the expert path is thin; it pays where a cache has headroom and mis
 actually dominate — which on this program's fleet means the 24 GB production box.
 Gates at ship bytes (`generate.cpp` md5 `699dca53…`, local↔ms01 identical): boot 62
 checks, targeted ctest 20/20 (idle GPU). Files: `engine/src/program/generate.cpp`.
+
+
+## 198. S2b re-test: the shared-head stack is farm-negative again at batch 4 under current constraints — the VMM sketch dies
+
+The S4 design note defined S2b as a re-test, not new development: the cow-m1 K/V
+sharing stack (arena + admission fork + joins-at-fetch + lineage shared region, shipped
+opt-in since 2026-11-12) was verdicted "farm-negative as pinned sharing" at batch 0.
+The re-test runs it against today's shape: current build (S4-v2 + S5d-v2 ship bytes),
+`--batch 4 --batch-mtp`, detach off both arms, identical config, C4 harness with
+battery + needle, arm A off / arm B on (`STRATA_COW_ARENA=1` 30720 slots,
+`STRATA_COW_SHARED=32768`, `STRATA_COW_FORK=1`).
+
+| band | A (stack off) | B (stack on) |
+|---|---|---|
+| wall | 245.5 s | 781.5 s |
+| agg decode | 13.4 tok/s | 5.7 tok/s |
+| ttft p50 / p95 / max | 4.2 / 90.1 / 112.6 s | 14.4 / 506.5 / 568.3 s |
+| window chunk / n | 8.35 s / 7 | 8.46 s / 10 |
+| needle | 4/4 | 4/4 |
+
+The deciding lines are the stack's own telemetry: `the admission fork points at 0 of
+128 prefix pages per K/V layer`, `joins-at-fetch served so far: 0, lineage shared
+fetches: 0` — under this traffic the stack shared nothing, so arm B paid only its
+boot cost (12 QSA layers x 63,488 slots = 3.00 GiB INT8 streamed) and machinery
+overhead, and cold TTFT went 6-10x worse. Correctness held (needle 4/4 both arms);
+benefit was nil; the 2026-11-12 verdict stands under the new constraints.
+
+Per the design note's rule this retires the VMM attach/detach sketch: shared-head is
+a capacity question, and capacity moves at 196's detach seam — not at a sharing layer
+that measures zero dedup on real conversation traffic. No engine changes; docs-only
+entry. Probe: ms01 `s2b_probe2.sh`, bands `c4_s2bA.log` / `c4_s2bB.log`. Note for
+future batch-8 runs on 12 GB boxes: arm A's guard logged `min_memavail_gib 1.9` with
+a 6,144 MiB park budget at `--kv-resident 8192` — RAM, not VRAM, is where batch 8
+will bind first.
