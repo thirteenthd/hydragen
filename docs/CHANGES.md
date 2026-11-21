@@ -1071,3 +1071,16 @@ Probe: ms01 `s73_ab.sh` round 5, bands `c4_s73a.log` / `c4_s73b.log`, battery ta
 window. A driver law learned the same day: a `flock` guard's fd leaks into every child —
 the round-1 daemonized serve held the A/B lock for hours as an invisible holder behind
 serve's inherited fd; child launches must close it (`200>&-`).
+
+Addendum (same day): both watch-items resolved from the round-5 logs and a targeted re-run.
+The 134 s stall is the slot-give-way preemption class at 102k prompts, not a park/restore
+interaction: one request decoded at ~2.7 tok/s while 69k-94k-token prompt re-reads kept
+overwriting the other slot (`skip parking ... 8192 MiB floor` refusals and `slot not
+parked ... without --batch-mtp` are its log signature). The class is symmetric - the fmt=0
+arm's window holds the same shape at 119 s and 143 s with expert hits down to 46%; fmt=1's
+longer completions only raised its exposure. The `qsa_prompt_attn_batch (v3)` illegal-access
+watch-item retires UNREPRODUCED: the probe-env recipe (probe + battery + C4, card near
+full) re-ran on this commit's bytes - battery clean, the probe verdict identical to the
+byte-for-byte quoted numbers (82048 of 89544, 99.9864% cells shared), zero illegal-access
+lines, and the engine stayed healthy through the full 40-minute probe-env C4 (the harness
+timed out: the probe's per-prompt rounding costs real time; the engine itself was intact).
