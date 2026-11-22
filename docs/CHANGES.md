@@ -1255,3 +1255,71 @@ strings separate the channels (prompt-read fail-fast vs batch-window loop), and
 the scene (park state, admission refusals, MemAvailable) discriminates among the
 surviving hypotheses. Labels never fire, so per-site instrumentation is retired
 for this class: any future arm starts from the at-exit probe.
+
+## 203. The prod arm: window recycling runs end-to-end on the 24 GB box; the decode ceiling did not move
+
+prebuilt-3: built on the prod host from 884f351b (§194-§202) with
+packaging/build_cuda_windows.py, CUDA 13.5, archs 86;89;120, Ninja,
+`hydragen.exe` 138,326,016 bytes, md5 615a359136ad9b7bf5b5582703756864,
+`--version` strata 0.1.60. The patch is proven in the binary by its literals
+(`died without a reason` and `session re-carved` present; `DIAG at-exit`
+absent - the §202 probes stay out of shipped builds).
+
+A packaging bug surfaced and is fixed in this change: the staged check demanded
+`strata.exe`, which this fork's engine target does not produce (the fork builds
+`hydragen.exe`, no `strata_kq.dll`), so a green `[158/158]` link still aborted
+with `the build made no strata.exe`. Staging now accepts whichever engine exe
+the build made. prebuilt-3 itself was staged by hand as usual:
+`runtime/hydragen-pb3.exe` beside the live exe, and `hydragen-local.json`
+diffed by exactly three lines - the `exe` path, `STRATA_SLOT_DETACH_MS=15000`,
+`STRATA_SLOT_KV_GROW=1` - with engine args byte-identical. Rollback is
+`hydragen-local.json.pre-pb3.bak` plus one service restart (host's hand).
+
+Gate first, measurements second: needle battery 4/4 after the restart
+(depths 18,995 -> 186,994 tokens), same as the prebuilt-2 baseline taken
+minutes before. Zero deaths across the whole arm; the engine pid never changed
+and §202's backfill never had to print.
+
+The §200 cycle fired in production, verbatim:
+
+    conversation cache: slot 3 detached idle (117923 tokens to the parked tier)
+    conversation cache: slot 3 detached idle: session arena returned (0.55 GiB back)
+    conversation cache: slot 3's session re-carved (kv-resident 16384, 0.65 GiB)
+
+The re-carve took the doubled window (boot carve 8192 -> 16384) with no
+fallback to the boot size: 24 GB funds it. The re-admission is what window
+recycling is for:
+
+    prompt 115705 tokens = 115698 reused + 7 read in 874 ms
+
+seven tokens re-read of 115,705. The same arm caught the give-way retry once
+more - `0 generated ... (cancelled)` after `16384 of 115705 read in 7408 ms`,
+then the successful pass above - geometry, not defect (§199).
+
+Fan-out at the §201 shape (a ~115.7k-token head across 4 workers, 2,300-token
+forced decode) on the 24 GB card:
+
+    pass 1 cold: walls 139.7/158.9/160.8/156.7 s, aggregate 59.9 tok/s
+    pass 2 warm: walls 42.3/113.7/139.9/137.9 s, aggregate 107.8 tok/s
+    C=2:         cold 175.1 s then warm 66.2 s,  aggregate 47.9 tok/s
+
+Per-stream decode at C=4 sits at 14.3-20.2 tok/s with decode-window expert
+hits at 78.8-87.0% against 92.4-99.6% idle - the same dilution signature §201
+measured on 12 GB, where the comparable fanf walls were 74.6-78.4 s
+(~30 tok/s a stream). Doubling the VRAM did not lift the aggregate band
+(~100-120 tok/s flat): the ceiling is the per-stream expert working set, not
+free bytes on the card. What the 24 GB box bought is fundability of the grown
+carve and admission economics - 0.55 GiB returned by each idle slot, and a
+115k conversation restored in 0.9 s against a 65.0 s cold re-prefill
+(`16384 reused + 99321 read in 64973 ms`, 1,528.7 tok/s) - not decode speed.
+
+Not claimed: the 102k `0.56 s/token` class (§199 addendum) remains unmeasured;
+the fan-out shape tops at 115.7k prompts. The disk park tier refused its index
+at boot - `park v2: bound to another model or configuration` for 16 entries,
+quarantined - which is the fingerprint law doing its expected job after an
+engine change; the RAM park tier (6144 MiB) carried the arm (25 parks,
+5 restores, 30 of 43 requests reused). Re-arming the disk tier against the new
+fingerprint is recorded, not taken.
+
+prod stays on prebuilt-3 with `STRATA_SLOT_DETACH_MS=15000` and
+`STRATA_SLOT_KV_GROW=1`.
