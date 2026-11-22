@@ -1449,3 +1449,60 @@ enforcement (`ARENA_SLOTS >= batch x SLOT_CELLS` + headroom), and
 (2) arena-backed sessions must honor KV_GROW re-carve, or the arena must
 size its window the way §200 does. Prod posture in the meantime: the
 §203 shape, unchanged.
+
+## 206. S8-v2: the arena allocator reclaims in any order, the sizing law is enforced at boot, and the detach/re-carve loop is measured green on the bench node
+
+*Amendment to §205 first:* the "under-funding arithmetic" in that section
+(`18432 slots vs 25165` etc.) conflated two units. A slot is a page of four
+cells, so the boot clamp in cells is `(1 + 2 x batch) x max(SLOT_CELLS,
+kv-resident)` — at the ms01 shape (batch 4, 8192 cells) demand is 18432
+slots/layer, exactly the arena shipped. The §205 regression stands, but its
+funding argument is retired.
+
+What landed engine-side (the two §206 gates from §205, plus the detach
+reachability fix):
+
+- Arena allocator: the bump-pointer could only reclaim the newest range, so
+  any out-of-order free fragmented the arena forever. Replaced with a
+  first-fit free list (`g_cow_free`) with sorted insert and coalescing, plus
+  a zombie list (`g_cow_zombie`) for ranges pinned by refcount>1 at release
+  — retried on every later release. `cow_range_clean` refuses to zero a
+  pinned range. `qsa_set_cow_arena()` now clears the range maps, so a fresh
+  arena never inherits a stale map.
+- Sizing enforced at boot: `ARENA_SLOTS >= (1 + 2 x batch) x
+  max(STRATA_COW_SLOT_CELLS, kv-resident) / 4`, with a printed raise when
+  the configured arena is short (the §205 prod shape printed exactly that
+  clamp line; ms01's 18432 met demand exactly and printed nothing).
+- KV_GROW interaction fixed: `ensure_slot_session` raises the cow window per
+  candidate (`qsa_set_cow_slot_cells(cand)`) before re-init and restores the
+  boot window after; a failed re-init releases the half-built session.
+- Detach reachability: the sweep fires only at the three batch-window
+  completion sites, and a solo request never enters the batch arm at all
+  (serve sends plain `GEN`). Measured law: the traffic shape that fires the
+  sweep is a **concurrent fan with one long-tail stream** — windows decode
+  slots in lockstep, so an all-short fan stamps every slot fresh at the same
+  instant and nothing ever ages past `SLOT_DETACH_MS`. §203's lone prod
+  detach was staggered completions, which this explains without any
+  different mechanism.
+
+Measured on ms01 (bench node, engine `961dc4905995d2b1ad2411340ba3c56d`,
+cow env on, `SLOT_DETACH_MS=15000`, `SLOT_KV_GROW=1`, `TAIL_SKIP=0`), fan
+of four 14k-token conversations, `max_tokens` 32/32/32/2600:
+
+    strata serve: conversation cache: slot 1 detached idle (43539 tokens to the parked tier)
+    strata serve: conversation cache: slot 1 detached idle: session arena returned (0.34 GiB back)
+    strata serve: conversation cache: slot 2 detached idle (43540 tokens to the parked tier)
+    strata serve: conversation cache: slot 2 detached idle: session arena returned (0.34 GiB back)
+    strata serve: conversation cache: slot 1's session re-carved (kv-resident 16384, 0.34 GiB)
+    strata serve: conversation cache: slot 2's session re-carved (kv-resident 16384, 0.34 GiB)
+
+First detach + arena handback + re-carve observed anywhere (every §203/§204/§205
+boot printed `detached 0`). The re-carve carries the raised resident window
+(16384), which is the §200 mitigation surviving inside the arena — the exact
+capability §205 found missing on prod. First-fit reclaim served the next
+admissions with zero `no room` / `arenas hold` refusals across the whole log.
+
+Prod posture unchanged: the §203 shape stays live; a cow re-arm needs a
+Windows build of this tree first, and the sizing clamp above is what will
+either fit the arena on 24 GB or say so at boot instead of bleeding expert
+cache slots silently.

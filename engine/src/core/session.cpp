@@ -133,6 +133,11 @@ void session_release(SessionState& s) {
             strata::kernels::rope_table_release(s.qsa_states[j].cos_tab);
             s.qsa_states[j].owns_rope = false;
         }
+    // (S8-v2) cow sessions hold a claimed range in their layer's arena: session end hands it back
+    // (refcount-clean ranges only; a pinned range stays owned so a join can still read it).
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
+        if (s.qsa_states[j].cow_ordinal >= 0)
+            strata::core::qsa_cow_state_release(s.qsa_states[j]);
 }
 
 #if defined(STRATA_GPU_METAL)

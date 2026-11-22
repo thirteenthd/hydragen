@@ -4629,13 +4629,25 @@ int main(int argc, char** argv) {
         const char* en = hg_getenv("STRATA_COW_ARENA");
         const char* ns = hg_getenv("STRATA_COW_ARENA_SLOTS");
         if (en != nullptr && en[0] == '1' && o.kv_resident > 0 && o.kv == "int8") {
-            strata::core::qsa_set_cow_arena(ns != nullptr ? std::atoll(ns)
-                                                          : 4 * (o.kv_resident / 4));   // page_size = 4 cells
+            const char* sc = hg_getenv("STRATA_COW_SLOT_CELLS");
+            const int64_t cells = sc != nullptr ? std::atoll(sc) : o.kv_resident;
+            const int64_t win = (cells > o.kv_resident ? cells : o.kv_resident) / 4;   // one session's window in slots (page = 4 cells)
+            const int64_t nb = o.batch > 0 ? (int64_t) o.batch : 1;
+            // S8-v2 sizing law: the arena must hold the main session's window, one window per batch slot,
+            // and room for one doubled re-carve window per slot (STRATA_SLOT_KV_GROW): (1 + 2B) x win.
+            const int64_t demand = (1 + 2 * nb) * win;
+            int64_t slots = ns != nullptr ? std::atoll(ns) : 4 * (o.kv_resident / 4);
+            if (slots < demand) {
+                std::fprintf(stderr, "strata generate: cow: the arenas hold %lld slots/layer, live demand is %lld "
+                                     "(main + %lld slot windows + one doubled round): raising the arena\n",
+                             (long long) slots, (long long) demand, (long long) nb);
+                slots = demand;
+            }
+            strata::core::qsa_set_cow_arena(slots);
             const char* jh = hg_getenv("STRATA_COW_JOIN_HH");
             if (jh != nullptr) strata::core::qsa_set_cow_join_hh(std::atoll(jh));
             const char* csh = hg_getenv("STRATA_COW_SHARED");
             if (csh != nullptr) strata::core::qsa_set_cow_shared(std::atoll(csh));
-            const char* sc = hg_getenv("STRATA_COW_SLOT_CELLS");
             if (sc != nullptr) strata::core::qsa_set_cow_slot_cells(std::atoll(sc));
         }
     }
@@ -15596,6 +15608,13 @@ int main(int argc, char** argv) {
                                  "STRATA_SLOT_DETACH_MS, one stage, no --batch-mtp/STRATA_PIPED_MTP and no "
                                  "STRATA_ROPE_TABLE\n");
         const int64_t kv_resident0 = strata::core::qsa_kv_resident();
+        // (S8-v2) with the cow arenas on, every session's window is pinned to STRATA_COW_SLOT_CELLS at
+        // state init (layer.cpp); a re-carve has to raise that global with the candidate window or the
+        // doubled session would silently re-init at the boot window.  The arena bump guard is the
+        // budget: when the arena cannot hold the bigger range the init fails and the boot size follows.
+        const bool cow_on = [] { const char* e = hg_getenv("STRATA_COW_ARENA"); return e != nullptr && e[0] == '1'; }();
+        const int64_t cow_cells0 = [] { const char* e = hg_getenv("STRATA_COW_SLOT_CELLS");
+                                        return e != nullptr ? std::atoll(e) : (int64_t) 0; }();
         const int64_t lo0 = 0, hi0 = multi_gpu ? split_at[0] : (int64_t) -1;
         const uint64_t slot_bytes0 = strata::core::session_bytes(g, o.max_context, K, lo0, hi0);
         // Re-carve a freed slot's session, bigger where the budget allows: keep one ordinary session's bytes
@@ -15610,6 +15629,7 @@ int main(int argc, char** argv) {
             const int64_t cands[2] = {kv_resident0 * 2, kv_resident0};
             for (int64_t cand : cands) {
                 strata::core::qsa_set_kv_resident(cand);
+                if (cow_on && cow_cells0 > 0) strata::core::qsa_set_cow_slot_cells(cand);   // (S8-v2) the cow window follows the candidate: the arena bump guard is the real budget
                 size_t fb = 0, tb = 0;
                 cudaMemGetInfo(&fb, &tb);
                 const uint64_t reserve = (uint64_t) (nfreed - 1) * slot_bytes0 + (64ull << 20);
@@ -15623,11 +15643,13 @@ int main(int argc, char** argv) {
                         bslot_arena[0][(size_t) b] = buf;
                         ver.drop_batch_graphs();   // the row layouts holding this slot bake its OLD null pools
                         strata::core::qsa_set_kv_resident(kv_resident0);
+                        if (cow_on && cow_cells0 > 0) strata::core::qsa_set_cow_slot_cells(cow_cells0);   // (S8-v2) boot window for the others
                         std::fprintf(stderr, "strata serve: conversation cache: slot %d's session re-carved "
                                              "(kv-resident %lld, %.2f GiB)\n", b, (long long) cand,
                                              (double) need / 1073741824.0);
                         return true;
                     }
+                    strata::core::session_release(su);   // (S8-v2) hand back any arena range the failed re-init claimed
                     if (buf != nullptr) cudaFree(buf);
                     if (su.qsa_states != nullptr) delete[] su.qsa_states;
                     su = strata::core::SessionState{};
@@ -15635,6 +15657,7 @@ int main(int argc, char** argv) {
                 } else
                     cudaGetLastError();
                 strata::core::qsa_set_kv_resident(kv_resident0);
+                if (cow_on && cow_cells0 > 0) strata::core::qsa_set_cow_slot_cells(cow_cells0);   // (S8-v2)
             }
             std::fprintf(stderr, "strata serve: conversation cache: slot %d's session could not be re-carved\n", b);
             return false;
@@ -15894,6 +15917,13 @@ int main(int argc, char** argv) {
             for (const BSlot& s2 : bs) if (s2.cached && !s2.active) ++ncache;
             std::fprintf(stderr, "strata batch: S4v2 sweep: detached %zu, idle-cached slots %zu, oldest idle %lld ms\n",
                          nsw, ncache, oldest);
+            for (size_t b = 0; b < bs.size(); ++b) {
+                const BSlot& s2 = bs[b];
+                std::fprintf(stderr, "strata batch: S4v2 sweep slot %zu: active=%d cached=%d partial=%d idle_ms=%lld\n",
+                             b, (int) s2.active, (int) s2.cached, (int) s2.partial,
+                             s2.t_idle.time_since_epoch().count() == 0 ? (long long) -1
+                                 : (long long) std::chrono::duration_cast<std::chrono::milliseconds>(tsw - s2.t_idle).count());
+            }
         };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
@@ -21543,6 +21573,14 @@ int main(int argc, char** argv) {
                     cont = false;
                 }
                 const auto tc1 = Clock::now();
+                // S8-v2: the serial (pipelined) arm never enters a batch window, so a finished slot's idle clock
+                // was never stamped and no sweep ever ran on this arm - the S4-v2 detach was unreachable here.
+                // Stamp the finished slot, then sweep: slots that finished on EARLIER requests (idle past
+                // STRATA_SLOT_DETACH_MS) park and hand their arenas back NOW, before any arrival can steal them.
+                if (!cont && bs[(size_t) admit_slot].cached) {
+                    bs[(size_t) admit_slot].t_idle = Clock::now();
+                    sweep_idle_detach();
+                }
                 if (cont) {
                     ver.set_slot_sampling(admit_slot, req_sp);   // the request's own sampling, row by row
                     if (!ver.set_slot_logit_bias(admit_slot, req_bias, err)) {   // and its own logit bias

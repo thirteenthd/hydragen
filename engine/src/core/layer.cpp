@@ -635,6 +635,11 @@ struct CowArena { int8_t* k = nullptr; int8_t* v = nullptr; uint16_t* ks = nullp
                     int32_t* lin = nullptr; int32_t* sblk = nullptr; int32_t* sst = nullptr; int32_t* srf = nullptr; unsigned long long* sctr = nullptr; };   // cow-m1e: hint tables, region clock, fetch counter
 std::vector<CowArena> g_cow_arenas;
 int64_t g_cow_session_ctr = -1;
+std::vector<int64_t> g_cow_next;   // (S8-v2) per-ordinal bump high-water
+struct CowRange { int64_t base, n; };
+std::vector<std::vector<CowRange>> g_cow_free;    // (S8-v2) per ordinal: released ranges, sorted by base
+std::vector<std::vector<CowRange>> g_cow_zombie;  // (S8-v2) per ordinal: ended owners still pinned by a sibling
+int64_t g_cow_arena_gaps = 0;      // (S8-v2) cumulative pinned-at-release events (telemetry)
 }
 struct ElasticPool {
     strata::core::VmmRange range;
@@ -800,6 +805,7 @@ uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 void qsa_set_cow_arena(int64_t slots_per_layer) {   // cow-m1 (extern scope; the globals are file-local)
     g_cow_arena = slots_per_layer > 0;
     g_cow_arena_slots = slots_per_layer;
+    g_cow_next.clear(); g_cow_free.clear(); g_cow_zombie.clear(); g_cow_arena_gaps = 0;   // (S8-v2) a fresh arena starts with a fresh map
 }
 void qsa_cow_session_begin() { ++g_cow_session_ctr; }
 void qsa_set_cow_slot_cells(int64_t cells) { g_cow_slot_cells = cells > 0 ? cells : 0; }
@@ -914,6 +920,53 @@ void qsa_cow_release(QsaState& st) {
         pe->floor = 0x7FFFFFFF;   // cow-m1e: the lineage is gone; the floor re-arms at the next fork
         cow_reg_reset_fields(*pe);
     }
+}
+
+static bool cow_range_clean(int64_t ord, int64_t base, int64_t n) {
+    // an ended owner seeded 1 across its range; >1 means a live sibling still names these pages
+    if (ord < 0 || (size_t) ord >= g_cow_arenas.size()) return false;
+    const CowArena& a = g_cow_arenas[(size_t) ord];
+    std::vector<int32_t> use((size_t) n, 0);
+    if (cudaMemcpy(use.data(), a.use + base, (size_t) n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    for (const int32_t u : use)
+        if (u > 1) return false;
+    if (cudaMemset(a.use + base, 0, (size_t) n * 4) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+static void cow_free_push(int64_t ord, int64_t base, int64_t n) {
+    std::vector<CowRange>& fl = g_cow_free[(size_t) ord];
+    fl.push_back({base, n});
+    std::sort(fl.begin(), fl.end(), [](const CowRange& x, const CowRange& y) { return x.base < y.base; });
+    for (size_t i = 0; i + 1 < fl.size();)
+        if (fl[i].base + fl[i].n == fl[i + 1].base) { fl[i].n += fl[i + 1].n; fl.erase(fl.begin() + (long) i + 1); }
+        else ++i;
+}
+
+void qsa_cow_state_release(QsaState& st) {   // S8-v2: a session ending releases its arena range
+    if (st.cow_ordinal < 0 || st.n_slots <= 0) return;
+    const int64_t ord = st.cow_ordinal;
+    st.cow_ordinal = -1;
+    qsa_cow_release(st);   // the state's own fork refs go first: siblings' ranges must read clean before they end
+    if (ord < 0 || (size_t) ord >= g_cow_arenas.size() || (size_t) ord >= g_cow_next.size()) return;
+    const int64_t base = st.map.slot_base, n = st.n_slots;
+    if (base < 0 || n <= 0) return;
+    if (cow_range_clean(ord, base, n))
+        cow_free_push(ord, base, n);
+    else { g_cow_zombie[(size_t) ord].push_back({base, n}); ++g_cow_arena_gaps; }
+    // (S8-v2) this release may have been the last pin on an ended owner's range: sweep the zombies.
+    std::vector<CowRange>& zl = g_cow_zombie[(size_t) ord];
+    for (size_t r = 0; r < zl.size();)
+        if (cow_range_clean(ord, zl[r].base, zl[r].n)) {
+            cow_free_push(ord, zl[r].base, zl[r].n);
+            zl.erase(zl.begin() + (long) r);
+        } else ++r;
 }
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
@@ -1075,11 +1128,34 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             }
         }
         if (g_cow_arena) {
-            static std::vector<int64_t> g_cow_next;   // per-ordinal next free slot: ranges may differ in size when the slot-window shrink applies
-            if (g_cow_next.size() < (size_t) g.n_qsa_layers()) g_cow_next.resize((size_t) g.n_qsa_layers(), 0);
-            const int64_t so = g_cow_next[(size_t) qsa_ordinal];
-            g_cow_next[(size_t) qsa_ordinal] += p.slots;
+            // (S8-v2): the bump cursor moved to file scope - a released session hands its range back;
+            // ranges may differ in size when the slot-window shrink applies
+            if (g_cow_next.size() < (size_t) g.n_qsa_layers()) {
+                g_cow_next.resize((size_t) g.n_qsa_layers(), 0);
+                g_cow_free.resize((size_t) g.n_qsa_layers());
+                g_cow_zombie.resize((size_t) g.n_qsa_layers());
+            }
+            // (S8-v2) first-fit over released ranges, else bump: a detached session's window comes back
+            // for the next admission instead of draining the arena one detach at a time.
+            int64_t so = -1;
+            {
+                std::vector<CowRange>& fl = g_cow_free[(size_t) qsa_ordinal];
+                for (size_t r = 0; r < fl.size(); ++r)
+                    if (fl[r].n >= p.slots) {
+                        so = fl[r].base;
+                        fl[r].base += p.slots;
+                        fl[r].n -= p.slots;
+                        if (fl[r].n <= 0) fl.erase(fl.begin() + (long) r);
+                        break;
+                    }
+            }
+            const bool bumped = so < 0;
+            if (bumped) {
+                so = g_cow_next[(size_t) qsa_ordinal];
+                g_cow_next[(size_t) qsa_ordinal] += p.slots;
+            }
             if (so + p.slots > g_cow_arena_slots) {
+                if (bumped) g_cow_next[(size_t) qsa_ordinal] = so;   // (S8-v2): a failed init claims nothing
                 std::fprintf(stderr, "cow: no room for another session in the K/V arenas (%lld slots/layer)\n",
                              (long long) g_cow_arena_slots);
                 return 0;
@@ -1092,11 +1168,14 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             st.cow_codes = so * s.n_head_kv * s.page_size * s.head_dim;
             st.cow_scale = so * s.n_head_kv * s.page_size * (s.head_dim / strata::kernels::KV_Q8_GROUP);
             cow_sb = so;
+            st.cow_ordinal = (int16_t) qsa_ordinal;   // (S8-v2): the release hook needs the range's owner
             {   // cow-m1b: the owner holds its own range: use = 1 across it
                 std::vector<int32_t> ones((size_t) p.slots, 1);
                 if (cudaMemcpy(g_cow_arenas[(size_t) qsa_ordinal].use + so, ones.data(),
                                (size_t) p.slots * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
                     std::fprintf(stderr, "cow: could not seed the slot refcounts\n");
+                    g_cow_next[(size_t) qsa_ordinal] = so;   // (S8-v2): a failed init claims nothing
+                    st.cow_ordinal = -1;
                     return 0;
                 }
             }

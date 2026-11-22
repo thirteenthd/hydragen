@@ -230,6 +230,7 @@ struct QsaState {
     /// cow-m1: element offsets of this state's slot range inside the layer K/V arena (0: private pool).
     int64_t cow_codes = 0;   ///< (codes arrays: k_q, v_q) element offset = slot_base * n_head_kv * page_size * head_dim
     int64_t cow_scale = 0;   ///< (scale arrays: k_scale, v_scale) element offset = slot_base * n_head_kv * page_size * (head_dim/64)
+    int16_t cow_ordinal = -1; ///< (S8-v2) the layer whose arena owns this state's slot range; -1: private pool / no range claimed
     int64_t n_pages = 0;
     int64_t max_cells = 0;
 
@@ -296,6 +297,9 @@ void qsa_set_cow_shared(int64_t v);    // cow-m1e: STRATA_COW_SHARED shared-regi
 int64_t qsa_cow_fork(const QsaState& from, QsaState& to, int64_t upto, std::string& error);
 /// cow-m1: decrement the refcounts of the foreign pages `to`'s table names, before its map is reset.
 void qsa_cow_release(QsaState& st);
+/// (S8-v2) session teardown hook: drops the state's fork refs AND hands its claimed arena range back
+/// to the bump cursor when nothing else pins it.  Ranges a sibling still pins stay owned (a counted gap).
+void qsa_cow_state_release(QsaState& st);
 /// cow-m1d: telemetry: joins-at-fetch this arena has served.
 uint64_t qsa_cow_joins(int64_t qsa_ordinal);
 uint64_t qsa_cow_shared_fetches(int64_t qsa_ordinal);   // cow-m1e: committed lineage fetches (telemetry)
