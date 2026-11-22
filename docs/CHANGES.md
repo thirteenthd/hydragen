@@ -1393,3 +1393,59 @@ prod's (section 203).
 
 Next: the prod arm — cow env + park-budget raise onto `hydragen-local.json`
 (128 GiB host RAM funds it), restart on the host's hand.
+
+## 205. The prod cow arm: the mechanism runs on the 24 GB box, the shape regresses, and prod rolls back
+
+The arm was staged exactly as §204 proposes — `STRATA_COW_ARENA=1`,
+`ARENA_SLOTS=18432`, `SLOT_CELLS=8192`, `FORK=1`, `JOIN_HH=8`, and
+`conversation-cache-mib 6144 -> 16384` on `hydragen-local.json`; binary
+unchanged (`hydragen-pb3.exe`); host restart. Boot carried every expected
+signal: `cow: K/V arenas: 12 QSA layers x 18432 slots (0 shared region) =
+0.87 GiB (INT8 streamed)`, the park-era quarantine lines (`index refuse ...
+bound to another model or configuration`, files kept), needle battery
+**4/4 at full depth** (the 186,994-token prompt answered). Mechanism live:
+`the admission fork points at 1424 of 28927 prefix pages` on the shared
+fan head, `85/515 of 36811` on a 147k-token conversation, `joins-at-fetch
+served so far: 131`.
+
+It is still the wrong shape for this node, on two grounds:
+
+1. Capacity sign flips. On 12 GB the arena replaced private windows and
+   grew the expert cache (§204: 1375 -> 2355); on the 24 GB box it is
+   simply an extra pool: expert cache **6453 -> 6235 slots** (-218). And
+   `ARENA_SLOTS=18432` under-funds the live demand of batch 4 x
+   `SLOT_CELLS=8192` = 32768 — the 2026-11-19 sizing law ("arena slots
+   must cover all session windows") applies at 24 GB too; copying the
+   ms01 arm-3 numbers was my error, disclosed here.
+2. The cow window bypasses §200's window-growth answer. Every cow boot
+   printed **zero** `re-carved (kv-resident 16384 ...)` lines; the §203
+   boot printed them for exactly the big conversations that now ride the
+   arena. The `OVERFLOW (too few resident cells)` KV-streaming flag is
+   NOT cow-caused (77 such lines sit inside the pre-cow §203 boot — it is
+   the `--kv-resident 8192` at 200k-context era), but re-carve was how
+   prod had been paying for 115k-token conversations, and the arm
+   silently removed that mitigation.
+
+Measured cost, cold fan pass (same §201/§204 shape): walls
+161.8/189.6/199.7/207.9 s, **aggregate 48.9 tok/s** vs §203's cold basis
+139.7-160.8 s / 59.9 — a -18 % cold penalty before the warm pass even
+started. The warm pass never got data: mid-window the engine died
+silently — last line `park COW anchor mounted for 112177 of 115705
+tokens`, no error text, no `session is up` until the supervisor's boot
+marker; the §202 scene naming did not print either (the exit path skips
+the handler — the unnamed crashw class, §202's open root cause; cow
+blame is NOT established, but the death sits inside the arm's fan
+window).
+
+Rollback staged: config restored to the pre-arm file (md5-identical to
+`hydragen-local.json.pre-cow.bak`; the arm config is kept as
+`hydragen-local.json.cowarm-attempt.json`); restart on the host's hand.
+The 16384 MiB park budget survives in the kept file only. ms01 stays on
+arm 3 — harmless on the bench node and the §204 warm-fan payoff stays
+real at the 12 GB shape.
+
+S8-v2 gate before any prod re-arm, both engine-side: (1) arena sizing
+enforcement (`ARENA_SLOTS >= batch x SLOT_CELLS` + headroom), and
+(2) arena-backed sessions must honor KV_GROW re-carve, or the arena must
+size its window the way §200 does. Prod posture in the meantime: the
+§203 shape, unchanged.
