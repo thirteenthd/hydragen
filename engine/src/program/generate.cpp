@@ -7378,6 +7378,9 @@ int main(int argc, char** argv) {
         return n;
     };
     std::vector<std::vector<std::unique_ptr<strata::core::SessionState>>> bslot_ss;
+    // KV-GROW (S4-v2 window recycling): the slot arenas `bslot_ss` carve, held so a detached slot can hand
+    // its arena back and an admitted slot's can be re-carved - see the sweep below.
+    std::vector<std::vector<void*>> bslot_arena;
     if (o.batch != 0) {
         const int cap = strata::kernels::kVerifyMaxT;
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
@@ -7425,6 +7428,7 @@ int main(int argc, char** argv) {
     }
     if (o.batch > 0) {
         bslot_ss.resize(1 + stages.size());
+        bslot_arena.resize(1 + stages.size());
         int fit = o.batch;   // the slots every stage could carve
         uint64_t bytes0 = 0;
         for (size_t k = 0; k < bslot_ss.size(); ++k) {
@@ -7449,6 +7453,7 @@ int main(int argc, char** argv) {
                     break;
                 }
                 strata::core::session_zero(*u, g, nullptr, nullptr);
+                bslot_arena[k].push_back(buf);
                 bslot_ss[k].push_back(std::move(u));
             }
             cudaDeviceSynchronize();
@@ -15572,7 +15577,71 @@ int main(int argc, char** argv) {
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
             return true;
         };
+        const int64_t slot_detach_ms = [] { const char* e = std::getenv("STRATA_SLOT_DETACH_MS");
+            return e != nullptr && e[0] != '\0' ? (int64_t) std::atoll(e) : 0; }();   // 0 (default): off, byte-identical
+        // KV-GROW (the S4-v2 window-recycling follow-up): an idle DETACHED slot can hand its whole session
+        // arena back - the batch-window graphs re-capture on demand (Verifier::capture_batch, keyed by the row
+        // layout) and the resident KV window is per QSA state (QsaState.n_slots) - and the slot re-carved at
+        // admission can then hold a bigger resident window than its detached siblings freed. The pay-off band
+        // is the long-turn anatomy (C4: 597 tok / 335 s at 98.3% expert hit: KV streaming-bound at window 20480
+        // over a 102k prompt). v1: single stage, no --batch-mtp / STRATA_PIPED_MTP (their per-slot drafters bake
+        // slot pools in their own graphs), no STRATA_ROPE_TABLE=1 (a freed session unregisters the device-wide
+        // rope table another session may still answer through), and it needs STRATA_SLOT_DETACH_MS > 0.
+        const bool kv_grow_want = [] { const char* e = std::getenv("STRATA_SLOT_KV_GROW"); return e != nullptr && e[0] == '1'; }();
+        const bool rope_tab_on = [] { const char* e = std::getenv("STRATA_ROPE_TABLE"); return e != nullptr && e[0] == '1'; }();
+        const bool kv_grow = kv_grow_want && slot_detach_ms > 0 && !batch_mtp && !piped_mtp &&
+                             bslot_ss.size() == 1 && !rope_tab_on && strata::core::qsa_kv_resident() > 0;
+        if (kv_grow_want && !kv_grow)
+            std::fprintf(stderr, "strata serve: conversation cache: STRATA_SLOT_KV_GROW is off: it needs "
+                                 "STRATA_SLOT_DETACH_MS, one stage, no --batch-mtp/STRATA_PIPED_MTP and no "
+                                 "STRATA_ROPE_TABLE\n");
+        const int64_t kv_resident0 = strata::core::qsa_kv_resident();
+        const int64_t lo0 = 0, hi0 = multi_gpu ? split_at[0] : (int64_t) -1;
+        const uint64_t slot_bytes0 = strata::core::session_bytes(g, o.max_context, K, lo0, hi0);
+        // Re-carve a freed slot's session, bigger where the budget allows: keep one ordinary session's bytes
+        // reserved for every OTHER freed slot (a later admission must find a home) plus a 64 MiB safety band,
+        // and try a doubled resident window first, falling back to the boot size. Returns false only when even
+        // the ordinary size fails to carve; the caller then treats the admission as it treats a failed copy.
+        auto ensure_slot_session = [&](int b) -> bool {
+            if (!kv_grow || bslot_arena[0][(size_t) b] != nullptr) return true;
+            int nfreed = 0;
+            for (void* q : bslot_arena[0]) nfreed += q == nullptr;
+            const strata::core::OnDevice on0(0);
+            const int64_t cands[2] = {kv_resident0 * 2, kv_resident0};
+            for (int64_t cand : cands) {
+                strata::core::qsa_set_kv_resident(cand);
+                size_t fb = 0, tb = 0;
+                cudaMemGetInfo(&fb, &tb);
+                const uint64_t reserve = (uint64_t) (nfreed - 1) * slot_bytes0 + (64ull << 20);
+                const uint64_t budget = cand == kv_resident0 ? fb : (fb > reserve ? fb - reserve : 0);
+                const uint64_t need = strata::core::session_bytes(g, o.max_context, K, lo0, hi0);
+                void* buf = nullptr;
+                if (need <= budget && cudaMalloc(&buf, need) == cudaSuccess) {
+                    strata::core::SessionState& su = *bslot_ss[0][(size_t) b];
+                    if (strata::core::session_init(g, o.max_context, K, buf, su, lo0, hi0) != 0) {
+                        strata::core::session_zero(su, g, nullptr, nullptr);
+                        bslot_arena[0][(size_t) b] = buf;
+                        ver.drop_batch_graphs();   // the row layouts holding this slot bake its OLD null pools
+                        strata::core::qsa_set_kv_resident(kv_resident0);
+                        std::fprintf(stderr, "strata serve: conversation cache: slot %d's session re-carved "
+                                             "(kv-resident %lld, %.2f GiB)\n", b, (long long) cand,
+                                             (double) need / 1073741824.0);
+                        return true;
+                    }
+                    if (buf != nullptr) cudaFree(buf);
+                    if (su.qsa_states != nullptr) delete[] su.qsa_states;
+                    su = strata::core::SessionState{};
+                    cudaGetLastError();
+                } else
+                    cudaGetLastError();
+                strata::core::qsa_set_kv_resident(kv_resident0);
+            }
+            std::fprintf(stderr, "strata serve: conversation cache: slot %d's session could not be re-carved\n", b);
+            return false;
+        };
+
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+            if (!ensure_slot_session(b)) { e = "batch admission: the slot's session could not be re-carved"; return false; }
             const int64_t upto = (int64_t) ids.size();
 #if defined(STRATA_GPU_METAL)
             // the running state and the K/V of the Metal window, not the session's device buffers
@@ -15780,8 +15849,6 @@ int main(int argc, char** argv) {
         // overwrite on its admission path.  The slot's resident KV window (bslot_ss, sized at boot; the captured
         // verify graphs hold its pointers) stays the slot's own - v1 detaches the conversation, not the bytes.
         // This is also the single ownership point where S2b's shared-head adoption and its refcounts will live.
-        const int64_t slot_detach_ms = [] { const char* e = std::getenv("STRATA_SLOT_DETACH_MS");
-            return e != nullptr && e[0] != '\0' ? (int64_t) std::atoll(e) : 0; }();   // 0 (default): off, byte-identical
         auto detach_slot = [&](int b) -> bool {
             BSlot& sl = bs[(size_t) b];
             if (!park_slot(b)) return false;   // the conversation must be safe in the parked tier first
@@ -15791,6 +15858,20 @@ int main(int argc, char** argv) {
             sl = BSlot{};
             std::fprintf(stderr, "strata serve: conversation cache: slot %d detached idle (%zu tokens to the parked tier)\n",
                          b, ndet);
+            if (kv_grow) {
+                ver.drop_batch_graphs();   // destroy the graphs that bake this slot's pools BEFORE freeing them
+                strata::core::SessionState& su = *bslot_ss[0][(size_t) b];
+                strata::core::session_release(su);
+                if (su.qsa_states != nullptr) delete[] su.qsa_states;
+                su = strata::core::SessionState{};
+                if (bslot_arena[0][(size_t) b] != nullptr) {
+                    const strata::core::OnDevice on0(0);
+                    cudaFree(bslot_arena[0][(size_t) b]);
+                    bslot_arena[0][(size_t) b] = nullptr;
+                    std::fprintf(stderr, "strata serve: conversation cache: slot %d detached idle: session arena "
+                                         "returned (%.2f GiB back)\n", b, (double) slot_bytes0 / 1073741824.0);
+                }
+            }
             return true;
         };
         // a sweep over the idle slots; run where a request just ended (the completion has been emitted, so the
@@ -18861,7 +18942,7 @@ int main(int argc, char** argv) {
                     std::vector<const CoReq*> used;
                     for (const CoReq& c : co_set) {
                         if (c.slot < 0 || c.slot >= (int) bs.size() || c.slot == admit_slot || bs[(size_t) c.slot].active ||
-                            bs[(size_t) c.slot].partial)
+                            bs[(size_t) c.slot].partial || (kv_grow && bslot_arena[0][(size_t) c.slot] == nullptr))
                             continue;
                         bool dup = false;
                         for (const CoReq* u : used) dup = dup || u->slot == c.slot;

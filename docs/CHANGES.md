@@ -1084,3 +1084,60 @@ full) re-ran on this commit's bytes - battery clean, the probe verdict identical
 byte-for-byte quoted numbers (82048 of 89544, 99.9864% cells shared), zero illegal-access
 lines, and the engine stayed healthy through the full 40-minute probe-env C4 (the harness
 timed out: the probe's per-prompt rounding costs real time; the engine itself was intact).
+
+
+## 200. S4-v2 follow-up KV-GROW: a detached slot hands its whole session arena back, and the re-carved slot at admission holds a bigger resident window
+
+`STRATA_SLOT_KV_GROW=1` (needs `STRATA_SLOT_DETACH_MS>0`, one stage, no
+`--batch-mtp`/`STRATA_PIPED_MTP`/`STRATA_ROPE_TABLE=1`): the §196 idle detach now
+destroys the batch-window graphs that baked the slot's pools
+(`Verifier::drop_batch_graphs`, new: destroy-then-free order, device quiet at both
+call sites), `cudaFree`s the slot's session arena, and the next admission re-carves
+it — doubled resident window first (kv-resident 20480 -> 40960), falling back to the
+boot size when the budget check (one ordinary session reserved for every other freed
+slot plus a 64 MiB band) does not pass. With the env unset the path is inert: off by
+default, byte-identical.
+
+Mechanism proven end-to-end on the node (ms01, `parallel: 4`, detach@15000 ms,
+measurement config): `slot 1 detached idle (31856 tokens to the parked tier)` ->
+`session arena returned (0.58 GiB back)` -> on re-admission
+`slot 1's session re-carved (kv-resident 40960, 0.83 GiB)`. At the shipped
+`--vram-reserve-mib 512` the budget check declines the doubled candidate and the
+fallback carve takes boot size - the safety band working as designed. The grown
+carve was funded by raising the reserve to 1536 MiB: expert cache drops to 914
+slots and S-wave prefill walls go 47-49 s -> 89-109 s. That is the honest economy
+on a 12 GB card: the grown window competes with the expert cache and must be paid
+for; the bytes for the grown carve are 0.83 GiB vs 0.58 boot.
+
+Payoff at bench shape is parity, not speed-up: 800-token decode on a 32k
+conversation measured 5.1 s on the grown 40960 slot vs 4.8 s on the boot-window
+slot (11.6k streamed tokens cost ~6 ms per decode token at `--pcie-frac 0.5` -
+nothing to win at this size). The stall class this aims (0.56 s/token at 102k,
+§199 addendum) needs a window that covers the prompt, not one that merely doubles;
+what KV-GROW delivers today is optionality with measured cost: idle slots return
+their memory, and the next carve sizes to the budget the moment it exists.
+
+No-regression evidence (all on these bytes): the two-arm A/B came green both ways
+(battery, C4 harness, 8x96k churn - churn walls 46.5-46.7 s both arms,
+restore_qc_fail=0), boot park-disk test 62/62, ctest park/session/conversation/
+file/buffer subset rc=0. The rebuild from these sources reproduced the build5
+binary byte-for-byte (579bdd02...), so build6/build7's §199 control comparison
+(`b6ec8844...`) applies to the source pair directly.
+
+Watch-item, blame-isolated: an intermittent engine-death class (`the engine
+reported an error:` with an empty message, engine down, clients get 503) hits BOTH
+these bytes and the §199 control bytes under the measurement config - it is NOT
+introduced here. Same family as the `qsa_prompt_attn_batch (v3)` watch-item retired
+unreproduced in the §199 addendum, now with a repro family: two mid-size bench
+runs in one boot where the second restores parked-tier conversations (crashes at
+the next admission ~every time), once even on a cold first run. Suspected fuel:
+stale cross-boot park-disk session files (a 2.67 GiB park restored at every boot);
+carried forward with that offload as the test lever.
+
+Null-test laws learned the expensive way (all three walls were benches, not code):
+slot machinery never sees serial solo arrivals (main-session path, no caching);
+the detach sweep only wins when donors sit in slots the traffic never touches
+(`parallel >= 4` geometry); and the parked tier's own budget (`--conversation-
+cache-mib`) plus the RAM admission floor (`--conversation-cache-min-free-mib`,
+8192 on this box is a B=8-era leftover that refuses every detach park at 2.5 GiB
+per park) both gate parking before the sweep ever runs.

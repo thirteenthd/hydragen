@@ -4012,6 +4012,14 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     return true;
 }
 
+void Verifier::drop_batch_graphs() {
+    for (auto* m : {&exec_bm_, &commit_bm_, &save_bm_, &dcommit_bm_}) {
+        for (auto& kv : *m)
+            if (kv.second) cudaGraphExecDestroy(kv.second);
+        m->clear();
+    }
+}
+
 bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err) {
     cudaGraphExec_t& ex = exec_bm_[bkey(rows, S, hbase)];
     if (ex != nullptr) return true;
