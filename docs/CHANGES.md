@@ -1579,3 +1579,30 @@ Supervisor gap on bazzite: the container stayed `Up` for 3 days with no
 engine child and an empty `/v1/models` - nothing on the host asked for
 the model, and unlike ms01's supervisor there was no lazy (re)load on
 first request. `podman restart` restored service (~80 s to loaded).
+
+## 210 - mech-arm concurrency scaling curve (ms01, C1-C8)
+
+First proper scaling curve on the mech arm (961dc490, ctx 131072, B=4,
+detach 15000 ms, tail-skip 0), farm shape identical to bazzite's §209
+ladder: every stream sends the same 22.5k-token conversation (25x
+runbook preamble + 900 incident-note lines), 800-token decode, QC =
+prime list 211/223/887 present - all levels passed.
+
+Cold ladder (fresh conversation per level), aggregate tok/s:
+C1 28.2 (per-stream decode 70.9) | C2 49.9 (1.77x, decode 54) |
+C4 70.4 (2.50x, decode 34-38) | C8 98.0 (3.48x, decode 34-39).
+Warm C8 (same conversation, primed by the ladder): **142.4 tok/s**
+(5.05x over cold C1, 1.45x over cold C8) with per-stream decode
+unchanged at ~36-39.
+
+- Aggregate keeps climbing to C8; per-stream decode halves by C2 then
+  holds ~35 tok/s all the way to C8 - streams queue and share rather
+  than starve each other.
+- MemAvailable dropped 4 -> 2 GiB at C4 and stayed there; no refused
+  requests, no restarts, no restore failures - park/detach absorbed it.
+- draft_n_accepted=0 reported at every stream of every level; open
+  question whether the mech arm reports that counter at all (the same
+  streams' decode rates look draft-driven).
+- Context: 24 GB prod fanouts ran 47.9 tok/s @C2 / 107.8 @C4 (§206
+  era); a 12 GB mech-arm box now sits at 98 @C8 - within 10% of the
+  24 GB box's C4 ceiling on 4x the stream count.
