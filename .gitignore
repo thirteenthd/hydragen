@@ -4,6 +4,7 @@ logs/
 .venv/
 dist/
 models/
+!engine/third_party/strata-llama/tools/mtmd/models/
 expert-profile-learned-*.bin
 hydragen-local.json
 hydragen-local.json.*

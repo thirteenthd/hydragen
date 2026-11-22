@@ -1506,3 +1506,16 @@ Prod posture unchanged: the §203 shape stays live; a cow re-arm needs a
 Windows build of this tree first, and the sizing clamp above is what will
 either fit the arena on 24 GB or say so at boot instead of bleeding expert
 cache slots silently.
+
+## 207 — Sync repair: the vision build's models/ sources had never left the §181 worktree
+
+A clean-clone vision build fails at CMake generate: the tracked
+`third_party/strata-llama/tools/mtmd/CMakeLists.txt` names 45 `models/`
+sources, but `.gitignore` line 6 (`models/`, meant for local model dirs)
+swallowed that upstream directory out of the §181 sync commit. They
+survived untracked in the original sync worktree — so every build to date
+passed while the public repo silently could not. Restored from the
+`C:/DevOps/hydragen-sync180` clone (all 45 md5-verified), added a
+negation rule for that exact path, and committed the sources (8,400
+lines). No engine behavior change; this is what unblocks the pb4
+(068a7cf6) Windows build.
