@@ -1519,3 +1519,27 @@ passed while the public repo silently could not. Restored from the
 negation rule for that exact path, and committed the sources (8,400
 lines). No engine behavior change; this is what unblocks the pb4
 (068a7cf6) Windows build.
+
+## 208 - the models/ ignore swallowed a second tree: src/models/
+
+The 207 fix found one casualty of the root .gitignore `models/` rule; the
+pb4 rebuild found the second. Upstream llama keeps its per-model builders
+in `third_party/strata-llama/src/models/` (155 .cpp + models.h, pulled in
+by `file(GLOB)` at src/CMakeLists.txt:9), and `llama-model.cpp:23` includes
+`models/models.h` directly. Both facts invisible to git: check-ignore maps
+the path to the same line 6.
+
+Symptom on pb4 attempt 2: the fresh vision configure succeeded (207
+sources back), then ninja died at `llama-model.cpp(23): fatal error
+C1083: Cannot open include file: 'models/models.h'` - and worse, the GLOB
+had silently contributed zero model sources to every prior full-tree
+configure on a clean worktree, which would have link-failed even with the
+header present. Old worktrees kept building only because the files
+survived untracked on disk.
+
+Restored all 156 files from the sync clone (C:/DevOps/hydragen-sync180,
+the only surviving copy on either machine - modelserver01's clone lacks
+them too; its build-s180 is another stale-worktree survivor), added the
+scoped negation, committed. 157 files, +41,344 lines. Vision dirs must be
+fully reconfigured, not ninja-resumed: the GLOB ran empty at their
+configure time.
