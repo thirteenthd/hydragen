@@ -1543,3 +1543,39 @@ them too; its build-s180 is another stale-worktree survivor), added the
 scoped negation, committed. 157 files, +41,344 lines. Vision dirs must be
 fully reconfigured, not ninja-resumed: the GLOB ran empty at their
 configure time.
+
+## 209 - second benchmark node (bazzite.chung.lan) + battery numbers; park-restore crash loop
+
+Benchmark node roster is now two 12 GB cards. bazzite.chung.lan runs the
+engine in a podman quadlet (`hydragen-server`, host port 8080, RTX 3060
+12288 MiB); its bench scripts were written for ms01's `:8181` and needed
+only a URL rewrite. Numbers below are same-battery, per-node - not
+directly comparable across builds (bazzite runs the 181-era container
+build; ms01 runs 961dc490).
+
+ms01 mech arm (961dc490, ctx 131072, B=4, detach 15000 ms, tail-skip 0):
+single 7,828-token probe 3.8 s; four-way 45k fan (cold) 41.7-54.4 s per
+stream; tail-shape fan 46.9-47.5 s (ttft 44.7-45.7); after the detach
+fired, a re-carve probe on a parked conversation answered in 0.4 s. The
+same fan warm: 1.8-5.0 s (~10x). Staggered fan 5k-20k: 5.3-8.2 s.
+Concurrency=2 (128-token streams): aggregate 56.5 tok/s cold, 78.3 tok/s
+warm; per-stream decode 34.2-45.1 tok/s.
+
+bazzite (RTX 3060): quality battery 8/8; park ladder cold prime 88.1 s,
+warm primes 28.2 s, restores 0.4-24.5 s, restore_qc_fail=0; fan ladder
+C1-C4 aggregate 15.0 -> 38.8 tok/s (2.6x on 4 streams), per-stream
+decode 42.5-48.8 with one suffix-draft winner near 97-99 tok/s per
+round.
+
+Incident on ms01 (worth a fix): the engine died once mid-battery (cause
+unnamed), and every supervisor restart then crash-looped at boot - the
+log repeated `the engine exited (code 1) after it reported: restoring a
+conversation checkpoint failed - please report` while RAM was idle at 4/60
+GiB used. Renaming the park-disk store out of the way cleared the loop
+and the engine booted clean in ~10 s. A single unreadable checkpoint
+entry should be skipped (or quarantined), not fatal at restore.
+
+Supervisor gap on bazzite: the container stayed `Up` for 3 days with no
+engine child and an empty `/v1/models` - nothing on the host asked for
+the model, and unlike ms01's supervisor there was no lazy (re)load on
+first request. `podman restart` restored service (~80 s to loaded).
