@@ -1323,3 +1323,73 @@ fingerprint is recorded, not taken.
 
 prod stays on prebuilt-3 with `STRATA_SLOT_DETACH_MS=15000` and
 `STRATA_SLOT_KV_GROW=1`.
+
+## 204. The S8 arm: the CoW stack fires on a shared head for the first time, and a warm fan-out decode escapes the dilution law
+
+The fan-out bench (§201, `m25_fanout3.py`: one ~90k shared head, C=4 workers
+with unique ~3k tails) ran for the first time with the cow-m1 stack armed —
+`STRATA_COW_ARENA=1`, `COW_ARENA_SLOTS`/`COW_SLOT_CELLS`, `COW_FORK=1`, and
+the one knob that had never been switched on before, `COW_JOIN_HH=8`
+(join-at-fetch OFF by default, which is why every §198/W1r log read
+`joins: 0`). ms01, engine `f60d86e67d54fc142440dabbb894c273` (§202 bytes;
+the stack ships inside them), config copy `...-s180-s8.json`, restart via
+`s8_restart.sh`. Staging caught that the live process's
+`--kv-resident/--batch` came from a boot-era config that no longer listed
+them; the arm states them explicitly.
+
+Arm 2, the W1r-proven small shape (`--kv-resident 4096`, arena
+9216 x 12, SLOT_CELLS 4096):
+
+    cow: K/V arenas: 12 QSA layers x 9216 slots (0 shared region) = 0.44 GiB (INT8 streamed)
+    strata generate: expert cache 2355 slots, 3.77 GiB of VRAM
+
+0.44 GiB of arena replaces the private 20480-cell windows of the fanf basis
+boot: the expert cache grows from **1375 to 2355 slots** before a request
+runs. Fan pass 1: fork/join telemetry non-zero for the first time in the
+stack's existence:
+
+    cow: the admission fork points at 1023 of 28927 prefix pages per K/V layer (upto 115705 cells)
+    cow: joins-at-fetch served so far: 0 -> 9 -> 24
+    strata serve: conversation cache: borrowed 28672 tokens from a parked conversation,
+      which stays parked, in 162.3 ms; parked=7 ... borrowed=2
+
+(1023 pages x 4 = 4092 cells = the whole 4096-cell window: the fork covers
+the worker's entire resident window; the head's rest streams.) Walls: W0
+solo cold 63.0 s, workers 79.9-81.1 s — level with the fanf basis
+(74.6-78.4 s; the forced 2,300-token decode dominates). Needle battery
+**3/3 at every depth ms01's 131,072 context admits** (18,995/46,993/96,994;
+the fourth depth returns the context-cap 400, as it must), before and after
+the fan passes.
+
+Arm 3, the prod mirror (`--kv-resident 8192`, SLOT_CELLS 8192, arena 18432,
+plus `STRATA_SLOT_DETACH_MS=15000` + `STRATA_SLOT_KV_GROW=1`): arena
+`12 x 18432 = 0.87 GiB`, expert cache **2070 slots**; the detach/grow
+posture coexists — no geometry refusal, no `could not be re-carved`, arena
+sessions produced no re-carve lines at all. Forks track the window: the
+fresh head conversation forks **2047 pages** (= the 8192 window). Cold pass
+68.0 / 75.9-77.0 s (basis-familiar); joins 0 -> 80 across the two passes.
+
+The payoff line, arm 3's warm pass, a worker completing the full 2,300-token
+forced decode:
+
+    [strata] done: 2300 tokens in 21 s (139.6 tok/s) ..., expert cache 97.2% hit (+1.8% of the routed experts over PCIe)
+    [strata] done: 2300 tokens in 24 s (101.1 tok/s) ..., expert cache 97.6% hit (+1.6% ...)
+
+Fan-window decode hit rates: cold 74.8/80.1 %, warm **97.2/97.6 %** — the
+§201 dilution signature (63-76 % under streams) does not apply to a warm
+shared-head fan-out once the head's experts stop being paid for N times.
+§203's law survives as written for COLD traffic (the cold pass walls are
+basis-level) and breaks for WARM fan-out exactly where S8 aimed.
+
+Not claimed: prod has not run the cow arm (§203's prod posture stays); the
+ms01 head parks measured 4.37 GB, over prod's 6144 MiB park budget, so the
+prod arm needs the budget raised before borrow can fund the head; join
+totals are modest (80 across two passes) and `lineage shared fetches: 0`
+stays zero — the cow-m1e shared region is not armed; arm-3 fan-4's
+7.9-21.3 s walls for qc=True workers are the warm shortcut (direct answer,
+not the 2,300-token repetition path) and are excluded from wall evidence;
+needle depth 4 on ms01 is unreachable at 131k, its 4/4 baseline remains
+prod's (section 203).
+
+Next: the prod arm — cow env + park-budget raise onto `hydragen-local.json`
+(128 GiB host RAM funds it), restart on the host's hand.
