@@ -1141,3 +1141,58 @@ the detach sweep only wins when donors sit in slots the traffic never touches
 cache-mib`) plus the RAM admission floor (`--conversation-cache-min-free-mib`,
 8192 on this box is a B=8-era leftover that refuses every detach park at 2.5 GiB
 per park) both gate parking before the sweep ever runs.
+
+
+## 201. Fan-out measurement: shared-head concurrency on shipped bytes - the sharing already works, and where the ceiling actually is
+
+Shape (ms01, 3080 Ti, shipped canonical config: `--batch 4 --kv-resident 20480`,
+131k context, conversation cache 16 GiB / min-free 2 GiB, tail skip off): one
+115,687-token shared head ("runbook"), then C worker conversations that start
+with the head and add ~3k unique tokens. Forced 2,300-token decodes (repetition
+task) for the long-occupancy arms; 200-token answers for the admission arms.
+Five arms: fana C=4 short decode, fanb C=8 short decode, fand/fanf C=4 forced
+decode (differing only in whether the bare head also sits in the conversation
+cache), fane C=2 warm steady-state, fang C=2 cold solo-then-solo. No engine
+code involved: these bytes are §200 build8, `STRATA_SLOT_DETACH_MS`/`GROW`
+unset (inert), engine-error 0 and cancelled 0 across the clean arms.
+
+Admission sharing already works without any new layer. Each worker's first read
+line: `108288 of 115687 tokens` reused for the head at ~1,000-1,500 tok/s
+(~5-7 s), and the worker parks carry 97% COW-anchored bytes
+(`reused_kv_bytes` against 5.0 GiB park bodies). At C=8 on 4 slots with short
+decodes: all 8 workers land in two waves, walls 15.6-65.7 s, `no room beside`
+0, `skip parking` 0, `evicted` 0. The vLLM/SGLang-style prefix effect the
+milestone list was chasing is already delivered by the fork's COW prefix reuse
+at this shape - no forkb4-style block machinery is needed.
+
+Capacity law (measured, fand vs fanf): with long decodes, cached conversations
+must fit the slots. fand cached the bare head as its own conversation: 5
+conversations vs 4 slots, every admission gave way to another worker's
+conversation, walls 86-87 s behind retry loops (`0 generated ... (cancelled)`
++ `1 generated in ~16 ms` summaries). fanf is the same traffic with the head
+living only inside worker 0's conversation: 4 = 4 slots, walls 74.6-78.4 s,
+all length-capped, `cancel=False` on every done line. The §199 watch-item's
+give-way preemption signature was caught live here for the first time, and it
+is geometry overshoot, not a bug. Client/farm rule: never keep the bare head
+cached once workers hold it as prefix.
+
+Decode ceiling: aggregate is flat at ~100-120 tok/s from two streams up, and
+the tax is expert-cache dilution, not KV streaming. One stream at the same
+115k context: `done: 2300 tokens in 75 s (142.0 tok/s), expert cache 96.1%
+hit`; a second solo stream `160.5 tok/s, 96.6% hit`. Three streams together:
+33.4/37.1/41.8 tok/s, hit 63-76% (~20% of routed experts streaming over PCIe
+per step vs 2.8% solo). Two streams warm measured ~50 tok/s each. The shared
+head does not mean shared decode experts: prefill experts are shared, but
+each stream's generated tokens route its decode steps to different experts,
+so the union of working sets exceeds the arena and the LRU thrashes
+super-linearly. On a 12 GB card this is a hard ceiling that added VRAM
+headroom does not lift by capacity alone - it is why the expert cache sizing
+and per-slot windows compete, and why the same measurement on a 24 GB card
+(arena 6,662 slots per the §S2 prod rule) is the open question, not the
+local one.
+
+Bench arithmetic kept honest: qc flags read the final marker line, which the
+2,300-token cap truncates on the repetition arms (repetition of 320 lines is
+~1,920+ tokens before the marker) - the false `qc=False` on fand/fanf/fane/
+fang rows is the harness, not generation quality; all four arms hit the token
+cap cleanly.
