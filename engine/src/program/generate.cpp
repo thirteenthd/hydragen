@@ -16041,7 +16041,7 @@ int main(int argc, char** argv) {
             }
             const Clock::time_point w0 = Clock::now();
             if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
-                std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
+                std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : (err.empty() ? "a batch window failed without a reason" : err.c_str()));
                 return false;
             }
             const Clock::time_point w1 = Clock::now();
@@ -19726,7 +19726,8 @@ int main(int argc, char** argv) {
                 }
                 if (!sp_ok) {
                     if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
-                        std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                                            if (err.empty()) err = "a batch window died without a reason (no CUDA fault sticky)";
+                                            std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
                         // #224: a CUDA fault (an illegal address) poisons the context for the whole process, and
                         // unwinding the destructors on it could hang until the 60 s watchdog: leave at once
@@ -20958,7 +20959,7 @@ int main(int argc, char** argv) {
                 exit_if_gpu_fatal("");   // (the test hook counts windows here)
                 if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     exit_if_gpu_fatal(drive.d.failed && drive.d.fail ? drive.d.fail : err);
-                    std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
+                    std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : (err.empty() ? "a batch window failed without a reason" : err.c_str()));
                     return 1;
                 }
                 if (aflipped) apply_pending(true);   // 0.1.43: every layer's copies were waited for in the window; the bookkeeping now

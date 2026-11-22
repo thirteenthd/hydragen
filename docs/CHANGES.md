@@ -1196,3 +1196,62 @@ Bench arithmetic kept honest: qc flags read the final marker line, which the
 ~1,920+ tokens before the marker) - the false `qc=False` on fand/fanf/fane/
 fang rows is the harness, not generation quality; all four arms hit the token
 cap cleanly.
+
+
+## 202. Naming the silent batch-window death: the crash-class forensics protocol, what it caught, and what it refused to show
+
+Class. The ms01 cumulative serve log carries 14 deaths of one signature: the
+supervisor reports `the engine reported an error:` with an EMPTY message, the
+engine exits 1, and clients get 503/400 mid-request. Ten of the eleven scenes
+end on the same last engine line, `park COW anchor mounted for N of M tokens`,
+with N/M ranging 8/459 to 31604/31614 to 9/120595 - size-independent. The class
+is byte-agnostic: §199 control bytes die it on the same geometry (blame
+isolation by hash-matched rebuild), and emptying the park-disk files before the
+boot does not prevent it, so stale cross-boot park state is not the fuel. The
+deaths cluster while the host's MemAvailable sits near or below the 2 GiB RAM
+admission floor with the parked tier fully loaded.
+
+The quoted last line is an artifact. The engine's own empty stderr line
+(`strata serve: ` + newline, printed by the fail-fast just before exiting)
+shifts the supervisor's last-log-line quote past the park line. The park-COW
+mount is where the scene stands, not where the crime happened.
+
+The channel. The death path is the prompt-read fail-fast (#224 gate): after a
+batch window fails with `batch_fatal` set, `err` is empty: it prints the empty
+ERR, `cudaPeekAtLastError()` is `cudaSuccess` (the #224b named-sticky line has
+never appeared in any death scene), and the engine returns 1.
+
+What the instruments showed. Eleven cold-path labels at the suspected silent
+sites (`Verifier::run_slot_rows`: pre_launch, stage_batch, chain end,
+sample_rows; plus the window/commit/prompt-read ERR sites): the class died with
+them live and NONE fired. An at-exit probe (execinfo backtrace + sticky naming,
+registered at namespace scope so any `exit()` prints the stack) went live across
+four boots and twelve bench pairs: it never printed - those boots never died.
+Tally: control bytes died on 5 boots, clean on 1; the labels-only build died
+once (labels silent); every boot carrying the at-exit probe - labels or not -
+survived the repro geometry (0 deaths in 4 boots). One control boot with
+`STRATA_PF_STEP_SYNC=1` reproduced twice back to back; re-runs of that shape
+then stayed clean. The class flees observation: state-dependent race on the
+park/restore path, not deterministic logic. (`CUDA_LAUNCH_BLOCKING=1` is
+self-poisoning on this engine - issue #1341: the verify windows cannot run with
+blocking launches, and the 60 s no-progress watchdog SIGABRTs the boot; the
+supported narrowing switch is `STRATA_PF_STEP_SYNC=1`.)
+
+The change (shipped; the root cause stays open). Three failure-path-only
+backfills convert every silent window death into a named one: the #224
+prompt-read fail-fast backfills `err` with `a batch window died without a
+reason (no CUDA fault sticky)` before printing, and the two batch-window ERR
+sites print `a batch window failed without a reason` when `err` is empty. No
+hot-path cost: each edit sits on a path that was already printing ERR and
+unwinding. The #224 sticky `_Exit` branch is untouched, so a true CUDA-context
+fault still names itself and leaves at once. The next occurrence in the field
+logs a named line instead of an empty one, and the supervisor restarts on a
+named event. These bytes ran the geometry that killed the pre-§202 build with
+zero deaths on ms01 - stated without softening: the fix is verified by
+construction and by green boots, not by re-triggering a named death locally.
+
+Next-occurrence protocol. If a named line appears anywhere: the two site
+strings separate the channels (prompt-read fail-fast vs batch-window loop), and
+the scene (park state, admission refusals, MemAvailable) discriminates among the
+surviving hypotheses. Labels never fire, so per-site instrumentation is retired
+for this class: any future arm starts from the at-exit probe.
