@@ -1937,4 +1937,52 @@ Landing: patch on the canonical `m-d-conc` tree and on the ms01 arm tree
 (`conversation_buffer.hpp`, `conversation_snapshot.cpp`, `generate.cpp`;
 originals `.bak-md2`); `build-s180` rebuilt; the live b4 mech restarted on
 it (:8181, one completion smoke, clean). This unblocks the §216 fund A/B:
-the queue-vs-fund arm can finally measure without mid-leg deaths.
+the queue-vs-fund arm can finally measure without mid-leg deaths (verdict at §218: the funder is structurally unreachable on 12 GB geometries; the serve queue is the sole absorber).
+### §218. Fund-vs-queue reachability audit: the five-grid null chain (v8-v12), and the rung-preset finding (2026-11-23)
+
+The §216 fund A/B ran to five arms on ms01 (all batch-4 mech-config, same
+battery, `STRATA_PAR_COUNTERS=1`, minutes apart; every arm `boots=1, deaths=0,
+silenterr=0` - the §217 guard fired 1-2x per battery and kept all seven legs whole
+in every arm):
+
+- v8 (rung 8192, SLOT_CELLS 16384, FLOOR 4096): both arms `grown=0 funded=0`;
+  the pair identical within noise (farm C4-warm agg 78.7 vs 78.6; both boot at
+  cache 2586 slots).
+- v9: the rung-16384 edit no-oped - the grid script regenerates cell JSONs from
+  the mech base at run time and clobbered the hand-written config; v9 re-measured
+  v8 and matched to the decimal. Ops law: edit the script's embedded generator,
+  and verify by the ENGINE BOOT LINES, never by the JSON on disk.
+- v10 (rung 16384, FLOOR 1024): boots print `arena floor: 4096` - the floor
+  clamps up to the first-admission window (layer.cpp:1377, "never starve the
+  first admission"). `grown=0` again.
+- v11 (rung 4096, FLOOR 1024 sticks, FUND=1): windows are 4096 cells against
+  19-21k-token streams (everything past the rung lives in the CPU/park tiers);
+  still `grown=0 funded=0`, all legs whole.
+- v12 (v12 = v11 with FUND off): the clean pair - cache boots IDENTICAL at
+  2970 slots / 4.84 GiB (the VMM boot tax is zero at this sizing, unlike the
+  b8 shape's 3628->1758), last hit-rate legs 98.9% vs 98.6%, decode within
+  noise (farm C4-warm agg 79.7 vs 80.5; worst C2 55.5 vs 55.9; nat C4 tail
+  54.9 vs 54.8).
+
+Verdict: the stage-C funder is STRUCTURALLY UNREACHABLE on 12 GB mech geometries.
+Three walls, each verified from source and boot lines: (a) arena demand is pinned
+by the `--kv-resident` rung - long conversations park past the window instead of
+growing it, so windows never exceed their reservation; (b) `STRATA_COW_ARENA_FLOOR`
+clamps up to the first window, so a small floor cannot buy grow pressure; (c) the
+stage-B unattached reservation (2.06-2.16 GiB at b4) exceeds the whole arena
+region (1.74 GiB at 36864 slots x 12 layers) - boot pre-funds every batch
+window. The transient `no room` + the serve-side queue (§165) is therefore the
+only absorber in this hardware class: §216's economics resolves to the queue
+half BY CONSTRUCTION, not by measurement of a contested grow. The funder stays
+opt-in for geometries where windows outgrow their reservation (no-rung windows,
+or attach-prefetch beyond batch - the 12-stream b8 smoke's 12 grows all paid
+from reservation draw, 0 funded).
+
+Rung-preset finding (feeds the P2-D calibration stage): rung 4096 BEAT rung 8192
+on every leg while handing the expert cache +384 slots (2970 vs 2586): farm
+C4-warm agg 80.5 vs 78.7, worst C2 agg 55.9 vs 52.4, nat C4 tail 54.8 vs 53.0,
+hit-rate legs >=98.6%. For 21k-token working sets, halving the resident window
+costs nothing and returns ~1 GiB to the cache.
+
+Artifacts: ms01 `grid-results-v{8,9,10,11,12}-*`, `logs/v{8,9,10,11,12}-b4_*.log`,
+scripts `~/s8_tune_grid_v{8..12}.sh`.
