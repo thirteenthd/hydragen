@@ -632,7 +632,10 @@ int64_t g_cow_slot_cells = 0;
 int64_t g_cow_join_hh = 0;               // cow-m1d: per-range join headroom; 0 = join-at-fetch OFF (forkb4 behavior)
 namespace {
 struct CowArena { int8_t* k = nullptr; int8_t* v = nullptr; uint16_t* ks = nullptr; uint16_t* vs = nullptr; int* use = nullptr; unsigned long long* jctr = nullptr;   // cow-m1d: jctr = joins-at-fetch counter (telemetry)
-                    int32_t* lin = nullptr; int32_t* sblk = nullptr; int32_t* sst = nullptr; int32_t* srf = nullptr; unsigned long long* sctr = nullptr; };   // cow-m1e: hint tables, region clock, fetch counter
+                    int32_t* lin = nullptr; int32_t* sblk = nullptr; int32_t* sst = nullptr; int32_t* srf = nullptr; unsigned long long* sctr = nullptr; 
+    std::unique_ptr<strata::core::VmmRange> vr;   // (dyn-conc P2) one address range per arena; the pointers above point into it
+    int64_t off[11] = {0};              // (dyn-conc P2) chunk-aligned array offsets inside *vr
+};   // cow-m1e: hint tables, region clock, fetch counter
 std::vector<CowArena> g_cow_arenas;
 int64_t g_cow_session_ctr = -1;
 std::vector<int64_t> g_cow_next;   // (S8-v2) per-ordinal bump high-water
@@ -802,10 +805,27 @@ int64_t qsa_kv_resident_min() {
 }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
+int64_t g_cow_mapped_slots = 0;   // (dyn-conc P2) window slots mapped in every arena: the admission capacity
+int64_t g_cow_slot_b[5] = {0};    // (dyn-conc P2) per-slot bytes of the window arrays: k, v, ks, vs, use
+// (dyn-conc P2 stage B) the window follows the streams actually attached: grow at admission, trim on detach.
+bool g_cow_elastic = false;        // STRATA_COW_ARENA_ELASTIC
+int64_t g_cow_floor_slots = 0;     // the boot floor: a trim never maps less than this
+int64_t g_cow_bank_mib = 0;        // STRATA_COW_ARENA_BANK_MIB: cap on parked chunks (0: no cap)
+int64_t g_cow_min_free_mib = 512;  // STRATA_COW_ARENA_MIN_FREE_MIB: an elastic grow stops above this line
+int64_t g_cow_declines = 0;        // grows the line refused
+int64_t g_cow_budget_bytes = 0;    // (dyn-conc P2 stage B) the deferred sessions' reservation, priced at cache sizing
+int64_t g_cow_budget_spent = 0;    // ... of which already spent on attached sessions
+bool g_cow_trim_debug = false;     // STRATA_COW_ARENA_TRIM_DEBUG: say why a trim had nothing to give back
+int64_t g_cow_trim_calls = 0;      // trims attempted (a detach asked)
+std::vector<strata::core::VmmChunk> g_cow_bank;   // chunks a shrink parked, waiting for the next grow
+int64_t g_cow_bank_out = 0, g_cow_grows = 0, g_cow_shrinks = 0;   // telemetry
+
 void qsa_set_cow_arena(int64_t slots_per_layer) {   // cow-m1 (extern scope; the globals are file-local)
     g_cow_arena = slots_per_layer > 0;
     g_cow_arena_slots = slots_per_layer;
-    g_cow_next.clear(); g_cow_free.clear(); g_cow_zombie.clear(); g_cow_arena_gaps = 0;   // (S8-v2) a fresh arena starts with a fresh map
+    g_cow_next.clear(); g_cow_free.clear(); g_cow_zombie.clear(); g_cow_arena_gaps = 0; g_cow_mapped_slots = 0;   // (S8-v2) a fresh arena starts with a fresh map
+    for (const strata::core::VmmChunk h : g_cow_bank) strata::core::vmm_chunk_free(h);   // (P2-B) and with an empty bank
+    g_cow_bank.clear(); g_cow_floor_slots = 0;
 }
 void qsa_cow_session_begin() { ++g_cow_session_ctr; }
 void qsa_set_cow_slot_cells(int64_t cells) { g_cow_slot_cells = cells > 0 ? cells : 0; }
@@ -969,6 +989,213 @@ void qsa_cow_state_release(QsaState& st) {   // S8-v2: a session ending releases
         } else ++r;
 }
 
+// ---- (dyn-conc P2) elastic arena windows: physical slots move between the arenas and the
+// expert-cache pool at runtime, quiesced like the elastic K/V.  All arenas grow/shrink together;
+// capacity is tracked in window slots.  Window arrays map chunk-aligned over their array regions;
+// the tail (join counter, shared region) stays mapped.  A shrink must not touch chunks a live or
+// zombie range still names: it refuses when any cursor or zombie tail reaches past the target.
+static bool cow_arena_live_past(int64_t slots) {
+    for (size_t o = 0; o < g_cow_next.size(); ++o) {
+        if (g_cow_next[o] > slots) return true;
+        for (const CowRange& r : g_cow_zombie[o])
+            if (r.base + r.n > slots) return true;
+    }
+    return false;
+}
+int64_t qsa_cow_arena_need(int64_t slots) {
+    if (!g_cow_arena || slots <= g_cow_mapped_slots || slots > g_cow_arena_slots) return 0;
+    const uint64_t G = strata::core::vmm_granularity();
+    int64_t n = 0;
+    for (int arr = 0; arr < 5; ++arr) {
+        const int64_t have = (int64_t) (((uint64_t) g_cow_slot_b[arr] * (uint64_t) g_cow_mapped_slots + G - 1) / G);
+        const int64_t want = (int64_t) (((uint64_t) g_cow_slot_b[arr] * (uint64_t) slots + G - 1) / G);
+        if (want > have) n += (want - have) * (int64_t) g_cow_arenas.size();
+    }
+    return n;
+}
+bool qsa_cow_arena_grow(int64_t slots, const std::function<strata::core::VmmChunk()>& take) {
+    if (!g_cow_arena || slots > g_cow_arena_slots) return false;
+    if (slots <= g_cow_mapped_slots) return true;
+    const uint64_t G = strata::core::vmm_granularity();
+    const int64_t from = g_cow_mapped_slots;
+    bool ok = true;
+    for (size_t j = 0; j < g_cow_arenas.size() && ok; ++j) {
+        CowArena& a = g_cow_arenas[j];
+        if (!a.vr) { ok = false; break; }
+        for (int arr = 0; arr < 5 && ok; ++arr) {
+            const int64_t c0 = a.off[arr] / (int64_t) G + (int64_t) (((uint64_t) g_cow_slot_b[arr] * (uint64_t) from + G - 1) / G);
+            const int64_t c1 = a.off[arr] / (int64_t) G + (int64_t) (((uint64_t) g_cow_slot_b[arr] * (uint64_t) slots + G - 1) / G);
+            for (int64_t c = c0; c < c1 && ok; ++c) {
+                if (a.vr->mapped(c)) continue;
+                const strata::core::VmmChunk h = take();
+                // (P2) chunk-by-chunk so a supplied handle can be released when its map fails
+                if (!a.vr->map_range(c, c + 1, [h] { return h; })) { ok = false; break; }
+            }
+        }
+    }
+    cudaDeviceSynchronize();
+    if (ok) g_cow_mapped_slots = slots;
+    return ok;
+}
+int64_t qsa_cow_arena_shrink(int64_t slots, const std::function<void(strata::core::VmmChunk)>& give) {
+    if (!g_cow_arena || slots < 0 || slots >= g_cow_mapped_slots || cow_arena_live_past(slots)) return 0;
+    const uint64_t G = strata::core::vmm_granularity();
+    int64_t freed = 0;
+    for (size_t j = 0; j < g_cow_arenas.size(); ++j) {
+        CowArena& a = g_cow_arenas[j];
+        if (!a.vr) return 0;
+        for (int arr = 0; arr < 5; ++arr) {
+            const int64_t c0 = a.off[arr] / (int64_t) G + (int64_t) (((uint64_t) g_cow_slot_b[arr] * (uint64_t) slots + G - 1) / G);
+            const int64_t c1 = a.off[arr] / (int64_t) G + (int64_t) (((uint64_t) g_cow_slot_b[arr] * (uint64_t) g_cow_mapped_slots + G - 1) / G);
+            for (int64_t c = c0; c < c1; ++c)
+                if (const strata::core::VmmChunk h = a.vr->unmap(c)) { give(h); ++freed; }
+        }
+    }
+    cudaDeviceSynchronize();
+    g_cow_mapped_slots = slots;
+    return freed;
+}
+int64_t qsa_cow_arena_mapped() { return g_cow_mapped_slots; }
+
+// ---- (dyn-conc P2 stage B) the demand side.  The ceiling stays the scheduler's; the memory follows demand.
+int64_t qsa_cow_arena_trim_calls() { return g_cow_trim_calls; }
+int64_t qsa_cow_arena_demand(int64_t cells) {
+    if (!g_cow_arena) return 0;
+    int64_t hw = 0;
+    for (const int64_t n : g_cow_next) if (n > hw) hw = n;
+    const int64_t c = cells > 0 ? cells : g_cow_slot_cells;
+    return hw + (c > 0 ? c / 4 : 0);   // one session's window in slots (page = 4 cells)
+}
+int64_t qsa_cow_arena_bank() { return (int64_t) g_cow_bank.size(); }
+void qsa_set_cow_arena_elastic(bool on, int64_t bank_mib) {
+    g_cow_elastic = on;
+    g_cow_bank_mib = bank_mib > 0 ? bank_mib : 0;
+}
+// (dyn-conc P2 stage C) the cache-funded grow.  A bank park shared with the funder (the same cap rule as the
+// trim's park), the funder registration, and the failure counter the refusal line quotes.
+static std::function<int64_t(int64_t)> g_cow_funder;
+static int64_t g_cow_grow_fails = 0;
+void qsa_cow_arena_bank_give(strata::core::VmmChunk h) {
+    const int64_t G = (int64_t) strata::core::vmm_granularity();
+    if (g_cow_bank_mib > 0 && ((int64_t) g_cow_bank.size() + 1) * G > g_cow_bank_mib * 1048576) {
+        ++g_cow_bank_out;
+        strata::core::vmm_chunk_free(h);   // the bank is full: the driver takes the VRAM back
+        return;
+    }
+    g_cow_bank.push_back(h);
+}
+void qsa_cow_arena_set_funder(std::function<int64_t(int64_t)> fund) { g_cow_funder = std::move(fund); }
+strata::core::VmmChunk qsa_cow_arena_bank_take() {
+    if (g_cow_bank.empty()) return 0;
+    const strata::core::VmmChunk h = g_cow_bank.back();
+    g_cow_bank.pop_back();
+    return h;
+}
+int64_t qsa_cow_arena_grow_fails() { return g_cow_grow_fails; }
+void qsa_set_cow_arena_min_free_mib(int64_t mib) { g_cow_min_free_mib = mib > 0 ? mib : 512; }
+int64_t qsa_cow_arena_min_free_mib() { return g_cow_min_free_mib; }
+void qsa_cow_arena_set_budget(int64_t bytes) { g_cow_budget_bytes = bytes > 0 ? bytes : 0; g_cow_budget_spent = 0; }
+int64_t qsa_cow_arena_budget_left() { return g_cow_budget_bytes - g_cow_budget_spent; }
+bool qsa_cow_arena_draw(int64_t bytes) {
+    if (!g_cow_elastic || bytes <= 0 || bytes > qsa_cow_arena_budget_left()) return false;
+    g_cow_budget_spent += bytes;
+    return true;
+}
+void qsa_cow_arena_give_back(int64_t bytes) {
+    if (!g_cow_elastic || bytes <= 0) return;
+    g_cow_budget_spent -= bytes;
+    if (g_cow_budget_spent < 0) g_cow_budget_spent = 0;   // a session that never drew (it attached at boot)
+}
+void qsa_set_cow_arena_trim_debug(bool on) { g_cow_trim_debug = on; }
+// The top of the highest range still owned, over every ordinal.  A bump cursor sits above the windows its
+// sessions still hold whenever one released its tail; a zombie (an ended owner a sibling still pins) owns
+// its pages too, so it counts as owned.
+static int64_t cow_arena_owned_high() {
+    int64_t need = 0;
+    for (size_t o = 0; o < g_cow_next.size(); ++o) {
+        int64_t owned = 0;
+        for (const CowRange& r : g_cow_zombie[o])
+            if (r.base + r.n > owned) owned = r.base + r.n;
+        int64_t cur = g_cow_next[o];
+        for (;;) {   // step down over the released ranges stacked at the top
+            const CowRange* top = nullptr;
+            for (const CowRange& r : g_cow_free[o])
+                if (r.base + r.n == cur && r.base >= owned) { top = &r; break; }
+            if (top == nullptr) break;
+            cur = top->base;
+        }
+        if (cur > need) need = cur;
+    }
+    return need;
+}
+// The same ledger trim acts on, read for the refusal message: where the cursors sit and what is stacked
+// released or still pinned.  Cheap: a dozen ordinals, a handful of ranges each.
+static void cow_arena_ledger(int64_t& cur_high, int64_t& free_n, int64_t& zombie_n) {
+    cur_high = 0; free_n = 0; zombie_n = 0;
+    for (size_t o = 0; o < g_cow_next.size(); ++o) {
+        if (g_cow_next[o] > cur_high) cur_high = g_cow_next[o];
+        free_n += (int64_t) g_cow_free[o].size();
+        zombie_n += (int64_t) g_cow_zombie[o].size();
+    }
+}
+int64_t qsa_cow_arena_trim() {
+    if (!g_cow_arena || !g_cow_elastic) {
+        if (g_cow_trim_debug)
+            std::fprintf(stderr, "strata generate: cow: arena trim asked with arena=%d elastic=%d - nothing to do\n",
+                         g_cow_arena ? 1 : 0, g_cow_elastic ? 1 : 0);
+        return 0;
+    }
+    ++g_cow_trim_calls;
+    int64_t target = cow_arena_owned_high();
+    if (target < g_cow_floor_slots) target = g_cow_floor_slots;
+    if (target >= g_cow_mapped_slots) {   // nothing to give back: say who still holds the top
+        if (g_cow_trim_debug) {
+            int64_t cur = 0, freen = 0, zon = 0;
+            cow_arena_ledger(cur, freen, zon);
+            std::fprintf(stderr, "strata generate: cow: arena trim asked, nothing above %lld of %lld window slots is "
+                                 "spare (cursor %lld, %lld ranges released, %lld pinned by a parked or joined owner)\n",
+                         (long long) target, (long long) g_cow_arena_slots, (long long) cur,
+                         (long long) freen, (long long) zon);
+        }
+        return 0;
+    }
+    for (size_t o = 0; o < g_cow_next.size(); ++o) {   // the cursor and the free list follow the window down
+        if (g_cow_next[o] <= target) continue;
+        g_cow_next[o] = target;
+        std::vector<CowRange>& fl = g_cow_free[o];
+        for (size_t r = fl.size(); r-- > 0;) {
+            if (fl[r].base >= target) fl.erase(fl.begin() + (long) r);
+            else if (fl[r].base + fl[r].n > target) fl[r].n = target - fl[r].base;
+        }
+    }
+    const int64_t freed = qsa_cow_arena_shrink(target, [] (strata::core::VmmChunk h) { qsa_cow_arena_bank_give(h); });
+    if (freed > 0) {
+        ++g_cow_shrinks;
+        std::fprintf(stderr, "strata generate: cow: arena trimmed to %lld of %lld window slots (%lld chunks parked, %lld given back)\n",
+                     (long long) g_cow_mapped_slots, (long long) g_cow_arena_slots,
+                     (long long) g_cow_bank.size(), (long long) g_cow_bank_out);
+    }
+    return freed;
+}
+
+// (dyn-conc P2 stage B) the deferred ledger.  A slot the boot left unattached printed the demand its window
+// would ask for; the first deferred one sits on the cursor, the next one sits a window behind it (a deferred
+// session never bumps the cursor), so each observation is priced at its own place in the arena.
+static int64_t g_cow_deferred = 0, g_cow_deferred_target = 0;
+void qsa_cow_arena_note_deferred(int64_t demand_observed) {
+    const int64_t win = g_cow_slot_cells > 0 ? g_cow_slot_cells / 4 : 0;   // one session's window, in slots
+    const int64_t target = demand_observed + g_cow_deferred * win;
+    ++g_cow_deferred;
+    if (g_cow_arena_slots > 0 && target > g_cow_arena_slots) return;   // past the ceiling: the gate says so
+    if (target > g_cow_deferred_target) g_cow_deferred_target = target;
+}
+int64_t qsa_cow_arena_deferred() { return g_cow_deferred; }
+int64_t qsa_cow_arena_deferred_bytes() {
+    if (!g_cow_arena || g_cow_deferred <= 0 || g_cow_deferred_target <= g_cow_mapped_slots) return 0;
+    return qsa_cow_arena_need(g_cow_deferred_target) * (int64_t) strata::core::vmm_granularity();
+}
+bool qsa_cow_arena_elastic() { return g_cow_elastic; }
+
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
@@ -1082,28 +1309,52 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             const uint64_t nc = (uint64_t) s.n_head_kv * s.page_size;
             const uint64_t kb = (uint64_t) T * nc * s.head_dim;
             const uint64_t sb2 = (uint64_t) T * nc * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
-            bool ok = true;
+            // (dyn-conc P2) one VMM range per arena: the five window arrays (k, v, ks, vs, use) at
+            // chunk-aligned offsets, then an always-mapped tail (the join counter, the cow-m1e shared
+            // region). cudaMalloc could not grow; VMM can, and the pointers never move.
+            const uint64_t G64 = strata::core::vmm_granularity();
+            const auto al = [G64](uint64_t x) { return (int64_t) ((x + G64 - 1) / G64 * G64); };
+            bool ok = G64 > 0;
+            g_cow_slot_b[0] = (int64_t) (nc * s.head_dim);
+            g_cow_slot_b[1] = g_cow_slot_b[0];
+            g_cow_slot_b[2] = (int64_t) (nc * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2);
+            g_cow_slot_b[3] = g_cow_slot_b[2];
+            g_cow_slot_b[4] = 4;
             g_cow_arenas.resize((size_t) g.n_qsa_layers());
             for (int64_t j = 0; j < g.n_qsa_layers() && ok; ++j) {
                 CowArena& a = g_cow_arenas[(size_t) j];
-                ok = cudaMalloc((void**) &a.k, kb) == cudaSuccess && cudaMalloc((void**) &a.v, kb) == cudaSuccess &&
-                     cudaMalloc((void**) &a.ks, sb2) == cudaSuccess && cudaMalloc((void**) &a.vs, sb2) == cudaSuccess &&
-                     cudaMalloc((void**) &a.use, (size_t) T * 4) == cudaSuccess &&
-                     cudaMalloc((void**) &a.jctr, 8) == cudaSuccess;
-                if (ok && g_cow_shared > 0)   // cow-m1e: hint tables + the region's block/clock arrays + fetch counter
-                    ok = cudaMalloc((void**) &a.lin, (size_t) strata::kernels::kCowLinTabs * (uint64_t) pages * 4) == cudaSuccess &&
-                         cudaMalloc((void**) &a.sblk, (size_t) g_cow_shared * 4) == cudaSuccess &&
-                         cudaMalloc((void**) &a.sst, (size_t) g_cow_shared * 4) == cudaSuccess &&
-                         cudaMalloc((void**) &a.srf, (size_t) g_cow_shared * 4) == cudaSuccess &&
-                         cudaMalloc((void**) &a.sctr, 8) == cudaSuccess;
-                if (ok) ok = cudaMemset(a.use, 0, (size_t) T * 4) == cudaSuccess &&
-                             cudaMemset(a.jctr, 0, 8) == cudaSuccess;
-                if (ok && g_cow_shared > 0)
-                    ok = cudaMemset(a.lin, 0xFF, (size_t) strata::kernels::kCowLinTabs * (uint64_t) pages * 4) == cudaSuccess &&
-                         cudaMemset(a.sblk, 0xFF, (size_t) g_cow_shared * 4) == cudaSuccess &&
-                         cudaMemset(a.sst, 0xFF, (size_t) g_cow_shared * 4) == cudaSuccess &&
-                         cudaMemset(a.srf, 0, (size_t) g_cow_shared * 4) == cudaSuccess &&
-                         cudaMemset(a.sctr, 0, 8) == cudaSuccess;
+                a.off[0] = 0;
+                a.off[1] = al(kb);
+                a.off[2] = a.off[1] + al(kb);
+                a.off[3] = a.off[2] + al(sb2);
+                a.off[4] = a.off[3] + al(sb2);
+                a.off[5] = a.off[4] + al((uint64_t) T * 4);                                   // the join counter
+                a.off[6] = a.off[5] + (int64_t) G64;                                          // cow-m1e: hint tables
+                a.off[7] = a.off[6] + al((uint64_t) strata::kernels::kCowLinTabs * (uint64_t) pages * 4);
+                a.off[8] = a.off[7] + al((uint64_t) g_cow_shared * 4);
+                a.off[9] = a.off[8] + al((uint64_t) g_cow_shared * 4);
+                a.off[10] = a.off[9] + al((uint64_t) g_cow_shared * 4);
+                const int64_t total = a.off[10] + (int64_t) G64;                              // + the fetch counter
+                a.vr = std::make_unique<strata::core::VmmRange>();
+                if (!a.vr->reserve((uint64_t) total)) ok = false;
+                else if (!a.vr->map_range(0, total / (int64_t) G64, [] { return (strata::core::VmmChunk) 0; })) ok = false;
+                if (ok) {
+                    uint8_t* pb = a.vr->base();
+                    a.k = (int8_t*) (pb + a.off[0]); a.v = (int8_t*) (pb + a.off[1]);
+                    a.ks = (uint16_t*) (pb + a.off[2]); a.vs = (uint16_t*) (pb + a.off[3]);
+                    a.use = (int32_t*) (pb + a.off[4]); a.jctr = (unsigned long long*) (pb + a.off[5]);
+                    a.lin = (int32_t*) (pb + a.off[6]); a.sblk = (int32_t*) (pb + a.off[7]);
+                    a.sst = (int32_t*) (pb + a.off[8]); a.srf = (int32_t*) (pb + a.off[9]);
+                    a.sctr = (unsigned long long*) (pb + a.off[10]);
+                    ok = cudaMemset(a.use, 0, (size_t) T * 4) == cudaSuccess &&
+                         cudaMemset(a.jctr, 0, 8) == cudaSuccess;
+                    if (ok && g_cow_shared > 0)
+                        ok = cudaMemset(a.lin, 0xFF, (size_t) strata::kernels::kCowLinTabs * (uint64_t) pages * 4) == cudaSuccess &&
+                             cudaMemset(a.sblk, 0xFF, (size_t) g_cow_shared * 4) == cudaSuccess &&
+                             cudaMemset(a.sst, 0xFF, (size_t) g_cow_shared * 4) == cudaSuccess &&
+                             cudaMemset(a.srf, 0, (size_t) g_cow_shared * 4) == cudaSuccess &&
+                             cudaMemset(a.sctr, 0, 8) == cudaSuccess;
+                }
             }
             if (ok) {   // cow-m1d: the join-at-fetch registry: a fixed device array, entries created at state init, never destroyed
                 g_cow_reg_h.assign((size_t) kCowRegCap, strata::kernels::CowPeer{});
@@ -1112,16 +1363,28 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                                cudaMemcpyHostToDevice) != cudaSuccess)
                     ok = false;
             }
+            g_cow_mapped_slots = g_cow_arena_slots;
+            g_cow_lin_blocks = pages;
             if (ok)
-                std::fprintf(stderr, "cow: K/V arenas: %lld QSA layers x %lld slots (%lld shared region) = %.2f GiB (INT8 streamed)\n",
+                std::fprintf(stderr, "cow: K/V arenas: %lld QSA layers x %lld slots (%lld shared region) = %.2f GiB reserved, all mapped (INT8 streamed, VMM)\n",
                              (long long) g.n_qsa_layers(), (long long) (g_cow_arena_slots + g_cow_shared), (long long) g_cow_shared,
                              (double) g.n_qsa_layers() * 2.0 * (kb + sb2) / 1073741824.0);
-                g_cow_lin_blocks = pages;
+            if (ok) {   // (dyn-conc P2) boot floor: STRATA_COW_ARENA_FLOOR commits the expected resident
+                        // budget, not the ceiling; the released chunks land back on the driver's free list,
+                        // and expert-cache sizing happens later, so they become cache.
+                const char* fe = std::getenv("STRATA_COW_ARENA_FLOOR");
+                int64_t fl = fe ? std::atoll(fe) : g_cow_arena_slots;
+                if (fl < p.slots) fl = p.slots;   // never starve the first admission
+                g_cow_floor_slots = fe ? fl : 0;   // (dyn-conc P2-B) the floor is the trim's floor too
+                if (fe && fl > 0 && fl < g_cow_mapped_slots &&
+                    qsa_cow_arena_shrink(fl, [] (strata::core::VmmChunk h) { strata::core::vmm_chunk_free(h); }) > 0)
+                    std::fprintf(stderr, "strata generate: cow: arena floor: %lld of %lld window slots mapped; the rest stays free VRAM for the expert cache\n",
+                                 (long long) fl, (long long) g_cow_arena_slots);
+            }
             if (!ok) {
                 std::fprintf(stderr, "cow: the K/V arenas could not be allocated: falling back to private pools\n");
                 for (CowArena& a : g_cow_arenas) {
-                    cudaFree(a.k); cudaFree(a.v); cudaFree(a.ks); cudaFree(a.vs); cudaFree(a.jctr);
-                    cudaFree(a.lin); cudaFree(a.sblk); cudaFree(a.sst); cudaFree(a.srf); cudaFree(a.sctr);
+                    if (a.vr) a.vr->release();
                 }
                 g_cow_arenas.clear();
                 g_cow_arena = false;
@@ -1154,10 +1417,88 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                 so = g_cow_next[(size_t) qsa_ordinal];
                 g_cow_next[(size_t) qsa_ordinal] += p.slots;
             }
-            if (so + p.slots > g_cow_arena_slots) {
+            // (dyn-conc P2 stage B) an admission pays for its own window: the chunks a detach parked first,
+            // the driver's free VRAM after that.  Boot maps only the floor (see the --batch carve), so a live
+            // server's arena holds what its streams hold rather than the --batch ceiling.
+            if (g_cow_elastic && so + p.slots > g_cow_mapped_slots && so + p.slots <= g_cow_arena_slots) {
+                // An elastic grow is a claim on free VRAM the expert cache has not already taken, and the serve
+                // has a line it will not cross (below it the driver pages, decode falls to a few tok/s and a
+                // window never finishes - #2065).  Price the fresh chunks (bank chunks cost nothing) and stop
+                // above the line: the session then takes the gate's "no room" path instead of borrowing memory
+                // that a live stream needs.  ms01 without the line: two doubled windows grew the map to 14336
+                // of 18432, the card ended 145 MiB free, and every later admission was refused anyway.
+                const int64_t chunks = qsa_cow_arena_need(so + p.slots);
+                // (dyn-conc P2 stage C) bank short: ask the serve's funder BEFORE pricing the ask.  The arena
+                // must be able to grow against the expert cache: chunks the cache hands over land in the bank
+                // and cost nothing against the line (stage B's lesson: bank chunks re-map free).  The funder
+                // returns how many it could give - zero when the cache is at its fund floor, and the admission
+                // then behaves exactly as it did before stage C (priced decline or silent driver failure, both
+                // now said out loud below).
+                int64_t short_n = chunks - (int64_t) g_cow_bank.size();
+                int64_t fresh = short_n;
+                int64_t ask = (fresh > 0 ? fresh : 0) * (int64_t) strata::core::vmm_granularity();
+                int64_t covered = ask > 0 ? std::min<int64_t>(ask, qsa_cow_arena_budget_left()) : 0;
+                // (dyn-conc P2 stage C) the cache funds only what the reservation does not cover: the claim
+                // stage B made at boot is the cheap money (VRAM the cache already agreed to leave out), and
+                // a cache slot is expensive (its expert pays a PCIe miss until a retake refills it).  Fund
+                // the uncovered part, then price what is still uncovered against the free-VRAM line.
+                if (ask - covered > 0 && g_cow_funder) {
+                    const int64_t want = (ask - covered + (int64_t) strata::core::vmm_granularity() - 1) /
+                                         (int64_t) strata::core::vmm_granularity();
+                    if (const int64_t got = g_cow_funder(want); got > 0) {
+                        std::fprintf(stderr, "strata generate: cow: the expert cache funded the arena: %lld chunks "
+                                             "to the bank\n", (long long) got);
+                        short_n = chunks - (int64_t) g_cow_bank.size();
+                        fresh = short_n;
+                        ask = (fresh > 0 ? fresh : 0) * (int64_t) strata::core::vmm_granularity();
+                        covered = ask > 0 ? std::min<int64_t>(ask, qsa_cow_arena_budget_left()) : 0;
+                    }
+                }
+                size_t fb = 0, tb = 0;
+                // The line guards the ALLOCATION this grow would make, not the state the card is already in:
+                // chunks parked in the bank are mapped back for free, and refusing that refuses a session while
+                // giving nothing back (measured: bank 48 chunks, ask 0 MiB, 505 MiB free vs a 512 line -> the
+                // grow declined, the session died at the mapped-capacity gate, and three streams of the window
+                // ended at one token).
+                const int64_t uncov = ask - covered;   // only the part the reservation does not pay for meets the line
+                const bool priced = uncov > 0 && cudaMemGetInfo(&fb, &tb) == cudaSuccess &&
+                                    (int64_t) fb - uncov < g_cow_min_free_mib * 1048576;
+                if (priced) {
+                    ++g_cow_declines;
+                    std::fprintf(stderr, "strata generate: cow: arena growth declined: %lld MiB of window, %llu MiB free, "
+                                         "%lld MiB stays under the line (%lld slots in the bank)\n",
+                                 (long long) (ask >> 20), (unsigned long long) (fb >> 20),
+                                 (long long) g_cow_min_free_mib, (long long) g_cow_bank.size());
+                } else if (qsa_cow_arena_grow(so + p.slots, [] () -> strata::core::VmmChunk {
+                    if (g_cow_bank.empty()) return 0;   // 0: the range takes a fresh chunk from the driver
+                    const strata::core::VmmChunk h = g_cow_bank.back();
+                    g_cow_bank.pop_back();
+                    return h;
+                })) {
+                    ++g_cow_grows;
+                    if (covered > 0) g_cow_budget_spent += covered;   // the reservation paid for this mapping
+                    std::fprintf(stderr, "strata generate: cow: arena grown to %lld of %lld window slots for a new session "
+                                         "(%lld chunks in the bank, %lld MiB of the %lld MiB ask on its reservation)\n",
+                                 (long long) g_cow_mapped_slots, (long long) g_cow_arena_slots, (long long) g_cow_bank.size(),
+                                 (long long) (covered >> 20), (long long) (ask >> 20));
+                } else if (so + p.slots > g_cow_mapped_slots) {   // (dyn-conc P2 stage C) the silent path no longer
+                    ++g_cow_grow_fails;                  // ...the driver could not satisfy the map
+                    const char* le = cudaGetErrorString(cudaGetLastError());
+                    size_t f2 = 0, t2 = 0;
+                    const bool had = cudaMemGetInfo(&f2, &t2) == cudaSuccess;
+                    char fbbuf[48];
+                    std::snprintf(fbbuf, sizeof fbbuf, "%llu MiB", had ? (unsigned long long) (f2 >> 20) : 0ull);
+                    std::fprintf(stderr, "strata generate: cow: arena grow attempt failed: %s, %lld chunks asked, "
+                                         "%lld in the bank, %s free (mapped %lld of %lld)\n",
+                                 le, (long long) (fresh > 0 ? fresh : 0), (long long) g_cow_bank.size(),
+                                 had ? fbbuf : "driver not answering",
+                                 (long long) g_cow_mapped_slots, (long long) g_cow_arena_slots);
+                }
+            }
+            if (so + p.slots > g_cow_mapped_slots) {   // (dyn-conc P2) the gate is mapped capacity, not the reservation
                 if (bumped) g_cow_next[(size_t) qsa_ordinal] = so;   // (S8-v2): a failed init claims nothing
-                std::fprintf(stderr, "cow: no room for another session in the K/V arenas (%lld slots/layer)\n",
-                             (long long) g_cow_arena_slots);
+                std::fprintf(stderr, "cow: no room for another session in the K/V arenas (%lld of %lld window slots mapped)\n",
+                             (long long) g_cow_mapped_slots, (long long) g_cow_arena_slots);
                 return 0;
             }
             const CowArena& a = g_cow_arenas[(size_t) qsa_ordinal];

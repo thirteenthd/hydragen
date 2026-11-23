@@ -3968,6 +3968,12 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
         return false;
     }
     for (SessionState* x : slots) {
+        // (dyn-conc P2 stage B) an uncarved state is a slot standing UNATTACHED: exactly what an idle detach
+        // leaves at runtime, and what the elastic arena leaves at boot for the windows above its floor.  The
+        // admission carves it (and maps its arena window) before anything reads its buffers, so there is
+        // nothing here to validate yet - and its counts stay zero, which is how every per-slot consumer
+        // already skips a detached slot.
+        if (x != nullptr && x->max_cells == 0) continue;
         if (x == nullptr || x->layer_lo != ss_->layer_lo || x->layer_hi != ss_->layer_hi ||
             x->max_cells != ss_->max_cells || x->gdn_ord0 != ss_->gdn_ord0 || x->qsa_ord0 != ss_->qsa_ord0) {
             err = "verify: a slot's session is not carved like the stage's own (layer range, context)";

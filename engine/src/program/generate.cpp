@@ -300,6 +300,9 @@ bool under_wddm() {
 // #620 #486: " (N MiB of M MiB VRAM free on this GPU)" for an allocation's failure message (clears the error first)
 // How many cache slots a prompt-path loan leaves behind (128 on a card with room; a card too short for that lends against 16, see the cache sizing).
 static int64_t g_lend_keep = 128;
+// (dyn-conc P2 stage C) STRATA_COW_CACHE_FUND=1: the expert cache funds the elastic arena's admission grows
+// (qsa_cow_arena_set_funder).  Set at option parse with the arena's elastic switch; it implies a VMM-backed cache.
+static bool g_cow_cache_fund = false;
 
 // May a start short of VRAM be moved off the GPU (strata/core/spill_gate.hpp)?  A discrete card only: not Metal, not an integrated GPU (Strix Halo and the other APUs share the host's RAM).
 static bool spill_discrete_gpu() {
@@ -4635,7 +4638,16 @@ int main(int argc, char** argv) {
             const int64_t nb = o.batch > 0 ? (int64_t) o.batch : 1;
             // S8-v2 sizing law: the arena must hold the main session's window, one window per batch slot,
             // and room for one doubled re-carve window per slot (STRATA_SLOT_KV_GROW): (1 + 2B) x win.
-            const int64_t demand = (1 + 2 * nb) * win;
+            // dyn-conc: STRATA_COW_ARENA_CONC sizes the arena for the streams expected resident,
+            // not the --batch ceiling: the ceiling stays the scheduler's, the memory follows demand.
+            // Streams above the hint pay the arena's normal pressure paths (park/re-carve); streams
+            // below the ceiling that never arrive were only ever reserved (the C1 tax).
+            const char* ac = hg_getenv("STRATA_COW_ARENA_CONC");
+            const int64_t conc = ac != nullptr ? std::atoll(ac) : nb;
+            const int64_t demand = (1 + 2 * (conc < nb ? conc : nb)) * win;
+            if (conc < nb)
+                std::fprintf(stderr, "strata generate: cow: arena sized for %lld resident streams (--batch %lld): streams above the hint take the arena's pressure paths\r\n",
+                             (long long) conc, (long long) nb);
             int64_t slots = ns != nullptr ? std::atoll(ns) : 4 * (o.kv_resident / 4);
             if (slots < demand) {
                 std::fprintf(stderr, "strata generate: cow: the arenas hold %lld slots/layer, live demand is %lld "
@@ -4644,6 +4656,32 @@ int main(int argc, char** argv) {
                 slots = demand;
             }
             strata::core::qsa_set_cow_arena(slots);
+            {   // (dyn-conc P2 stage B) STRATA_COW_ARENA_ELASTIC: the arena window follows demand (grow at
+                // admission, trim when a slot detaches).  Off by default: every existing arm keeps P2-A behavior.
+                const char* el = hg_getenv("STRATA_COW_ARENA_ELASTIC");
+                const char* bm = hg_getenv("STRATA_COW_ARENA_BANK_MIB");
+                const char* mf = hg_getenv("STRATA_COW_ARENA_MIN_FREE_MIB");
+                if (el != nullptr && el[0] == '1') {
+                    strata::core::qsa_set_cow_arena_elastic(true, bm != nullptr ? std::atoll(bm) : 0);
+                    strata::core::qsa_set_cow_arena_min_free_mib(mf != nullptr ? std::atoll(mf) : 512);
+                    const char* td = hg_getenv("STRATA_COW_ARENA_TRIM_DEBUG");
+                    strata::core::qsa_set_cow_arena_trim_debug(td != nullptr && td[0] == '1');
+                    std::fprintf(stderr, "strata generate: cow: elastic arena windows on (bank %s, grows stop above %s MiB free)\n",
+                                 bm != nullptr ? bm : "unbounded", mf != nullptr ? mf : "512");
+                    // (dyn-conc P2 stage C) STRATA_COW_CACHE_FUND=1: when a grow finds the bank short, the
+                    // expert cache funds it (see qsa_cow_arena_set_funder): the arena and the cache become two
+                    // ends of one budget instead of two independent boot allocations.  It implies a VMM-backed
+                    // cache - the chunk-level give/take is the elastic K/V's machinery, pointed at the arena.
+                    const char* cf = hg_getenv("STRATA_COW_CACHE_FUND");
+                    g_cow_cache_fund = cf != nullptr && cf[0] == '1';
+                    if (g_cow_cache_fund) {
+                        strata::core::ExpertCache::set_vmm(true);
+                        std::fprintf(stderr, "strata generate: cow: cache-funded arena admission on: the expert "
+                                             "cache is VMM-backed and pays for window grows above its fund floor "
+                                             "(STRATA_COW_FUND_MIN_PCT, 50 default)\n");
+                    }
+                }
+            }
             const char* jh = hg_getenv("STRATA_COW_JOIN_HH");
             if (jh != nullptr) strata::core::qsa_set_cow_join_hh(std::atoll(jh));
             const char* csh = hg_getenv("STRATA_COW_SHARED");
@@ -7442,6 +7480,12 @@ int main(int argc, char** argv) {
         bslot_ss.resize(1 + stages.size());
         bslot_arena.resize(1 + stages.size());
         int fit = o.batch;   // the slots every stage could carve
+        // (dyn-conc P2 stage B) boot maps the arena's floor, never its ceiling: a slot whose window sits above
+        // the floor is left UNATTACHED (exactly the state a detach leaves) and attaches on demand, where the
+        // admission grows the window for it.  --batch keeps its ceiling either way.
+        const bool cow_elastic_on = [] { const char* e = hg_getenv("STRATA_COW_ARENA");
+            const char* x = hg_getenv("STRATA_COW_ARENA_ELASTIC");
+            return e != nullptr && e[0] == '1' && x != nullptr && x[0] == '1'; }();
         uint64_t bytes0 = 0;
         for (size_t k = 0; k < bslot_ss.size(); ++k) {
             const int dev = k == 0 ? 0 : stages[k - 1]->dev;
@@ -7452,6 +7496,18 @@ int main(int argc, char** argv) {
             if (k == 0) bytes0 = bytes;
             for (int b = 0; b < fit; ++b) {
                 auto u = std::make_unique<strata::core::SessionState>();
+                if (cow_elastic_on &&
+                    strata::core::qsa_cow_arena_demand(0) > strata::core::qsa_cow_arena_mapped()) {
+                    std::fprintf(stderr, "strata generate: --batch: slot %d window needs %lld arena slots, "
+                                         "the floor maps %lld: unattached at boot, it attaches on demand\n",
+                                 b, (long long) strata::core::qsa_cow_arena_demand(0),
+                                 (long long) strata::core::qsa_cow_arena_mapped());
+                    if (k == 0)   // the arena is CUDA0's; a stage-split arm keeps its own question for later
+                        strata::core::qsa_cow_arena_note_deferred((int64_t) strata::core::qsa_cow_arena_demand(0));
+                    bslot_arena[k].push_back(nullptr);
+                    bslot_ss[k].push_back(std::make_unique<strata::core::SessionState>());
+                    continue;
+                }
                 void* buf = nullptr;
                 if (cudaMalloc(&buf, bytes) != cudaSuccess || strata::core::session_init(g, o.max_context, K, buf, *u, lo, hi) == 0) {
                     cudaGetLastError();
@@ -8484,7 +8540,19 @@ int main(int argc, char** argv) {
 #if defined(STRATA_HAVE_DFLASH2)
         if (use_df2 && native_head.loaded()) mtp_bind += df2_head_bytes() + (48 << 20) + (o.serve ? (112 << 20) : 0);   // DFlash2's own draft head and logits (serve: and the prompt staging), bound after this
 #endif
-        const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
+        // (dyn-conc P2 stage B) the slots the boot left unattached are claims on this VRAM that arrive later:
+        // each one cudaMallocs its session buffers and maps its arena window at its first admission.  The cache
+        // is sized now and never again, so both are priced into the reserve here.  Measured unpriced on ms01
+        // (floor 6144, batch 4): the cache took everything, C4's re-carve met 393 MiB free against a 0.44 GiB
+        // ask, the admission failed and the stream ended at one token.
+        const int64_t cow_deferred = strata::core::qsa_cow_arena_deferred();
+        const int64_t cow_lo = stages.empty() ? (int64_t) 0 : stages[0]->lb;
+        const int64_t cow_hi = stages.empty() ? (int64_t) -1 : stages[0]->le;
+        const int64_t cow_sess_bytes = (int64_t) strata::core::session_bytes(g, o.max_context, K, cow_lo, cow_hi);
+        const int64_t cow_reserve = cow_deferred > 0
+            ? cow_deferred * cow_sess_bytes + strata::core::qsa_cow_arena_deferred_bytes() : 0;
+        const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first + cow_reserve;
+        strata::core::qsa_cow_arena_set_budget(cow_reserve);   // (dyn-conc P2 stage B) the same bytes, now a claim they can spend
         const int64_t blob = (int64_t) nibble_max_slot_bytes();   // max_blob (STRATA_EXPERT_NIBBLE: or a larger 4-bit slot)
         // #496: the least a working cache needs (the verify window cannot start without one, #174): a cache too small to lend the prompt path a
         // 256-token chunk's buffers (plus the 128 slots a loan leaves; one slot without --prefill) makes it allocate its own on top
@@ -8511,11 +8579,25 @@ int main(int argc, char** argv) {
             slots = kMetalAutoCacheSlots;
         }
 #endif
+        std::fprintf(stderr, "strata generate: cache pricing ledger: free %.2f GiB; reserve line %d MiB + prefill(owned) "
+                             "%lld + draft-bind %lld + pipe %lld + cow-deferred %lld + late %lld = %.2f GiB; "
+                             "prefill_chunk %lld borrow=%d min_slots %lld; -> %lld slots\n",
+                     (double) free_b / 1073741824.0, o.vram_reserve_mib,
+                     (long long) (prefill_mib << 20 >> 20), (long long) (mtp_bind >> 20), (long long) (pipe_first >> 20),
+                     (long long) (cow_reserve >> 20), (long long) (strata::core::kLateAllocMib),
+                     (double) reserve / 1073741824.0,
+                     (long long) o.prefill_chunk, (int) (o.prefill_chunk > 0 && pf_borrow), (long long) min_slots,
+                     (long long) std::max<int64_t>(slots, 0));
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
                              "draft head%s) -> %d slots\n",
                      (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20),
                      auto_slots.late_priced ? ", +256 MiB for what is allocated after the cache" : "", o.expert_cache);
+        if (cow_deferred > 0)
+            std::fprintf(stderr, "strata generate: expert cache auto: %lld slot session%s stand unattached at the arena "
+                                 "floor: %lld MiB (their buffers and their windows) stays out of the cache so their "
+                                 "admission can pay for itself\n",
+                         (long long) cow_deferred, cow_deferred == 1 ? "" : "s", (long long) (cow_reserve >> 20));
 #if defined(STRATA_USE_HIP) && !defined(_WIN32)
         // An APU's "VRAM" is system RAM: the device-free figure above counts the whole GPU-addressable pool and does not
         // subtract ordinary CPU allocations (the host expert arena), so a cache sized from it alone can ask the OOM killer
@@ -8917,6 +8999,12 @@ int main(int argc, char** argv) {
     if (o.expert_cache > 0) {
         std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
                      (long long) xcache.slots(), xcache.gib());
+        {   // (dyn-conc P2) the ledger's second mark: what the cache left behind
+            size_t fb2 = 0, tb2 = 0;
+            if (cudaMemGetInfo(&fb2, &tb2) == cudaSuccess)
+                std::fprintf(stderr, "strata generate: cache pricing ledger: after the cache: %.2f GiB free\n",
+                             (double) fb2 / 1073741824.0);
+        }
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
         // Round 328 warned here that the GPU hit path was wrong (tokens diverged from a cache-off run from
@@ -12633,6 +12721,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: --batch, stage %zu: %s\n", k + 1, err.c_str());
                     return 1;
                 }
+                mem_mark("the verifier's batch slot sessions");   // (dyn-conc P2) where the after-cache spend lands
                 // STRATA_PIPED_MTP: the rows a group's commit replays after the verdict, one hand-off row each
                 if (piped_mtp && bslot_ss.size() > 1 &&
                     !vk.init_deferred_commit(std::max<int>(strata::kernels::kVerifyNarrowT, (1 + pm_drafts) * o.batch), err)) {
@@ -15626,7 +15715,12 @@ int main(int argc, char** argv) {
             int nfreed = 0;
             for (void* q : bslot_arena[0]) nfreed += q == nullptr;
             const strata::core::OnDevice on0(0);
-            const int64_t cands[2] = {kv_resident0 * 2, kv_resident0};
+            // (dyn-conc P2 stage B) with elastic windows the doubled candidate is not taken: a doubled window
+            // maps twice the arena chunks and the cache's reserve priced ONE window per deferred session.
+            // Measured on ms01 with both on: the map reached 14336 of 18432 slots, the card ended 145 MiB free,
+            // and the next admission died at one token.  KV-window doubling and elastic growth are one budget.
+            const int64_t dbl = strata::core::qsa_cow_arena_elastic() ? kv_resident0 : kv_resident0 * 2;
+            const int64_t cands[2] = {dbl, kv_resident0};
             for (int64_t cand : cands) {
                 strata::core::qsa_set_kv_resident(cand);
                 if (cow_on && cow_cells0 > 0) strata::core::qsa_set_cow_slot_cells(cand);   // (S8-v2) the cow window follows the candidate: the arena bump guard is the real budget
@@ -15635,7 +15729,13 @@ int main(int argc, char** argv) {
                 const uint64_t reserve = (uint64_t) (nfreed - 1) * slot_bytes0 + (64ull << 20);
                 const uint64_t budget = cand == kv_resident0 ? fb : (fb > reserve ? fb - reserve : 0);
                 const uint64_t need = strata::core::session_bytes(g, o.max_context, K, lo0, hi0);
+                std::fprintf(stderr, "strata serve: conversation cache: re-carve ledger: asks %.2f GiB (cand %lld cells), "
+                                     "%.2f GiB free, budget %.2f GiB, %d freed slot%s, line %lld MiB\n",
+                             (double) need / 1073741824.0, (long long) cand, (double) fb / 1073741824.0,
+                             (double) budget / 1073741824.0, nfreed, nfreed == 1 ? "" : "s",
+                             strata::core::qsa_cow_arena_elastic() ? strata::core::qsa_cow_arena_min_free_mib() : 0ll);
                 void* buf = nullptr;
+                mem_mark("a deferred slot's turn to attach");   // (dyn-conc P2) the claim the pricing promised to cover
                 if (need <= budget && cudaMalloc(&buf, need) == cudaSuccess) {
                     strata::core::SessionState& su = *bslot_ss[0][(size_t) b];
                     if (strata::core::session_init(g, o.max_context, K, buf, su, lo0, hi0) != 0) {
@@ -15647,6 +15747,9 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata serve: conversation cache: slot %d's session re-carved "
                                              "(kv-resident %lld, %.2f GiB)\n", b, (long long) cand,
                                              (double) need / 1073741824.0);
+                        // (dyn-conc P2 stage B) the buffers count against the reservation the sizing gave up; drawn
+                        // only once the attach SUCCEEDED, so a failed attempt cannot leak the claim.
+                        strata::core::qsa_cow_arena_draw((int64_t) need);
                         return true;
                     }
                     strata::core::session_release(su);   // (S8-v2) hand back any arena range the failed re-init claimed
@@ -15872,6 +15975,196 @@ int main(int argc, char** argv) {
         // overwrite on its admission path.  The slot's resident KV window (bslot_ss, sized at boot; the captured
         // verify graphs hold its pointers) stays the slot's own - v1 detaches the conversation, not the bytes.
         // This is also the single ownership point where S2b's shared-head adoption and its refcounts will live.
+        // ---- (dyn-conc P2 stage C) the cache-funded arena admission (STRATA_COW_CACHE_FUND=1).  The arena
+        // floor maps what the boot expected to hold resident and the expert cache took the rest, so a grow past
+        // the map found the bank empty and the price line guarding nothing behind it: stage B refused.  The
+        // funder is what was behind it - the kvg_ensure dance aimed at the ARENA instead of the K/V: quiesce
+        // (nothing runs on the device, the adaptive tier's swaps land), walk the cache's live slots down from
+        // the prompt loan's edge, move an expert in a given-up slot into the coldest slot below the line when
+        // it is hotter (a device copy, as kvg does) or drop it to the CPU tier, unmap the wholly-freed chunks,
+        // park them in the arena's bank - which the grow pops for free (bank chunks skip the price line).  The
+        // cache never gives below STRATA_COW_FUND_MIN_PCT percent of its slots; under that line the admission
+        // behaves as stage B did (priced decline or refusal), both now printed.  The reverse leg runs at the
+        // detach, right after the trim: chunks the arena parked and does not need go back into the cache's VA
+        // and refill from the profile, exactly as kvg_trim refills after a K/V trim.  Single thread (the serve
+        // loop: detach, admission and sweep all run between decode rounds), device-quiet by the quiesce
+        // contract - the same assumption kvg_* and S8-v2 detach already rest on, so no locks.
+        const int64_t cf_top = (borrow != nullptr && lend_first >= 0) ? (int64_t) lend_first : xcache.slots();   // the loan region is untouched
+        int64_t cf_lo = -1;                               // slots [cf_lo, cf_hi) stand given to the arena; -1: none yet
+        int64_t cf_hi = 0;                                // highest loan edge ever funded from (retake's upper scan bound)
+        std::vector<int32_t> cf_owner;                    // slot -> residency index (built on the first give)
+        std::vector<int32_t> cf_rank;                     // (layer, expert) -> profile rank: the heat tie-break
+        std::vector<std::pair<float, int32_t>> cf_cold;   // residents above the line, hottest first; back() = coldest
+        auto cf_heat = [&](int32_t i) -> float {
+            const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[(size_t) i];
+            return u * 1048576.0f - (float) cf_rank[(size_t) i];
+        };
+        auto cow_fund = [&](int64_t want) -> int64_t {
+            auto say = [] (const char* why) {   // say the reason once, so a silent zero cannot hide again
+                static bool done = false;
+                if (!done) { done = true;
+                    std::fprintf(stderr, "strata: cow: the arena fund declined to pay: %s\n", why); }
+            };
+            strata::core::VmmRange* vr = xcache.vmm_range();
+            if (want <= 0) return 0;
+            if (vr == nullptr) { say("the expert cache is not VMM-backed"); return 0; }
+            if (host_res.empty()) { say("the residency mirror is empty"); return 0; }
+            // the loan edge moves with every prompt (it is set at 11886 when one runs), so read it per call,
+            // as the borrow arithmetic itself does; cf_hi remembers the highest edge ever funded from, so the
+            // retake can still see slots a wider prompt's loan region had given up
+            const int64_t cf_top = (borrow != nullptr && lend_first >= 0) ? (int64_t) lend_first : xcache.slots();
+            if (cf_top <= 0) { say("the cache has no slots below the prompt loan"); return 0; }
+            if (cf_hi < cf_top) cf_hi = cf_top;
+            static const int64_t fund_pct = [] {
+                const char* v = std::getenv("STRATA_COW_FUND_MIN_PCT");
+                const long x = v != nullptr ? std::atol(v) : 50;
+                return x < 0 ? (int64_t) 0 : (x > 100 ? (int64_t) 100 : (int64_t) x);
+            }();
+            const int64_t floor_slot = cf_top * fund_pct / 100;
+            if (cf_lo < 0 || cf_lo > cf_top) cf_lo = cf_top;
+            if (cf_lo <= floor_slot) { say("the cache reached its fund floor"); return 0; }
+            const int64_t lo_entry = cf_lo;   // where this call's walk started, for the error path to undo to
+            const uint64_t G = strata::core::vmm_granularity();
+            adapt_quiesce();                      // the kvg_ensure contract: nothing runs, every swap landed
+            int64_t gave = 0, moved = 0;
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            auto freeable = [&]() -> int64_t {    // mapped chunks wholly inside [cf_lo, cf_top)
+                const int64_t c0 = (int64_t) ((xcache.slot_offset(cf_lo) + G - 1) / G);
+                const int64_t c1 = (int64_t) (xcache.slot_offset(cf_top) / G);
+                int64_t k = 0;
+                for (int64_t c = c0; c < c1; ++c) k += vr->mapped(c) ? 1 : 0;
+                return k;
+            };
+            while (freeable() < want && cf_lo > floor_slot) {
+                // rebuilt on the quiet device every give, as kvg does: between fund calls the cache's own
+                // admission and eviction keep moving experts around, so the owner table is never stale
+                cf_owner.assign((size_t) xcache.slots(), -1);
+                for (size_t i = 0; i < host_res.size(); ++i)
+                    if (host_res[i] >= 0 && host_res[i] < xcache.slots()) cf_owner[(size_t) host_res[i]] = (int32_t) i;
+                cf_rank.assign(host_res.size(), (int32_t) profile.size());
+                for (size_t r = 0; r < profile.size(); ++r)
+                    cf_rank[(size_t) profile[r].first * (size_t) g.n_expert + (size_t) profile[r].second] = (int32_t) r;
+                cf_cold.clear();
+                for (size_t i = 0; i < host_res.size(); ++i)
+                    if (host_res[i] >= cf_top) cf_cold.emplace_back(cf_heat((int32_t) i), (int32_t) i);
+                std::sort(cf_cold.begin(), cf_cold.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                --cf_lo;
+                ++gave;
+                if (const int32_t oi = cf_owner[(size_t) cf_lo]; oi >= 0) {
+                    const int64_t layer = oi / g.n_expert;
+                    int32_t vi = -1;
+                    if (!cf_cold.empty() && cf_cold.back().first < cf_heat(oi)) {   // hotter than the coldest below: move
+                        vi = cf_cold.back().second;
+                        const int32_t vs = host_res[(size_t) vi];
+                        nib::guard_raw(layer, "the arena fund's slot move (cow_fund)");
+                        if (xcache.slot_offset(vs + 1) - xcache.slot_offset(vs) < lay.blob_bytes(layer) ||
+                            cudaMemcpy(xcache.device_slot(vs), xcache.device_slot((int32_t) cf_lo),
+                                       (size_t) lay.blob_bytes(layer), cudaMemcpyDeviceToDevice) != cudaSuccess)
+                            vi = -1;
+                        else {
+                            cf_cold.pop_back();
+                            host_res[(size_t) oi] = vs;
+                            host_res[(size_t) vi] = strata::core::kNotResident;
+                            ++moved;
+                        }
+                    }
+                    if (vi < 0) host_res[(size_t) oi] = strata::core::kNotResident;   // given up: a CPU miss now
+                }
+            }
+            int64_t parked = 0;
+            // a device-to-device cudaMemcpy does not wait for the copy: the moves still read the slots given
+            // up, and a chunk unmapped under a copy faults it (kvg's law: the error then sticks to whatever
+            // runs next).  No give happened: no copies are in flight and there is nothing to wait for.
+            if (gave > 0 && cudaDeviceSynchronize() != cudaSuccess) {
+                std::fprintf(stderr, "strata: cow: moving experts for the arena fund failed: %s\n",
+                             cudaGetErrorString(cudaGetLastError()));
+                cf_lo = lo_entry;   // forget this call's walk; chunks it never reached stay mapped
+                return 0;
+            }
+            const int64_t c0 = (int64_t) ((xcache.slot_offset(cf_lo) + G - 1) / G);
+            const int64_t c1 = (int64_t) (xcache.slot_offset(cf_top) / G);
+            for (int64_t c = c0; c < c1; ++c)
+                if (vr->mapped(c))
+                    if (const strata::core::VmmChunk h = vr->unmap(c)) {
+                        strata::core::qsa_cow_arena_bank_give(h);
+                        ++parked;
+                    }
+            if (gave > 0 && d_res != nullptr &&
+                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+                std::fprintf(stderr, "strata: cow: the residency table upload (arena fund) failed: %s\n",
+                             cudaGetErrorString(cudaGetLastError()));
+                return 0;   // the chunks are parked; the next retake puts them back
+            }
+            if (parked > 0)
+                std::fprintf(stderr, "strata: cow: the expert cache gave %lld chunks (%.2f GiB) to the arena bank "
+                                     "(%lld slots released, %lld hotter experts moved; cache at %lld of %lld slots)\n",
+                             (long long) parked, (double) ((int64_t) parked * (int64_t) G) / 1073741824.0,
+                             (long long) (cf_top - cf_lo), (long long) moved, (long long) cf_lo, (long long) cf_top);
+            return parked;
+        };
+        auto cow_retake = [&]() {
+            strata::core::VmmRange* vr = xcache.vmm_range();
+            if (vr == nullptr || cf_lo <= 0 || cf_lo >= cf_hi) return;   // nothing was ever given
+            const int64_t spare = strata::core::qsa_cow_arena_bank();
+            if (spare <= 0) return;
+            const uint64_t G = strata::core::vmm_granularity();
+            const int64_t c0 = (int64_t) ((xcache.slot_offset(cf_lo) + G - 1) / G);
+            const int64_t c1 = (int64_t) (xcache.slot_offset(cf_hi) / G);
+            int64_t cend = c0, need = spare;
+            while (cend < c1 && need > 0) need -= vr->mapped(cend++) ? 0 : 1;
+            if (cend == c0) return;
+            adapt_quiesce();
+            if (!vr->map_range(c0, cend, [] () -> strata::core::VmmChunk { return strata::core::qsa_cow_arena_bank_take(); }))
+                std::fprintf(stderr, "strata: cow: the expert cache could not take its VRAM back from the arena\n");
+            const int64_t lo0 = cf_lo;
+            while (cf_lo < cf_hi) {   // a slot whose chunks are all mapped again may hold an expert again
+                const int64_t a = (int64_t) (xcache.slot_offset(cf_lo) / G);
+                const int64_t b = (int64_t) ((xcache.slot_offset(cf_lo + 1) + G - 1) / G);
+                bool all = true;
+                for (int64_t c = a; c < b && all; ++c) all = vr->mapped(c);
+                if (!all) break;
+                ++cf_lo;
+            }
+            if (cf_lo == lo0) return;
+            // refills on one stream and one sync, from the profile's hottest misses, as kvg_trim does
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            std::vector<std::pair<size_t, int32_t>> filled;
+            size_t pi = 0;
+            for (int64_t s = lo0; s < cf_lo; ++s) {
+                const uint64_t room = xcache.slot_offset(s + 1) - xcache.slot_offset(s);
+                for (; pi < profile.size(); ++pi) {
+                    const int32_t l = profile[pi].first, e = profile[pi].second;
+                    const size_t i = (size_t) l * (size_t) g.n_expert + (size_t) e;
+                    if (host_res[i] >= 0 || lay.blob_bytes(l) > room) continue;
+                    const uint8_t* b2 = srcp->blob_stable(l, e);
+                    if (b2 == nullptr) continue;
+                    nib::guard_raw(l, "the arena fund's refill (cow_retake)");
+                    cudaMemcpyAsync(xcache.device_slot((int32_t) s), b2, (size_t) lay.blob_bytes(l),
+                                    cudaMemcpyHostToDevice, nullptr);
+                    filled.emplace_back(i, (int32_t) s);
+                    ++pi;
+                    break;
+                }
+            }
+            if (cudaDeviceSynchronize() != cudaSuccess)
+                std::fprintf(stderr, "strata: cow: refilling the expert cache after the arena gave back failed: %s\n",
+                             cudaGetErrorString(cudaGetLastError()));
+            for (const auto& [i, s] : filled) host_res[i] = s;
+            if (d_res != nullptr &&
+                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess)
+                std::fprintf(stderr, "strata: cow: the residency table upload (arena retake) failed: %s\n",
+                             cudaGetErrorString(cudaGetLastError()));
+            std::fprintf(stderr, "strata: cow: %lld slots back to the expert cache, %lld refilled from the profile "
+                                 "(cache at %lld of %lld)\n", (long long) (cf_lo - lo0), (long long) filled.size(),
+                         (long long) cf_lo, (long long) cf_top);
+        };
+        if (g_cow_cache_fund && o.batch > 0 && xcache.valid() && xcache.vmm_range() != nullptr) {
+            strata::core::qsa_cow_arena_set_funder([&] (int64_t want) -> int64_t { return cow_fund(want); });
+            std::fprintf(stderr, "strata generate: cow: arena admission is cache-funded: the expert cache gives what "
+                                 "a grow needs above the bank, down to %lld of its %lld slots (the prompt loan's "
+                                 "%lld stay its own)\n", (long long) (cf_top * 50 / 100), (long long) xcache.slots(),
+                         (long long) (xcache.slots() - cf_top));
+        }
         auto detach_slot = [&](int b) -> bool {
             BSlot& sl = bs[(size_t) b];
             if (!park_slot(b)) return false;   // the conversation must be safe in the parked tier first
@@ -15893,8 +16186,13 @@ int main(int argc, char** argv) {
                     bslot_arena[0][(size_t) b] = nullptr;
                     std::fprintf(stderr, "strata serve: conversation cache: slot %d detached idle: session arena "
                                          "returned (%.2f GiB back)\n", b, (double) slot_bytes0 / 1073741824.0);
+                    strata::core::qsa_cow_arena_give_back((int64_t) slot_bytes0);   // (dyn-conc P2) its claim is the next session's
                 }
             }
+            // (dyn-conc P2 stage B) this slot's arena range came back with its session, so whatever the
+            // remaining attached slots no longer own goes back: parked in the bank, ready for the next grow.
+            (void) strata::core::qsa_cow_arena_trim();   // the trim reports its own reason; nothing to add here
+            if (g_cow_cache_fund) cow_retake();          // (dyn-conc P2 stage C) chunks the arena will not need go back
             return true;
         };
         // a sweep over the idle slots; run where a request just ended (the completion has been emitted, so the
@@ -15915,6 +16213,7 @@ int main(int argc, char** argv) {
             }
             size_t ncache = 0;
             for (const BSlot& s2 : bs) if (s2.cached && !s2.active) ++ncache;
+            mem_mark("a request completed (the serve's steady state)");   // (dyn-conc P2) the free-memory curve across serving
             std::fprintf(stderr, "strata batch: S4v2 sweep: detached %zu, idle-cached slots %zu, oldest idle %lld ms\n",
                          nsw, ncache, oldest);
             for (size_t b = 0; b < bs.size(); ++b) {

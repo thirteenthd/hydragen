@@ -1865,3 +1865,13 @@ A/B needs a shape where demand outruns the reservation: a batch-4 mech
 (smaller reservation, raisable cap) or a concurrency-above-batch probe
 arm. Both are queued behind the open b8-elastic death-family item (the
 mid-leg 2/4-stream deaths above).
+
+Landing note: the whole `dynconc-arena` chain (`29f10bf4` → `3665a350` +
+the stage-C working patch) is snapshotted onto this branch's tree — the
+five touched engine files are byte-identical to the ms01 binary that ran
+the smokes and the v7 grid (`layer.cpp` md5 `d964a48c…`, `generate.cpp`
+`94d81616…`, `layer.hpp` `a8749ebf…`; earlier md5 notes predating the
+fix-round re-scp are superseded by these). The serve/dashboard/packaging
+surfaces deliberately keep trunk's newer versions — the arm's base
+predates §184/§185/#656/§203 and taking the arm copies would have
+reverted them. `main` awaits ctest + a soak on the merged tree.

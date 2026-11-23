@@ -129,7 +129,9 @@ and the K/V arenas elastic instead of boot-frozen.
 | dyn-conc P2 stage C | the expert cache funds an arena grow above the reservation | implemented, smoke green (first-ever live grows: map 4096→16384+); b8 grid null — §206 clamp + reservation make the fund path unreachable at batch 8, a b4 or above-batch shape is owed §216 |
 
 Canonical today: M-C11-win2 + S8-v2, with the dyn-conc P2 chain (§211–§216)
-landed on the arm branch `dynconc-arena` and owed its main-tree landing; the
+on the arm branch `dynconc-arena`, snapshotted onto `m-d-conc` byte-identical
+to the ms01 build that measured it; its landing into `main` is owed a ctest +
+soak pass on the merged tree; the
 mech-arm C1–C8 scaling curve (cold 28.2→98.0, warm C8 142.4 tok/s, §210) is
 the concurrency headline on the bench node.
 
