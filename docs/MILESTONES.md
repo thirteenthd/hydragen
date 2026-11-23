@@ -105,8 +105,33 @@ This is the chain the shipped product stack stands on.
 | M-C9 | deep-checkpoint retention + resume: disk image competes with the RAM match and mounts the deepest checkpoint, not the last-saved one | deep warm 100k replays at 2–3 s wall (was ~39 s re-prefill) §157 |
 | M-C10 / b / c | RAM-tier park-anchor donor lifetime: donors stop being eviction candidates while an anchored child is resident; stale deque index in the eviction cascade fixed (the run56 SIGSEGV); park holds the anchor through the cache's single-slot guard | run64: 3x4 deep 100k replays under CoW parks, zero anchors lost, zero QC fails §158 |
 
-Canonical today: M-C9 + M-C10c, benchmarked at c4/c8 deep 100k in §159 and
-replicated on a second 12 GB box in §162.
+## Era E — the concurrency pipeline, S0 → dyn-conc P2 (2026-11-18..23)
+
+Goal: raise live concurrency on 12 GB by making batch slots, idle sessions,
+and the K/V arenas elastic instead of boot-frozen.
+
+| Marker | Intended outcome | Progression |
+|---|---|---|
+| S0 | config-only memory-tier levers | CLOSED-NEGATIVE — resident arena beats the mmap file tier when the pack fits RAM §179 |
+| S1 | re-cut the fork onto upstream 0.1.60 | LANDED; fork overlay reapplied, battery constants re-notarized §181 |
+| S2 | batch slots at capacity | B=4 boots clean on 12 GB; per-stream window decode pays ~35%; prod rule: pair batch>1 with kv-resident or 131k context (ladder record) |
+| S2b / S2b-v2 | shared live-KV prefix across slots | mechanism live, RETIRED as a VRAM capacity lever — cannot buy capacity with capacity; M-C1e law holds in the batch era |
+| S3 | two-zone VRAM expert arena (pin floor) | VOID + TABLED — the patch guarded a victim loop the bench harness never ran; pinning axes assessed (host-RAM page-locking pays, VRAM victim-locking doesn't) |
+| S4 / S4-v2 | idle-session lifecycle: a detached slot hands its arena back, admission re-carves a bigger window | LANDED §184, §200; payoff = admission economics, not decode speed: 115,698/115,705 tokens re-used in 874 ms vs 65 s re-prefill §203 |
+| S5a / S5b / S5d | unbuffered parallel park I/O; .bcs block container; per-session expert-hit histogram | LANDED §183, §186, §195 |
+| S6 | multi-profile category store | TABLED alongside S3 |
+| S7 | VRAM budget trims (idx-pool FP16, kv-resident rungs) | idx-pool F16 +175 expert slots §199; kv4096 fails identical-outputs-at-depth (depth gate) |
+| S8 | shared-head fan-out, CoW arm live | fan-out dilution law §201; crash-class forensics §202; prod 24 GB arm NEGATIVE, rolled back §203/§205; CoW arm green on the bench node, warm fan-out escapes dilution §204 |
+| S8-v2 | first-fit arena allocator + zombie reclaim, boot sizing clamp, measured detach/re-carve loop | LANDED §206 |
+| S8-v3 grids | mech batch×fraction grid; COW_SHARED re-arm under the elastic floor | batch is the survivorship dial, b8_f50 mech shape §214; COW_SHARED stays OFF §215 |
+| dyn-conc P2 stage A | VMM arenas, boot floor, mapped-capacity admission | LANDED on arm branch `dynconc-arena` §211 (+ ARENA_CONC demand sizing: +29.7% resident experts) |
+| dyn-conc P2 stage B | elastic windows, detach parks chunks in a bank, reservation = spendable claim | LANDED + PROMOTED on the bench mech §212; floor-dial verdict FLOOR=4096, host-RAM cliff removed by soak §213 |
+| dyn-conc P2 stage C | the expert cache funds an arena grow above the reservation | implemented, smoke green (first-ever live grows: map 4096→16384+); b8 grid null — §206 clamp + reservation make the fund path unreachable at batch 8, a b4 or above-batch shape is owed §216 |
+
+Canonical today: M-C11-win2 + S8-v2, with the dyn-conc P2 chain (§211–§216)
+landed on the arm branch `dynconc-arena` and owed its main-tree landing; the
+mech-arm C1–C8 scaling curve (cold 28.2→98.0, warm C8 142.4 tok/s, §210) is
+the concurrency headline on the bench node.
 
 ## Decoding the abbreviations you'll still see
 
@@ -119,3 +144,16 @@ replicated on a second 12 GB box in §162.
 - `HTIER` = pinned host expert hot-tier size in GiB (Era A/B capacity knob).
 - `IQ3_XXS / IQ3_S / Q5_K` = quantization classes of the model blobs
   (expert pack and dense wire formats).
+- `sync180` = the engine arm tree built from upstream Strata 0.1.60 plus
+  the fork overlay (§181 lineage); on the bench node at `~/hydragen-sync180`.
+- `S0..S8-v2` = Era E concurrency-ladder markers (Era E table above); the
+  concurrency roadmap they come from is the milestone ladder doc.
+- `P2 stage A/B/C` = the arena-elasticity stages: VMM arenas + floor (§211),
+  elastic windows + bank (§212), cache-funded admission (§216).
+- `b4 / b8 / b12` = batch-slot-count arms; `f35 / f50 / f65` = expert-cache
+  fraction arms of the mech grid (§214); `sh` = a `STRATA_COW_SHARED` arm
+  (OFF per §215).
+- `ELASTIC / FLOOR` = `STRATA_COW_ARENA_ELASTIC` / `_FLOOR`, the arena
+  elasticity switch and its free-VRAM dial (§211–§213).
+- `dynconc-arena` = the bench-node branch carrying §211–§216's engine
+  commits; owed a main-tree landing.

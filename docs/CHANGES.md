@@ -1606,3 +1606,262 @@ unchanged at ~36-39.
 - Context: 24 GB prod fanouts ran 47.9 tok/s @C2 / 107.8 @C4 (§206
   era); a 12 GB mech-arm box now sits at 98 @C8 - within 10% of the
   24 GB box's C4 ceiling on 4x the stream count.
+
+
+## 211 — dyn-conc P2 stage A: the CoW arenas become VMM-backed, boot to a mapped floor, and admission gates on mapped capacity
+
+The arena campaign so far reserved every window slot at boot — the arenas
+were a fixed tax on the expert cache, and §209's incident class (refusals,
+crash-loops at the arena ceiling) had no elasticity to absorb it. Stage A
+(ms01 branch `dynconc-arena`, commit `71f52ff2`) rebuilds the K/V arenas on
+the CUDA VMM API: the whole window region is *reserved* (pointers never move,
+so graphs and kernels keep them) while only a *floor* is *mapped*.
+
+Lineage first, because this chain does not sit on §206's tree: the ms01 arm
+tree re-cut to upstream 0.1.60 with the fork overlay (`ccdc8923`, 2026-11-18),
+then carried the S8-v2 line over (`29f10bf4`, 2026-11-23) — slot detach and
+KV_GROW gating, park-hist, checkpoint pool, rope-table guards — and added
+`STRATA_COW_ARENA_CONC`, which sizes the arena for expected resident streams
+instead of `--batch`: measured same-shape C1, arena 0.87 → 0.29 GiB, engine
+self-clamped batch 4 → 2 at boot, resident experts 2709 → 3515 (+29.7%).
+Stage A lands on top of that shape.
+
+Mechanism:
+- Boot line `cow: K/V arenas: 12 QSA layers x N slots ... reserved, all
+  mapped (INT8 streamed, VMM)`; the admission gate is now mapped slots, not
+  the reservation. Unmapped reservation costs no physical VRAM.
+- `STRATA_COW_ARENA_FLOOR` boots a smaller mapped window (floor ≥ the first
+  admission's slots). Freed chunks return to the driver and the auto-sized
+  expert cache spends them: floor 18432 → 6144 on the bench node gave
+  2709 → 3430 resident experts (+26%), and the engine boot-clamped `--batch`
+  from 4 to 2 by refusing slot-session init at the mapped-capacity gate —
+  the clamp is graceful, the server serves on the slots that fit.
+- Elastic API (`qsa_cow_arena_need/grow/shrink/mapped`) quiesces like
+  `--kv-grow`; shrink refuses while any range cursor or refcount names a
+  chunk past the target.
+
+Cost law (measured, closed-negative to fight): every VMM region pads to
+2 MiB chunk alignment — `cuMemGetAllocationGranularity` MIN == RECOMMENDED ==
+2 MiB on the 3080 Ti — so all-mapped VMM arenas cost ~160 MB vs cudaMalloc
+(2709 → 2611 experts). Packing tricks cannot claw it back. The elasticity,
+not the padding, is the win: cudaMalloc arenas could not grow at all.
+
+## 212 — dyn-conc P2 stage B: windows follow demand, detach parks chunks in a bank, and a reservation becomes a claim the admission can spend
+
+Three commits (`51c0ad3c`, `0f467b4c`, `3665a350`, all 2026-11-23) close the
+elasticity loop, inert unless `STRATA_COW_ARENA_ELASTIC=1`:
+
+- A slot whose window sits above the floor boots **unattached** (the verifier
+  skips an uncarved state instead of exiting) — exactly the state an idle
+  detach leaves. Admission grows the window for itself; the detach sweep
+  trims to the highest range still owned and **parks the freed chunks in a
+  bank** (`STRATA_COW_ARENA_BANK_MIB` caps it) instead of handing them to the
+  driver, so the next grow takes them before touching VRAM. Measured cycle:
+  `arena trimmed to 6144 of 18432 window slots (96 chunks parked, 0 given
+  back)`, VRAM 11525 → 10861 MiB; the next wave's two grows drew the bank's
+  48 chunks first; every stream served, floor never crossed.
+- Trim shrinks only from the top of the arena (a stack); releasing a low
+  range while an attached slot holds the top correctly reports nothing spare
+  above the target.
+
+Four laws earned the hard way, each one a measured death:
+- **Deferred must be priced.** Anything sized after the expert cache must be
+  added to its reserve (`qsa_cow_arena_note_deferred`); unpriced, every C4
+  re-attach failed at `the slot's session could not be re-carved` and the
+  stream ended at one token.
+- **The growth line guards only a nonzero ask.** Bank chunks are already
+  allocated; mapping them back costs no VRAM. Refusing free grows while the
+  card already sat under the 512 MiB line manufactured a death signature
+  (ask 0 MiB, 505 free vs the line → decline → capacity gate → 3 streams
+  dead in the window).
+- **The doubled re-carve window and elastic growth spend the same budget.**
+  Under elastic, `STRATA_SLOT_KV_GROW` takes the single-size candidate;
+  doubling pushed the map to 14336/18432 and the card to 145 MiB free.
+- **A reservation is a claim, not only a subtraction.** The deferred
+  session's reservation shrank the cache sizing, but nothing let the later
+  admission *spend* those bytes — the same GiB was charged twice and
+  reservations went idle while admissions starved. Fix (`3665a350`): the
+  budget is drawn on attach success and in the grow, given back on detach,
+  and only the part of an ask the reservation does *not* cover meets the
+  free-VRAM line.
+
+Stage-B A/B (bench node, ctx 131072, batch 4, cells 8192, floor 6144, seven
+phases with unique tags so every phase admits a fresh conversation): eager
+control kept 2774-slot cache and all streams alive but rode the card to
+7 MiB free at peak; elastic kept 2679 slots (~3.5% cache), grew the map
+6144 → 10240, all streams alive, zero `#2065` warnings, and detach returned
+0.34 GiB per idle slot. With the cache left on auto (2849 slots) the second
+deferred session cannot pay — C4 dies — which is the capacity line at this
+context, not a bug.
+
+## 213 — the floor is a free-VRAM dial: FLOOR=4096 promoted on the bench mech, and the host-RAM cliff that elastic + floor removed
+
+`STRATA_COW_ARENA_FLOOR` is not a safety margin — it is a dial on how much
+VRAM the expert cache gets at boot, because the cache is sized exactly once:
+all-committed boot → 2849-slot cache; floor 6144 → 3360 slots / 5.47 GiB;
+floor 4096 → 3628 slots / 5.90 GiB (boot prints the free figure and the slot
+count every time — confirm the flip by reading `expert cache N slots`, never
+by trusting the env edit). Step the dial downward and re-probe each step.
+
+Matched warm-profile A/B, minutes apart (probe6 = three 2-up and three 4-up
+waves): the 6144 arm reproduced its old sums (4-up waves summed 31–41);
+4096 nearly doubled them (52–72; 2-up 29.5 → 52.5). Composition: +269 expert
+slots, −1.6 GiB boot `RssShmem`, +1.5 GiB `MemAvailable` under load.
+201-cycle soak at 4096: 601 streams, 0 dead, 0 errors, p50 18.0 tok/s,
+`MemAvailable` min 8680 MiB (at 6144: p50 14.7, min 7170, four streams
+under 5).
+
+The pre-elastic baseline soak on the same harness had the cliff: 18 cycles,
+45 streams, 2 errors, **three engine deaths** (exit −9, OOM killer),
+`MemAvailable` min 386 MiB, p50 11.8. The promoted config soaked 30 cycles /
+76 streams / 0 errors / min 7283 MiB / one engine pid throughout. The
+smaller boot commit is worth ~4–5 GiB of real headroom at this traffic
+shape; the engine's RSS is a ~40 GiB anonymous arena that does not climb —
+the few GiB of churn on top is what used to tip the killer.
+
+**Confound law (cost a fake attribution here):** the traffic-learned expert
+profile (`--expert-profile-save`) persists across restarts. Any knob
+re-measure must re-run the *baseline* arm on the same warm profile before
+attributing a delta to the knob — a jump that survives a same-profile
+baseline is real; one that doesn't was profile warmth. All §212–§213 numbers
+above are matched-warm, same-boot where claimable.
+
+Posture: the bench mech config (`:8181`) now runs `ELASTIC=1 FLOOR=4096` on
+binary `3665a350` (sha1 `02afaf20`) — a config-env flip, no rebuild; revert
+is `ELASTIC=0` plus restart.
+
+## 214 — the mech tuning grid: batch is the survivorship dial, fraction is nearly irrelevant
+
+Nine-cell sweep (batch 4/8/12 × expert-cache fraction 35/50/65, bench node,
+full seven-leg battery, 9/9 cells RC=0). Headlines:
+- **Batch decides who survives; fraction barely moves anything** (all
+  f-variants inside noise). b4 is fastest (farm 73, worst-leg 55 tok/s, hit
+  95–97%) but cannot hold the farm-C4-warm or nat-C4 legs — 2 of 4 streams
+  died in *every* b4 cell: 4 sessions for 4 streams plus the prefill burst
+  (the prompt path borrows ~3.8 GiB of CUDA0 slots) is an exact-fit pool
+  overrun, and it dies silent (`make_room`, zero log lines).
+- **b8 is the only zero-casualty profile** at C=4 × 25k (farm-C4-warm 64–65
+  with all four streams, nat-C4 27.4 all four, hit 90–92.5%). b12 survives
+  like b8 at ~15% lower decode and worse hit (80.9–85.8%) — and the engine
+  clamps `--batch` to `--conversation-cache-slots` anyway (b12 boots as
+  eight slot sessions), so the b12 cells ≡ b8.
+- Mechanism (verified from boot logs): `--batch N` allocates N VRAM slot
+  sessions (0.34 GiB each on this model) — an admission pool per live
+  stream, not a decode-speed knob — and the sessions eat the expert-cache
+  budget verbatim (b4 leaves 5.55 GiB for the cache, b8 leaves 3.39). The
+  hit-rate and speed gradients track exactly the VRAM handed to sessions.
+- Decision: **b8_f50 is the mech re-arm shape** (farm within 12% of b4 at
+  the only survivable batch); applied to the bench mech config.
+
+## 215 — COW_SHARED re-armed under the elastic floor: the v5 catastrophe is fixed and the verdict still says OFF
+
+The M-C1e shared-region verdict was earned pre-batching; both grids below
+re-test it as a *verdict-retest* on the 12 GB node, disclosure per the
+provenance law.
+
+v5 (pre-elastic, `COW_SHARED=32768`, negative and banked on the ms01 arm
+repo): paired cells show the shared region is a **boot-time reservation
+that taxes the expert cache at every concurrency level** — b8: 502 experts
+/ 0.83 GiB cache, hit 72.9%, +17–22% PCIe, 1 GiB available; farm-C4 64–65 →
+43.3. b4 −13%, b8 −38%. The C1 "regression" never needed a runtime
+explanation: the arena is sized before the cache gets its leftover, and the
+engine prints the trade per boot (audit line: `expert cache auto: ... -> N
+slots`, second witness `the slot sessions take X GiB ... that the expert
+cache would otherwise hold`).
+
+v6 (elastic floor 4096, four cells, farm-C4-warm legs / nat C2 / worst C2 /
+nat C4 / expert hit, tok/s):
+
+```
+b4_f50_e      67.0  75.8  36.5  56.7  39.1   97.6%
+b4_f50_e_sh   59.9  72.5  33.6  51.9  32.9   94.2%
+b8_f50_e      67.5  81.0  36.3  57.0  38.8   97.6%
+b8_f50_e_sh   62.0  70.9  33.5  50.4  36.9   96.3%
+```
+
+The elastic floor removed the v5 catastrophe (b8_sh farm-C4 43.3 → 62.0,
+available 1 → 9 GiB) — but the shared arm is still uniformly ~8% negative
+at healthy headroom. Leg caveat (learned from the v7 rerun): in **every**
+b8+elastic cell, v6 and v7 alike, the farm-C4-warm and nat-C4 legs lost
+2 of 4 streams mid-leg (the engine died and restarted — `avail` jumped
+9 → 59 GiB between legs); the shared-arm deltas above are read from the
+surviving streams and the clean legs. The death family is batch-elastic
+battery shape, not shared-arm-specific, and predates stage C — open item.
+Root cause of the shared delta is structural: the 32768-slot shared region
+is boot-committed and mapped (3.19 GiB) and **not floor-gated** — it walks
+past the elasticity and takes the cache's boot gift (3628 → 2623 slots).
+That is M-C1e's birth law restated at the batch era: you cannot buy
+resident capacity with resident capacity; every region slot costs an
+expert slot 1:1.
+
+**Verdict: `STRATA_COW_SHARED` stays OFF on 12 GB.** Opt-in mechanism stays
+banked for roomier substrates; a re-arm would have to floor-gate the shared
+region itself, and nothing measured here asks for that yet.
+
+## 216 — P2 stage C: the expert cache can now fund an arena grow (implemented; the b8 grid came back null — unreachable there)
+
+With stages A+B, the mech shape's ceiling stopped being VRAM and became the
+window-region cap `STRATA_COW_ARENA_SLOTS`: the stage-B boot reservation
+already covers the 18432-slot cap entirely, so grows never hit the price
+line — and above the cap, nothing was left to pay. Stage C (patch on
+`3665a350`, tree md5-matched on the arm node) makes the expert cache a
+funding source:
+
+- `STRATA_COW_CACHE_FUND=1` boots the expert cache VMM-backed
+  (`ExpertCache::set_vmm(true)` before the cache opens) — a segmented cache
+  can give slots away in chunk-sized pieces. The standing price of being
+  fundable: the same boot sizes the cache at 1758 slots / 2.87 GiB against
+  3628 un-fundable (VMM slot granularity plus the unattached-sessions
+  reservation; the A/B grid measures the full trade).
+- Economics order at admission: **reservation first** (stage B's claim is
+  already-paid money), then the funder pays **only the uncovered part**,
+  then the free-VRAM line sees what remains. A cache slot is expensive —
+  its expert pays a PCIe miss until a retake refills it — so it is never
+  spent while the reservation still covers.
+- The funder is the prompt-lending quiesce dance aimed at the arena:
+  quiesce → rebuild the owner/rank/cold tables on *every* call (the cache's
+  own admission moves experts between dances) → walk slots down from the
+  prompt's loan edge, never below `STRATA_COW_FUND_MIN_PCT` (default 50) →
+  a hotter expert moves into the coldest loan slot or drops to the CPU tier
+  → wholly-free chunks unmap and park in the bank (same one-bank rule as
+  detach trim, same cap). The reverse leg runs after every detach trim:
+  bank chunks map back into the cache's range and refill hottest-first from
+  the learned profile.
+- Silent paths made loud, because the v5/v6 mystery (grow block present,
+  zero grows, zero complaints) was only unmaskable retroactively: every
+  grow failure now prints (`arena grow attempt failed: ...`), and a
+  one-shot line names the first reason the fund declined to pay.
+
+Smoke (b8 shape, floor 4096, cap 18432, fund on): boot registers
+`cache-funded arena admission on`; 12 concurrent ~4k-token streams all
+served 200 (10.1–16.9 s each); **12 `arena grown to` lines — the mapped
+window climbed 4096 → 16384+**, the first grows ever observed in this
+family (v5/v6 grew zero, silently); 16 transient `no room` refusals all
+cleared on later admissions — with grows keeping pace the capacity gate is
+backpressure, not death. The funder itself stayed dormant (0 calls, 0
+complaints), correctly: the reservation covers a cap that size.
+
+The end-to-end grid (three cells on the b8 shape: control cap 18432 /
+cap 34816 fund-off / cap 34816 fund-on) came back **null, and the why is
+a law of its own**: the §206 boot clamp printed `the arenas hold 18432
+slots/layer, live demand is 34816 (main + 8 slot windows + one doubled
+round): raising the arena` — at batch 8 the config cannot set
+`STRATA_COW_ARENA_SLOTS` below `(1 + 2 x batch) x max(cells, kv-resident)/4`,
+so the control cell booted at the same 34816 as the raised cells, and the
+control-vs-cap pair was dead on arrival. All three cells then agreed within
+1% on every battery column and all three booted the cache at 1758 slots /
+2.87 GiB: at b8 it is the **stage-B reservation** (3106 MiB of unattached
+slot windows charged to the cache sizing) that sets the boot gift — against
+the 3628-slot gift of the batch-4 mech — and that reservation covers the
+whole clamped window region. The battery legs (slot sessions pre-sized at
+8192 cells, concurrency <= batch) therefore never reach the funder, and
+even the 12-concurrent probe's twelve grows were paid from the
+reservation's draw with the funder still dormant.
+
+Stage-C verdict as measured: **the fund path is currently unreachable on
+the b8 mech shape** — clamp plus reservation fully fund the window region —
+so stage C ships opt-in and dormant, honestly untested end-to-end. A real
+A/B needs a shape where demand outruns the reservation: a batch-4 mech
+(smaller reservation, raisable cap) or a concurrency-above-batch probe
+arm. Both are queued behind the open b8-elastic death-family item (the
+mid-leg 2/4-stream deaths above).
