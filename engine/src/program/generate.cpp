@@ -13409,7 +13409,12 @@ int main(int argc, char** argv) {
                         std::move(reuse), &reused_bytes, storage.empty() ? nullptr : &storage,
                         moved.empty() ? nullptr : &moved, anchor_img, anchor_tokens);
                 for (ConvCheckpoint& c : storage) ckpt_pool.give(std::move(c));
-                if (!saved) return false;
+                if (!saved) {
+                    // M-D2: every failure in the save chain sets err except the ConversationBuffer
+                    // visit guards; name the silent case instead of exiting serve with an empty `ERR`.
+                    if (err.empty()) err = "conversation park: the K/V save aborted without a message";
+                    return false;
+                }
                 if (anchor_img != nullptr) image.view_donor = (int64_t) anchor_serial;   // M-C3b3: name the park donor for lineage spills
                 pool_topup();   // what the park took (and what moved out) is allocated again, in the background
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)

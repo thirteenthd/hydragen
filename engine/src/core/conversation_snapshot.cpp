@@ -347,9 +347,9 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     for (size_t i = 0; i < dst.size(); ++i) {
         // Recopy the partial page and the indexer's moving spare row. Completed
         // pages/rows strictly before the first rewritten token remain identical.
-        const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim
-                                       * (strata::kernels::qsa_real_shapes().idx_pool_f16 ? 2 : 4) : 0)
-                                  : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
+        size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim
+                                      * (strata::kernels::qsa_real_shapes().idx_pool_f16 ? 2 : 4) : 0)
+                             : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
         const size_t anc = anchor ? anchor_keep[i] : 0;
         if (anc > keep && src[i] && !on_device(src[i]) && dst[i]->adopt_shared(*anchor_part[i], anc,
@@ -362,6 +362,21 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
                 })) return false;
             if (reused_bytes) *reused_bytes += anc;
             continue;
+        }
+        // M-D2: this part's buffer may be the conversation's own previous park image, which can still
+        // hold CoW view segments from its last park's anchor (or the adopt above was refused and left
+        // the buffer untouched). A write landing on a borrowed segment aborts visit() with NO error
+        // string, which surfaced as the b8-elastic battery's exit-code-1 park deaths with an empty
+        // `ERR`. Drop this part's reuse when the rewrite range hits a view: copy it whole, fresh.
+        if (dst[i]->has_borrowed(keep, sizes[i] - keep)) {
+            static const bool said = [] {
+                std::fprintf(stderr, "strata: conversation park: the reused K/V part holds CoW views under "
+                                     "this park's rewrite range; copying the part fresh\n");
+                return true;
+            }();
+            (void) said;
+            *dst[i] = ConversationBuffer{};
+            keep = 0;
         }
         {   // STRATA_PARK_VRAM_MIB: with a slot, the whole part goes device to device into it (a restore of this image
             // reads it from there) and the host buffer gets only the bytes past the kept prefix, read from the slot on

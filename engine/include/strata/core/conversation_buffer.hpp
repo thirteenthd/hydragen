@@ -213,6 +213,17 @@ public:
     // tier turns those runs into view entries instead of a second copy of the donor's bytes.
     size_t dbg_borrowed() const { size_t c = 0; for (const auto& s : segments_) if (s.borrowed()) ++c; return c; }
     size_t dbg_segs() const { return segments_.size(); }
+    // M-D2: true when a write of [offset, offset+count) would land on at least one borrowed (CoW view)
+    // segment: visit() aborts such a write with no error string, so callers check this BEFORE visiting.
+    bool has_borrowed(size_t offset, size_t count) const {
+        size_t begin = 0;
+        for (const auto& s : segments_) {
+            const size_t end = begin + s.size();
+            if (s.borrowed() && offset < end && offset + count > begin) return true;
+            begin = end;
+        }
+        return false;
+    }
     template<class Fn> void head_spans(Fn fn) const {
         for (const auto& s : segments_) {
             if (!s.borrowed()) break;

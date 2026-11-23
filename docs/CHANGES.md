@@ -1786,7 +1786,8 @@ b8+elastic cell, v6 and v7 alike, the farm-C4-warm and nat-C4 legs lost
 2 of 4 streams mid-leg (the engine died and restarted — `avail` jumped
 9 → 59 GiB between legs); the shared-arm deltas above are read from the
 surviving streams and the clean legs. The death family is batch-elastic
-battery shape, not shared-arm-specific, and predates stage C — open item.
+battery shape, not shared-arm-specific, and predates stage C — open item
+(closed by §217).
 Root cause of the shared delta is structural: the 32768-slot shared region
 is boot-committed and mapped (3.19 GiB) and **not floor-gated** — it walks
 past the elasticity and takes the cache's boot gift (3628 → 2623 slots).
@@ -1864,7 +1865,7 @@ so stage C ships opt-in and dormant, honestly untested end-to-end. A real
 A/B needs a shape where demand outruns the reservation: a batch-4 mech
 (smaller reservation, raisable cap) or a concurrency-above-batch probe
 arm. Both are queued behind the open b8-elastic death-family item (the
-mid-leg 2/4-stream deaths above).
+mid-leg 2/4-stream deaths above; closed by §217).
 
 Landing note: the whole `dynconc-arena` chain (`29f10bf4` → `3665a350` +
 the stage-C working patch) is snapshotted onto this branch's tree — the
@@ -1875,3 +1876,65 @@ fix-round re-scp are superseded by these). The serve/dashboard/packaging
 surfaces deliberately keep trunk's newer versions — the arm's base
 predates §184/§185/#656/§203 and taking the arm copies would have
 reverted them. `main` awaits ctest + a soak on the merged tree.
+
+## 217 — M-D2: the b8-elastic battery death family — a silent CoW-view park write; the guard closes it
+
+§215's leg caveat and §216's "open death family" are now closed, root cause
+found and the fix measured on the same battery that reproduced it.
+
+The signature (identical in every b8-elastic cell, v6 and v7 alike): the
+wrapper logged `the engine reported an error:` with nothing after the colon,
+then `the engine stopped unexpectedly (exit code 1)`; the engine's last log
+line was always `park COW anchor mounted for N of M tokens`. Two deaths per
+cell, auto-healed by the serve wrapper mid-battery — which is what zeroed
+the farm-C4-warm and nat-C4 legs' streams and jumped `avail` from 9 to
+58 GiB.
+
+The trace: park failure exits serve at the one site that prints
+`ERR %s` + `return 1`, and the message was empty — so the failing callee
+was one of the two sites in the whole park→save→`conversation_kv_save`
+chain that return false **without setting the error string**:
+`ConversationBuffer::visit_impl` — the range guard and the
+`never write through another owner's bytes` borrowed-segment guard
+(`conversation_buffer.hpp`).
+
+The mechanism: farm conversations share a 19.8 k-token prompt prefix, so
+their parks take the M-C2 CoW route — `adopt_shared` mounts read-only
+*views* of the donor image's bytes (the `park COW anchor mounted` line).
+`--conversation-cache-park-gain` defaults to 0, so the warm leg re-parks the
+same conversation, and `take_reuse_for` hands back its **own previous
+image buffers — still holding those borrowed view segments**. The reuse
+branch rewrites from the page-rounded kept prefix; when that range lands
+under the old view head, `visit()` aborts with no message, the park fails,
+serve exits 1, the wrapper restarts it. The geometry is rare — one
+anchor-park plus a re-park diverged back under the view head — which is
+why a 12-stream smoke never hit it but the battery did twice per cell. It
+predates P2-C (it is M-C2-era code), exactly as §215 observed.
+
+The fix (3 files, §202 law — silent paths go loud):
+- `conversation_buffer.hpp`: `has_borrowed(offset, count)` — check before
+  visiting for a write.
+- `conversation_snapshot.cpp` `conversation_kv_save`: when the rewrite
+  range hits a view, drop this part's reuse and copy it whole, fresh, with
+  a one-shot notice (`the reused K/V part holds CoW views under this
+  park's rewrite range; copying the part fresh`).
+- `generate.cpp`: `if (!saved)` names the silent case
+  (`conversation park: the K/V save aborted without a message`) instead of
+  exiting with an empty `ERR`.
+
+Measured same-boot against the reproducing battery (b8 grid config,
+`STRATA_PARK_TRACE=1`, tree `3665a350` + P2-C + M-D2, ms01 3080 Ti):
+**before**: 3 boots / 2 deaths, farm-C4-warm `decode=[72.6,72.5,0,0]`,
+nat-C4 `[73.0,0,0,24.9]`. **after**: `boots=1`, `deaths=0`,
+`cowguard=1 silenterr=0` — the notice fired exactly once (the rare
+geometry, caught) — legs whole: farm C1 42.6, C2 69.9, C4 69.3,
+C4-warm `[72.5,72.5,73.2,72.2]`, nat C2 50.6 s (no restart stall inside),
+nat C4 `[73.2,73.7,45.2,45.5]`; `avail` steady 8–9 GiB throughout. Surviving-leg
+decodes from §215 reproduce within noise, so the death family was the only
+confounder in those legs.
+
+Landing: patch on the canonical `m-d-conc` tree and on the ms01 arm tree
+(`conversation_buffer.hpp`, `conversation_snapshot.cpp`, `generate.cpp`;
+originals `.bak-md2`); `build-s180` rebuilt; the live b4 mech restarted on
+it (:8181, one completion smoke, clean). This unblocks the §216 fund A/B:
+the queue-vs-fund arm can finally measure without mid-leg deaths.

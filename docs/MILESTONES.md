@@ -127,6 +127,7 @@ and the K/V arenas elastic instead of boot-frozen.
 | dyn-conc P2 stage A | VMM arenas, boot floor, mapped-capacity admission | LANDED on arm branch `dynconc-arena` §211 (+ ARENA_CONC demand sizing: +29.7% resident experts) |
 | dyn-conc P2 stage B | elastic windows, detach parks chunks in a bank, reservation = spendable claim | LANDED + PROMOTED on the bench mech §212; floor-dial verdict FLOOR=4096, host-RAM cliff removed by soak §213 |
 | dyn-conc P2 stage C | the expert cache funds an arena grow above the reservation | implemented, smoke green (first-ever live grows: map 4096→16384+); b8 grid null — §206 clamp + reservation make the fund path unreachable at batch 8, a b4 or above-batch shape is owed §216 |
+| M-D2 | trace the b8-elastic battery death family | CLOSED — a silent CoW-view park write: a re-park's rewrite range lands on borrowed view segments in its own reused park image; `has_borrowed` guard + fresh-copy fallback; same-battery re-run: 1 boot / 0 deaths, guard fired once §217 |
 
 Canonical today: M-C11-win2 + S8-v2, with the dyn-conc P2 chain (§211–§216)
 on the arm branch `dynconc-arena`, snapshotted onto `m-d-conc` byte-identical
