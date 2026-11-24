@@ -2167,3 +2167,40 @@ Consequences: the fork/arena story of §220 stands; §221's knob verdicts (join0
 detach0 path-class) stand; the Windows :8080 exposure note of §221 is RESTORED (the fork is
 live there too) though the fix, once proven, supersedes any mitigation. §219 promotion
 stays blocked until fix222 is green and grids are re-run.
+
+### §223. The §222 fix is not sufficient: arena-on still degrades on the fixed binary — 1/4 twice, vs 8/8 arena-off (2026-11-24)
+
+The §222 test verdict is in, on a rebuilt ms01 mech binary (`build-s180/hydragen`, mtime
+Nov-24 07:11, carries `STRATA_COW_FORK_HEADROOM`, i.e. built from 7cb7f1e). The discriminator
+is the 4-up parallel probe (`probe222x.py parallel`: 13k-token prompts, 900-token arms, four
+concurrent seeded conversations, qc = both numeric marks echoed and `finish=stop`):
+
+1. Stock mech (`COW_ARENA=1 COW_FORK=1 JOIN_HH=8`), two rounds, seed bases 8300 and 8310:
+   **1/4 and 1/4**. The failing tails are degeneration/refusal — `3.14`, `no meaningful
+   answer to extract from this string of characters`, `27 3 1`, `34 12`, `...clarify the
+   goal`, `3.1415926535` — every arm `finish=stop`: corruption, not truncation. One arm
+   survives in both rounds.
+2. Same binary, same boot ladder, `COW_ARENA=0` (`strata-green1.json`), two rounds, seed
+   bases 8200 and 8210: **8/8**.
+3. The restore-QC arms stay green on arena-on (`fix222b`, `fix222b2`: `restore_qc_fail=0`):
+   §222's four bugs genuinely healed on the restore path. The surviving corruption carrier
+   under the probe shape is elsewhere in the arena-on path and needs concurrent forks
+   (serial W-probes were clean pre-fix too).
+
+So §222's gate reads: restore-QC green, degradation red, and degradation is the gate that
+counts. The §220 law ("everything arena-on red") survives the fix; the only green axis
+remains `COW_ARENA=0`.
+
+Live reproduction of the same corruption class on the Windows :8080 desktop service:
+pre-fix binary (`hydragen-pb4.exe` built Nov-22 09:57, before 7cb7f1e), `COW_ARENA=1
+COW_FORK=1 JOIN_HH=8`, interactive sessions to ~126k-token depth — the service log shows
+4-token degenerate generations, `KV streaming: OVERFLOW (too few resident cells)` at >90 %,
+`park COW anchor mounted for 3 of 125830 tokens`, `reused_kv_bytes` ~1.9 GB. §221's exposure
+note (restored by §222) is confirmed: the desktop service has been serving on the corrupt
+path. Mitigation staged in config (`COW_ARENA=0`, backup `hydragen-local.json.bak-arenaoff`),
+restart pending.
+
+Next engineering target: the carrier sits inside the arena claim/release path under
+concurrent fork pinning; the `STRATA_COW_DEBUG` knob (c172460: CLAIM/RELEASE/ZOMBIE/GROW/
+SHRINK per-layer events) is the intended observation under the 4-up shape. §219 promotion
+stays blocked; the known-green production axis is `COW_ARENA=0`.
