@@ -2031,3 +2031,41 @@ pre-existing in the ctest190 baseline: ple_parity (wants ../../Q2_0/*.gguf, an
 asset path absent in the arm tree) and cuda_spill_guard (known). Ops law: the
 ctest gate is full-suite -j4 then re-run-failures serially; never conclude a
 regression from a -j4 parity/snapshot fail alone.
+
+### §220. KV-window degradation bisected to the dyn-conc arena VMM conversion (2026-11-24)
+
+The endurance-battery content degradation (W3 restores returning 3-6-token
+refusals; repetition collapse at temp 0) was bisected on ms01 to the dyn-conc
+stage-A/B arena conversion, not to M-D2, P2-C.5, the learned profile, spec
+decode, or the park store:
+
+- stage A = 11/21 source state (arena arrays = plain cudaMalloc): W3 4/4 green.
+- stage B = +4c39aa5 (arena window arrays live on one VmmRange per arena:
+  CowArena::vr + off[11] chunk-aligned offsets; boot maps the floor, windows
+  attach at admission): W3 4/4 red, restore walls normal, expert hit 93-98%,
+  no engine errors, counters clean.
+- arena0 = same B binary, STRATA_COW_ARENA=0: 8/8 GREEN - the first perfect
+  W1 wave (4/4) ever recorded on the m25_churnpar v2 battery, which had been
+  67/68 red since its first use. W1's chronic red was the same bug.
+
+Same battery (mtime Nov 21 02:52, proven unchanged), same seeded profile,
+same cold park store, stock mech config, one variable per arm. The old
+11/21 green logs predate the v2 battery and were never comparable to it.
+
+Consequences, held to what is measured:
+- Every dyn-conc-era grid number (v7-v13, §216-§219) was collected while
+  every session's KV windows were degraded; cross-arm deltas are suspect and
+  §219's promotion gate stays blocked until the arena defect is fixed and
+  the pair re-run.
+- The fix hunt starts at the conversion's invariants: chunk-aligned off[11]
+  addressing, zero-fill on fresh VmmChunk maps, and whether grow at admission
+  can shift array offsets under live ranges. Mechanism NOT yet identified.
+- Local Windows engine (C:\hydragen, Nov-20 install) predates the conversion
+  and is not in the affected family.
+
+Method laws banked this session: (1) a battery whose mtime postdates the
+"green baseline" logs is not a baseline - check versions before bisecting;
+(2) .bak revert chains must be path-verified (src/core vs src/program) or
+the && chain silently reverts nothing while still booting the old binary;
+(3) overlapping arms on one host contaminate each other - one experiment,
+one queue.
