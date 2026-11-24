@@ -2079,3 +2079,35 @@ Method laws banked this session: (1) a battery whose mtime postdates the
 the && chain silently reverts nothing while still booting the old binary;
 (3) overlapping arms on one host contaminate each other - one experiment,
 one queue.
+
+### §221. Unification: the CoW fork is the carrier for both degradation families (2026-11-24)
+
+Single-variable arms on the committed C.5 tree (3eff8fd contents; live files md5-verified:
+generate=4f11fc10, layer=d964a48c, snapshot=76073a26), cold park store, m25_churnpar v2
+battery (seeds 8100+):
+
+- c5fork0 = C.5 + STRATA_COW_FORK=0: 8/8 green, W1 4/4 TRUE, W3 4/4 TRUE (walls
+  16.8-17.3 s), restore_qc_fail=0. First full-tree battery pass ever recorded.
+- The four-up parallel probe (mt 900, per-arm seeds) reproduces family 1 on every
+  arena shape with fork on (stage A 0/4 clean at ~13k, 2/4 refusals at ~1.6k; stage B
+  same), and is clean with fork off (stageA-fork0 8/8; stageB-arena0 W1 4/4).
+
+Families: (1) fresh+parallel content corruption, present since the arena-era with
+COW_FORK=1 - this is the battery's chronic W1-red (17 False/1 True history) and
+general session degradation under concurrency; (2) restore corruption, era-D only -
+the VMM re-placement (4c39aa5) did not create a new defect, it made the fork's
+aliasing hit the restore path (W3 flips red only after era-D). One carrier, two
+symptoms. The death family (§217, has_borrowed guard) is the write-side instance
+of the same borrowed-view aliasing class and stays closed: every degraded arm ran
+rc=0 with silent ERR streams.
+
+Held as static reasoning (marked unconfirmed): the fork shares page *contents*;
+the corruption pattern (survives forks of the same prompt, clean serial) fits a
+fork-time content race or aliasing, not a use-after-free (a freed cell would
+poison serial too). Next step is instrumentation, not more knobs: fork counters
++ A/B content compare of donor-vs-forked windows.
+
+Consequences: interim config law - COW_FORK=0 on mech and on the Windows local
+engine (the user-facing :8080 engine runs COW_FORK=1 and is exposed to family 1;
+fix = config line + service restart). §219 promotion: ctest green + battery green
+under fork-off; era-D grid numbers stay suspect until re-measured with fork fixed.
