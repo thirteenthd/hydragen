@@ -640,6 +640,10 @@ std::vector<CowArena> g_cow_arenas;
 int64_t g_cow_session_ctr = -1;
 std::vector<int64_t> g_cow_next;   // (S8-v2) per-ordinal bump high-water
 struct CowRange { int64_t base, n; };
+bool cow_debug_env() {   // (dyn-conc §221 hunt) opt-in arena event log; the default path is untouched
+    static const bool on = [] { const char* v = std::getenv("STRATA_COW_DEBUG"); return v && v[0] != '\0' && v[0] != '0'; }();
+    return on;
+}
 std::vector<std::vector<CowRange>> g_cow_free;    // (S8-v2) per ordinal: released ranges, sorted by base
 std::vector<std::vector<CowRange>> g_cow_zombie;  // (S8-v2) per ordinal: ended owners still pinned by a sibling
 int64_t g_cow_arena_gaps = 0;      // (S8-v2) cumulative pinned-at-release events (telemetry)
@@ -977,9 +981,15 @@ void qsa_cow_state_release(QsaState& st) {   // S8-v2: a session ending releases
     if (ord < 0 || (size_t) ord >= g_cow_arenas.size() || (size_t) ord >= g_cow_next.size()) return;
     const int64_t base = st.map.slot_base, n = st.n_slots;
     if (base < 0 || n <= 0) return;
+    if (cow_debug_env())
+        std::fprintf(stderr, "arena: RELEASE ord %lld base %lld n %lld\n",
+                     (long long) ord, (long long) base, (long long) n);
     if (cow_range_clean(ord, base, n))
         cow_free_push(ord, base, n);
-    else { g_cow_zombie[(size_t) ord].push_back({base, n}); ++g_cow_arena_gaps; }
+    else { g_cow_zombie[(size_t) ord].push_back({base, n}); ++g_cow_arena_gaps;
+           if (cow_debug_env())
+               std::fprintf(stderr, "arena: ZOMBIE ord %lld base %lld n %lld\n",
+                            (long long) ord, (long long) base, (long long) n); }
     // (S8-v2) this release may have been the last pin on an ended owner's range: sweep the zombies.
     std::vector<CowRange>& zl = g_cow_zombie[(size_t) ord];
     for (size_t r = 0; r < zl.size();)
@@ -1035,6 +1045,8 @@ bool qsa_cow_arena_grow(int64_t slots, const std::function<strata::core::VmmChun
     }
     cudaDeviceSynchronize();
     if (ok) g_cow_mapped_slots = slots;
+    if (cow_debug_env())
+        std::fprintf(stderr, "arena: GROW %lld -> %lld ok %d\n", (long long) from, (long long) slots, (int) ok);
     return ok;
 }
 int64_t qsa_cow_arena_shrink(int64_t slots, const std::function<void(strata::core::VmmChunk)>& give) {
@@ -1053,6 +1065,8 @@ int64_t qsa_cow_arena_shrink(int64_t slots, const std::function<void(strata::cor
     }
     cudaDeviceSynchronize();
     g_cow_mapped_slots = slots;
+    if (cow_debug_env())
+        std::fprintf(stderr, "arena: SHRINK to %lld freed %lld\n", (long long) slots, (long long) freed);
     return freed;
 }
 int64_t qsa_cow_arena_mapped() { return g_cow_mapped_slots; }
@@ -1417,6 +1431,10 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                 so = g_cow_next[(size_t) qsa_ordinal];
                 g_cow_next[(size_t) qsa_ordinal] += p.slots;
             }
+            if (cow_debug_env())
+                std::fprintf(stderr, "arena: CLAIM ord %lld base %lld n %lld %s mapped %lld\n",
+                             (long long) qsa_ordinal, (long long) so, (long long) p.slots,
+                             bumped ? "bump" : "reclaim", (long long) g_cow_mapped_slots);
             // (dyn-conc P2 stage B) an admission pays for its own window: the chunks a detach parked first,
             // the driver's free VRAM after that.  Boot maps only the floor (see the --batch carve), so a live
             // server's arena holds what its streams hold rather than the --batch ceiling.
