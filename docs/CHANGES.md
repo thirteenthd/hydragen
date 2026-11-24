@@ -2082,6 +2082,8 @@ one queue.
 
 ### §221. Bisection audit: the carrier is the arena window machinery; the fork claim was a false positive (2026-11-24)
 
+*(Superseded by §222: the dead-path audit below is itself wrong.)*
+
 Corrected verdict table (C.5 tree 3eff8fd, cold store, m25_churnpar v2 battery; and the
 4-up parallel probe at mt 900 with per-arm seeds):
 
@@ -2113,3 +2115,55 @@ exhausted.
 
 Consequences: §219 promotion stays blocked; era-D numbers stay suspect; the earlier
 "Windows :8080 fork-off mitigation" claim is also void (same dead-path reasoning).
+
+### §222. The §221 audit was itself wrong: the CoW fork IS on the live path, and it corrupts through four verified bugs (2026-11-24)
+
+The §221 reversal rested on `cow_fork_on` being read only inside `direct_slot_copy`. It is a
+`static` defined at generate.cpp:15645-15648 and consumed at THREE sites: :15680 (inside
+`direct_slot_copy`: that transport is indeed dead without `STRATA_SLOT_COPY_DIRECT`), :15814
+inside `copy_to_slot`'s legacy branch (:15796-15827, the branch the mech shape takes), and
+:15890 inside `copy_from_slot`. The fork fires on every batch admission and every slot->main
+continuation. The per-admission print at :15822 ("cow: the admission fork points at %lld of
+%lld prefix pages") is the proof of liveness; §204-era engine logs carry it ("points at
+1023 of 28927 prefix pages"). Consequences: c5fork0 8/8 green and the fork0 probe 8/8 are
+VALID evidence; arena0's green is the same axis (qsa_cow_fork returns a silent no-op when
+`slot_use` is null, layer.cpp:898-899, so arena-off disables forking too); the allfloor arm
+(COW_ARENA_FLOOR=18432, static full map: 0/8 red, restore_qc_fail=4) kills the elastic
+grow/shrink-churn hypothesis.
+
+Mechanism, verified by code reading (an external deep-read corroborated all four sites):
+
+1. Starved-window blinding (primary, both families): every request runs `read_windows` and
+   token 1 on `ss` (slot_base 0) before admission; the fork pins ~all of `ss`'s own slots
+   (use 1->2) for the batch slots; resolve never takes a pinned victim (`cow_hold`,
+   kv_stream.cu:202); the next conversation admitted/restored on `ss` overflows resolve
+   (`placed < need` -> page -1 + ctl[3], kv_stream.cu:262, whose comment claims it "never
+   happens"), and decode attention silently masks -1 blocks to -FLT_MAX
+   (qsa_decode_attn.cu:206-209). The conversation answers blind to ~99% of its KV, zero CUDA
+   errors. Explains the size threshold (900-line arm clean vs 1300 red), W1 and W3 together,
+   and the era-D flip (window shrank so one fork starves `ss`).
+2. `qsa_state_zero` (pre-fix layer.cpp:1679-1699): calls `kv_stream_reset` WITHOUT
+   `qsa_cow_release` (leaks pins, leaves stale conv/floor registry stamps: pin leak matches
+   the endurance soak's growing restore_qc_fail) and memsets its own slot range
+   unconditionally, wiping bytes still pinned by a live batch slot: the next fresh request's
+   `session_zero(ss)` corrupts W1 sessions mid-decode, which then park corrupted state.
+3. Lineage floor gating: `cow_lower_floor` ran only when `g_cow_shared > 0` (layer.cpp:931),
+   and resolve read the floor only when `lin_all != nullptr` (kv_stream.cu:98) - with
+   `STRATA_COW_SHARED=0` the floor stayed infinite, so joins-at-fetch could name a sibling's
+   divergent tail. Latent (join0 red: joins were not the carrier) but real.
+4. Rewind overwrite (unfixed, flagged): resume>0 from an in-memory checkpoint without
+   `refresh_residency` leaves positive table entries over fork-pinned slots, and neither
+   `kv_append` (kernels.cu:2562) nor `kv_append_q8` (kv_q8.cu:64) checks `slot_use`: a new
+   branch writes in-place through a shared page. Not shown active in the battery shapes.
+
+Fix (7cb7f1e): `qsa_state_zero` releases fork pins before resetting and zeroes its mapped
+range in runs, skipping slots with `slot_use > 1` (no-pin ranges zero identically to before);
+`qsa_cow_fork` keeps the source a headroom of unpinned slots (`STRATA_COW_FORK_HEADROOM`,
+default 512, clamped to n_slots/2; refused pages stay cold and re-fetch from the host image);
+the floor is lowered unconditionally at fork and read whenever the registry exists.
+Test: fix222 arm (stock mech, fork ON) on ms01 - verdict pending at writing.
+
+Consequences: the fork/arena story of §220 stands; §221's knob verdicts (join0, parkcow0,
+detach0 path-class) stand; the Windows :8080 exposure note of §221 is RESTORED (the fork is
+live there too) though the fix, once proven, supersedes any mitigation. §219 promotion
+stays blocked until fix222 is green and grids are re-run.
