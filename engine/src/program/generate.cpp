@@ -15681,7 +15681,7 @@ int main(int argc, char** argv) {
                     int64_t sh0 = -1;
                     for (int64_t j = 0; j < from.qsa_alloc; ++j) {
                         const int64_t sh = strata::core::qsa_cow_fork(from.qsa_states[from.qsa_ord0 + j],
-                                                                      to.qsa_states[to.qsa_ord0 + j], upto, e);
+                                                                      to.qsa_states[to.qsa_ord0 + j], upto, e, &ids);
                         if (sh < 0) return failed();
                         if (sh0 < 0) sh0 = sh;
                     }
@@ -15815,7 +15815,7 @@ int main(int argc, char** argv) {
                     int64_t sh0 = -1;
                     for (int64_t j = 0; j < from.qsa_alloc; ++j) {
                         const int64_t sh = strata::core::qsa_cow_fork(from.qsa_states[from.qsa_ord0 + j],
-                                                                      to.qsa_states[to.qsa_ord0 + j], upto, e);
+                                                                      to.qsa_states[to.qsa_ord0 + j], upto, e, &ids);
                         if (sh < 0) return false;
                         if (sh0 < 0) sh0 = sh;
                     }
@@ -15891,7 +15891,7 @@ int main(int argc, char** argv) {
                     int64_t sh0 = -1;
                     for (int64_t j = 0; j < from.qsa_alloc; ++j) {
                         const int64_t sh = strata::core::qsa_cow_fork(from.qsa_states[from.qsa_ord0 + j],
-                                                                      to.qsa_states[to.qsa_ord0 + j], upto, e);
+                                                                      to.qsa_states[to.qsa_ord0 + j], upto, e, (at != nullptr ? &at->ids : &bs[(size_t) b].ids));
                         if (sh < 0) return false;
                         if (sh0 < 0) sh0 = sh;
                     }

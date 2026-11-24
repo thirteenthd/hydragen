@@ -138,7 +138,7 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
                         if (lin != nullptr && b < fl) {
                             volatile int32_t* vlin = lin;
                             const int32_t L = vlin[b];
-                            if (L >= 0) {
+                            if (false && L >= 0) {   // arm-227: hint adoption OFF (miss registration stays)
                                 // prev-gated add (the M-C1d protocol): an unpinned hint (a dead holder)
                                 // or an in-flight claim (-2) takes itself back; revalidate against a
                                 // reclaim that moved the hint mid-protocol.

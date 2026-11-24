@@ -2204,3 +2204,79 @@ Next engineering target: the carrier sits inside the arena claim/release path un
 concurrent fork pinning; the `STRATA_COW_DEBUG` knob (c172460: CLAIM/RELEASE/ZOMBIE/GROW/
 SHRINK per-layer events) is the intended observation under the 4-up shape. §219 promotion
 stays blocked; the known-green production axis is `COW_ARENA=0`.
+
+## §224 — conversation-identity arms: fingerprint and tab-injective serials, both 1/4 (2026-11-24)
+
+Two source arms against the §222-fixed tree, each synced to `~/hydragen-sync180`,
+`ninja` in `build-s180`, gated by the 4-up degradation probe (`probe222x.py parallel`,
+four 13k-token prompts with two marker numbers, qc = both markers + `finish_reason=stop`):
+
+1. **§224 fingerprint identity** — `qsa_cow_fork(…, const std::vector<int32_t>* ids)`:
+   the lineage serial is chosen by an FNV-1a fingerprint of the conversation's token ids
+   (first `upto` ids, length mixed in) against a `ids-fingerprint → conv` table, so two
+   admissions of the same conversation adopt the same conv and different conversations
+   never share one. Both call sites pass ids (`copy_to_slot`: `&ids`; `copy_from_slot`:
+   `at ? &at->ids : &bs[b].ids`). Verdict: **1/4 and 1/4** (seeds 8300/8310) — the
+   failure tails are the same degeneration/refusal class as §223 (`e i a e i c y r`
+   character soup, number recitation, one refusal legibly answering a different task).
+2. **§225 tab-injective conv serials** — host-side hint-tab ownership: `g_cow_lin_owner`
+   maps each of the `kCowLinTabs` hint tabs to the live conv holding it; `cow_conv_new()`
+   hands out a serial injective over live tabs (LRU victim tab reset via
+   `cow_lin_reset(victim)` *before* the fresh holder claims it), and re-entering an
+   already-owned conversation no longer wipes its tab. Kernel untouched. Verdict:
+   **1/4 and 1/4** (seeds 8300/8310). Control on the same §225 boot: `parallel`→**serial**
+   probe seed 8500: **4/4** — and after 40 admissions the census still prints
+   `0 of 3193 prefix pages` allowed with neighbor admissions at 512/1023/29.
+
+Read-out: identity is *not* the carrier. The hint tabs are keyed `conv % kCowLinTabs`;
+§224 made conv honest per conversation, §225 made it injective per tab, and both still
+degrade 3-in-4. Both patches stay in the tree (they close real aliasing holes and the
+kernel's protocol is untouched); reverting them would only re-open holes the §222 note
+records.
+
+## §225 — the serial-vs-parallel asymmetry points at the join mechanics, not identity (2026-11-24)
+
+Arm ladder on the §225 binary/config (`strata-mechdbg.json`, park-disk serve shape,
+port 8181, arena 18432 slots, floor 4096):
+
+| arm | probe | verdict |
+|---|---|---|
+| stock mechdbg (fork1 hh8 shared0) | parallel ×2 | 1/4, 1/4 |
+| serial control (same boot) | serial | 4/4 (0 joins served) |
+| `COW_SHARED=0 COW_JOIN_HH=0` (JOINOFF) | parallel ×2 | 1/4, 0/4 |
+| `COW_FORK=0` (rest as JOINOFF) | parallel ×2 | **4/4, 4/4** |
+
+Corroborated earlier on the pre-§224 binary: NOFLOOR 4/4, FORK0FULL 4/4×2,
+`COW_ARENA=0` 8/8×2, `JOIN_HH=0` alone 1/4, `SHARED=1` 1/4, `SHARED=1+JOIN_HH=0` 2/4.
+
+The green family is exactly the arms that kill **either** the fork splice **or** the
+join paths; the red family is exactly "a join path is live". Code read closes the loop
+the JOINOFF arm left open: `join_ctr` bumps at exactly two sites in
+`kv_stream.cu` (:149 hint adoption, :179 sibling adoption); the sibling path consumes
+the per-entry `hhead` budget (gate at :172-176) but the **hint-adoption path at :149 is
+gated by neither `hhead` nor the shared region** — only `lin != nullptr` (which needs a
+registry conv ≥ 0 and a mapped hint table, both true with `SHARED=0`, because
+`qsa_set_cow_shared(0)` maps 0 region slots but leaves `lin_all` wired) and `b < fl`
+(the fork floor). That is why `JOIN_HH=0` alone scored 1/4 and why the JOINOFF config
+arm still served 15,508 joins: **config knobs never disabled hint adoption.** The
+`b < fl` gate also explains NOFLOOR and REKEY going green: both remove the gate, which
+kills adoption.
+
+Note on log hygiene: the FORK=0 rerun re-used the JOINOFF runner's output files
+(`probe-226.log`, `probe-226b.log`), overwriting the JOINOFF probe logs after their
+verdicts (1/4, 0/4) had been recorded above — verdicts preserved here, logs not.
+
+The fork floor law says only blocks below `fl` are byte-identical across the lineage,
+and adoption pins with the prev-gated M-C1d protocol plus a revalidate against
+reclaim-move; the resolve path fences its re-point (`slot_use` 1→0 CAS after detaching
+the entry, §220) — but the **append/write path names slots without any `slot_use`
+check**: `kv_append_q8_kernel` writes `kv_k/kv_v[page …]` for any `table[pos/page_size]
+≥ 0`, and `conversation_kv_restore` writes named slots directly. A window that joined
+a sibling's slot below the floor is only safe while the holder never rewrites that
+slot; the fork-join kernel's pin (`cow_fork_join_kernel` +1 per spliced foreign entry)
+protects against *eviction* (§222 bug #3) but nothing marks the *host-side rewrites*
+in `conversation_kv_save/restore` — which run on every `copy_to_slot`/`copy_from_slot`
+while other windows hold pins. Arm in flight at entry-time (§227): fork ON + hint
+adoption disabled at the source (`if (false && L >= 0)` at :141) — if that goes green
+while fork splice stays live, the adoption race is the carrier and the fix is a
+pin-checked rewrite, not a knob.

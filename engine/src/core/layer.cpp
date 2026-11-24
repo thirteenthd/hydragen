@@ -894,7 +894,69 @@ static void cow_lin_reset(int32_t conv) {
                               0xFF, (size_t) g_cow_lin_blocks * 4);
 }
 
-int64_t qsa_cow_fork(const QsaState& from, QsaState& to, int64_t upto, std::string& error) {
+// §224: fork lineage identity is the CONVERSATION, not the state hosting it. Admission forks from
+// main_ss - one session state refilled per request - so inheriting its entry's conv merged EVERY
+// admitted session into one lineage: the floor then claimed [0,P) byte-identity across DIFFERENT
+// prompts and joins-at-fetch served sibling sessions' tail KV (their different final instructions)
+// under that claim - the §220-§223 corruption (4-up probe: 1/4; fork off or floor pinned to 0: 4/4;
+// lineage re-keyed per conversation: 4/4 + 3/4 with zero OVERFLOW lines).
+static uint64_t cow_ids_fingerprint(const std::vector<int32_t>& ids, int64_t upto) {
+    uint64_t h = 1469598103934665603ull;
+    const int64_t lim = upto <= 0 ? (int64_t) ids.size() : std::min<int64_t>(upto, (int64_t) ids.size());
+    for (int64_t i = 0; i < lim; i++) { h ^= (uint32_t) ids[(size_t) i]; h *= 1099511628211ull; }
+    h ^= (uint64_t) lim; h *= 1099511628211ull;
+    return h;
+}
+static std::vector<std::pair<uint64_t, int32_t>> g_cow_conv_by_ids;   // fingerprint -> lineage serial
+// cow-m1e/§225: the kernel picks the hint tab by conv % kCowLinTabs, and the hint path NEVER checks the
+// tab's owner. Distinct lineages that hash to one tab (or whose tab was recycled under them) join each
+// other's slots through stale hints - the §222-§223 corruption, even with honest fork lineage. So the
+// host makes the hash injective while a lineage is live: serials are allocated per tab (conv ≡ tab mod
+// kCowLinTabs), one live conv per tab, LRU handover invalidates the victim's entries BEFORE clearing
+// the tab, and the fresh holder claims only after. Entry invalidation is the cow-m1d 4 B conv law, so
+// every interleaving a pipelined kernel can observe is safe: a victim entry either still names its own
+// (uncleared) tab or is -1 and takes no join at all. Evicted lineages lose sharing (cold fetches),
+// never correctness; a re-admitted one re-keys and re-claims.
+static int32_t g_cow_lin_owner[strata::kernels::kCowLinTabs] = {0};
+static uint64_t g_cow_lin_clock[strata::kernels::kCowLinTabs] = {0};
+static int64_t g_cow_lin_clock_ctr = 0;
+static bool g_cow_lin_owner_init = false;
+static int32_t cow_conv_new() {   // claim a tab, return its fresh conv serial
+    if (!g_cow_lin_owner_init) {
+        for (int t = 0; t < strata::kernels::kCowLinTabs; ++t) g_cow_lin_owner[t] = -1;
+        g_cow_lin_owner_init = true;
+    }
+    int32_t tab = -1;
+    uint64_t oldest = ~0ull;
+    for (int t = 0; t < strata::kernels::kCowLinTabs; ++t)
+        if (g_cow_lin_owner[t] == -1) { tab = t; break; }
+        else if (g_cow_lin_clock[t] < oldest) { oldest = g_cow_lin_clock[t]; tab = t; }
+    const int32_t victim = g_cow_lin_owner[tab];
+    if (victim >= 0 && g_cow_reg != nullptr)
+        for (auto& pe : g_cow_reg_h)
+            if (pe.conv == victim) { pe.conv = -1; cow_reg_conv(pe); }   // (tab,conv) pair never torn: a victim never re-joins a tab it lost
+    if (victim >= 0) cow_lin_reset(victim);   // clears tab = victim % tabs, before the fresh holder claims
+    const int32_t c = (int32_t) (++g_cow_conv_serial) * strata::kernels::kCowLinTabs + tab;
+    g_cow_lin_owner[tab] = c;
+    g_cow_lin_clock[tab] = ++g_cow_lin_clock_ctr;
+    return c;
+}
+static int32_t cow_conv_for_ids(const std::vector<int32_t>& ids, int64_t upto) {
+    const uint64_t fp = cow_ids_fingerprint(ids, upto);
+    for (auto& kv : g_cow_conv_by_ids)
+        if (kv.first == fp) {
+            if (kv.second >= 0 && g_cow_lin_owner[kv.second % strata::kernels::kCowLinTabs] == kv.second)
+                return kv.second;   // still holds its tab: identity and hints intact
+            kv.second = cow_conv_new();   // evicted since: re-key (its tables re-fork and re-splice)
+            return kv.second;
+        }
+    const int32_t c = cow_conv_new();
+    g_cow_conv_by_ids.emplace_back(fp, c);
+    return c;
+}
+
+int64_t qsa_cow_fork(const QsaState& from, QsaState& to, int64_t upto, std::string& error,
+                     const std::vector<int32_t>* ids) {
     if (from.kv_mode != 1 || to.kv_mode != 1 || from.map.slot_use == nullptr ||
         from.map.slot_use != to.map.slot_use) return 0;   // not a forkable pair: a silent no-op
     const int64_t P = std::min(to.map.n_blocks, std::min(from.map.n_blocks, upto / 4));   // only COMPLETE pages: the partial tail page stays cold, its cells read from the host copy; two sessions appending into one shared page would trample each other
@@ -949,8 +1011,15 @@ int64_t qsa_cow_fork(const QsaState& from, QsaState& to, int64_t upto, std::stri
         strata::kernels::CowPeer* pf = cow_reg_entry(from.map.page_table);
         strata::kernels::CowPeer* pt2 = cow_reg_entry(to.map.page_table);
         if (pf != nullptr && pt2 != nullptr) {
-            if (pf->conv < 0) { pf->conv = (int32_t) (++g_cow_conv_serial); cow_reg_conv(*pf); cow_lin_reset(pf->conv); }
-            pt2->conv = pf->conv; cow_reg_conv(*pt2);
+            // cow-m1e/§225: lineage identity is the CONVERSATION behind the fork (its token ids), not
+            // the state hosting it — main_ss is refilled per request and would merge every session
+            // into one lineage. Serials come from the hint-tab allocator: one live conv per tab, so
+            // the kernel's `conv % kCowLinTabs` tab choice is injective while a lineage is live.
+            // With ids absent, `from`'s lineage stands (set by the admitting fork that filled it).
+            const int32_t lineage = ids != nullptr ? cow_conv_for_ids(*ids, upto)
+                                                   : (pf->conv >= 0 ? pf->conv : cow_conv_new());
+            if (pf->conv != lineage) { pf->conv = lineage; cow_reg_conv(*pf); }   // tab cleared at claim; never wipe a live conv's hints on re-entry
+            pt2->conv = lineage; cow_reg_conv(*pt2);
             cow_lower_floor(pf->conv, (int32_t) P);   // cow-m1e: complete prefix pages only, floor never rises.
             // dyn-conc §222: unconditionally, not only when the cow-m1e shared region is on: the
             // joins-at-fetch (cow-m1d) consult the same floor and must not join a sibling's divergent tail.

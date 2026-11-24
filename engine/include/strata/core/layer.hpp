@@ -342,7 +342,10 @@ void qsa_set_cow_shared(int64_t v);    // cow-m1e: STRATA_COW_SHARED shared-regi
 /// cow-m1: point `to`'s page table at `from`'s resident pages for the prefix [0, upto): shared pages
 /// name from's arena slots (refcounts bumped); from's cold pages stay cold and stream into to's range.
 /// Returns the number of shared pages, -1 on failure. Requires both states on the same layer arena.
-int64_t qsa_cow_fork(const QsaState& from, QsaState& to, int64_t upto, std::string& error);
+// §224: `ids` is the conversation being copied; the lineage is keyed by its fingerprint. A null ids
+// falls back to the from-state's lineage (legacy callers with no conversation identity in hand).
+int64_t qsa_cow_fork(const QsaState& from, QsaState& to, int64_t upto, std::string& error,
+                     const std::vector<int32_t>* ids = nullptr);
 /// cow-m1: decrement the refcounts of the foreign pages `to`'s table names, before its map is reset.
 void qsa_cow_release(QsaState& st);
 /// (S8-v2) session teardown hook: drops the state's fork refs AND hands its claimed arena range back
