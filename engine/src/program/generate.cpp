@@ -137,6 +137,7 @@
 #include "strata/spec/spec_start.hpp"
 #include "strata/program/batch_groups.hpp"
 #include "strata/program/par_counters.hpp"
+#include "strata/program/decode_governor.hpp"
 #if defined(__linux__)
 #include <execinfo.h>
 #include <fcntl.h>
@@ -720,6 +721,7 @@ struct Options {
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     bool kv_grow = false;              ///< the elastic K/V (--kv-grow, STRATA_KV_GROW=1; kvg_ensure)
+    double min_stream_tps = 0.0;       ///< P2-D1 DecodeGovernor SLA floor (tok/s per active stream; 0 = throughput mode)
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the 794 MB GEMV does not.
@@ -1190,6 +1192,7 @@ void usage() {
                  "                       window (STRATA_BATCH_MTP=1 does the same); works on one GPU and on a layer split (the\n"
                  "                       slot drafters sit on the last stage's GPU; not with --batch-groups); needs VRAM per slot\n"
                  "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
+                 "  --min-stream-tps F   --batch decode-width governor: minimum tok/s per active stream (0 = throughput mode)\n"
                  "  --pipeline-windows N --serve with a layer split on two GPUs (on by default for 2+ stages on AMD gfx12;\n"
                  "                       STRATA_PIPELINE_AUTO=0 or N=0 turns it off): one conversation's verify windows\n"
                  "                       with the GPUs overlapped - 1 = the prompt's short reads, 2 = decode as well\n"
@@ -3787,6 +3790,7 @@ int main(int argc, char** argv) {
             if (std::strcmp(bgv, "auto") == 0) o.batch_groups_auto = true;
             else o.batch_groups = std::atoi(bgv);
         }
+        else if (a == "--min-stream-tps") o.min_stream_tps = std::atof(next("--min-stream-tps"));
         else if (a == "--batch-mtp") o.batch_mtp = true;
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
@@ -7231,6 +7235,7 @@ int main(int argc, char** argv) {
     // stage that runs [lb, le) carves only those layers' GDN rows and QSA pools - before the carve every stage
     // held all 48 layers' state whatever layers it ran, which is the same disease the chunked-QSA-prefill PR
     // fixed in llama.cpp: allocation sized by the whole model instead of the device's own work.
+    uint64_t main_kv_host_bytes = 0;
     {
         const strata::core::OnDevice on0(primary_device);   // STRATA_PRIMARY_DEVICE (upstream: a literal 0)
         const int64_t hi0 = multi_gpu ? split_at[0] : -1;
@@ -7261,6 +7266,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: session_init failed\n");
             return 1;
         }
+        main_kv_host_bytes = strata::core::qsa_kv_host_bytes();
         if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1)
             std::fprintf(stderr, "strata generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
                                  "%.2f GiB of pinned RAM\n",
@@ -7491,8 +7497,13 @@ int main(int argc, char** argv) {
             const int dev = k == 0 ? 0 : stages[k - 1]->dev;
             const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
             const int64_t hi = k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le;
+            const strata::core::SessionState& primary_k = k == 0 ? ss : stages[k - 1]->ss;
+            const strata::core::QsaState* share_rope_k =
+                (primary_k.qsa_alloc > 0 && primary_k.qsa_states != nullptr)
+                    ? &primary_k.qsa_states[primary_k.qsa_ord0]
+                    : nullptr;
             const strata::core::OnDevice on_k(dev);
-            const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi);
+            const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi, share_rope_k == nullptr);
             if (k == 0) bytes0 = bytes;
             for (int b = 0; b < fit; ++b) {
                 auto u = std::make_unique<strata::core::SessionState>();
@@ -7509,7 +7520,7 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 void* buf = nullptr;
-                if (cudaMalloc(&buf, bytes) != cudaSuccess || strata::core::session_init(g, o.max_context, K, buf, *u, lo, hi) == 0) {
+                if (cudaMalloc(&buf, bytes) != cudaSuccess || strata::core::session_init(g, o.max_context, K, buf, *u, lo, hi, share_rope_k) == 0) {
                     cudaGetLastError();
                     if (buf != nullptr) cudaFree(buf);
                     size_t fb = 0, tb = 0;
@@ -8548,7 +8559,9 @@ int main(int argc, char** argv) {
         const int64_t cow_deferred = strata::core::qsa_cow_arena_deferred();
         const int64_t cow_lo = stages.empty() ? (int64_t) 0 : stages[0]->lb;
         const int64_t cow_hi = stages.empty() ? (int64_t) -1 : stages[0]->le;
-        const int64_t cow_sess_bytes = (int64_t) strata::core::session_bytes(g, o.max_context, K, cow_lo, cow_hi);
+        const strata::core::SessionState& cow_primary = stages.empty() ? ss : stages[0]->ss;
+        const bool cow_with_rope = !(cow_primary.qsa_alloc > 0 && cow_primary.qsa_states != nullptr);
+        const int64_t cow_sess_bytes = (int64_t) strata::core::session_bytes(g, o.max_context, K, cow_lo, cow_hi, cow_with_rope);
         // (dyn-conc P2 stage C.5) reservation-collateral: with cache-funded admission on, the deferred
         // sessions' ARENA WINDOW bytes are no longer subtracted from the cache — the fundable slice of the
         // cache IS their collateral (the grow block pays the funder before the price line, layer.cpp ~1445),
@@ -15605,6 +15618,13 @@ int main(int argc, char** argv) {
                                              batch_telemetry_env[0] == '1' && batch_telemetry_env[1] == '\0';
         strata::core::BatchWindowSampler batch_telemetry(batch_telemetry_enabled);
         strata::program::ParCounters pc;   // STRATA_PAR_COUNTERS=1: counters only (par_counters.hpp); off: a branch
+        const Clock::time_point gov_t0 = Clock::now();
+        strata::program::DecodeGovernor decode_gov(strata::program::parse_decode_governor_config(o.min_stream_tps));
+        if (decode_gov.enabled())
+            std::fprintf(stderr, "strata serve: decode governor: on (min_stream_tps=%.1f hit_floor=%.1f%% "
+                                 "init_n=%d quantum=%.0f ms)\n",
+                         decode_gov.config().min_stream_tps, decode_gov.config().hit_floor_pct,
+                         decode_gov.config().initial_width, decode_gov.config().cohort_quantum_ms);
         auto pc_ex = [&]() {
             strata::program::ParCounters::Ex e;
             e.misses = drive.d.multi_misses; e.entries = drive.d.multi_entries; e.hits = drive.d.cache_hits;
@@ -15705,13 +15725,19 @@ int main(int argc, char** argv) {
         // over a 102k prompt). v1: single stage, no --batch-mtp / STRATA_PIPED_MTP (their per-slot drafters bake
         // slot pools in their own graphs), no STRATA_ROPE_TABLE=1 (a freed session unregisters the device-wide
         // rope table another session may still answer through), and it needs STRATA_SLOT_DETACH_MS > 0.
+        const strata::core::QsaState* main_rope0 =
+            (ss.qsa_alloc > 0 && ss.qsa_states != nullptr) ? &ss.qsa_states[ss.qsa_ord0] : nullptr;
         const bool kv_grow_want = [] { const char* e = std::getenv("STRATA_SLOT_KV_GROW"); return e != nullptr && e[0] == '1'; }();
         const bool rope_tab_on = [] { const char* e = std::getenv("STRATA_ROPE_TABLE"); return e != nullptr && e[0] == '1'; }();
+        const bool rope_blocks = rope_tab_on && (main_rope0 == nullptr);
         const bool kv_grow = kv_grow_want && slot_detach_ms > 0 && !batch_mtp && !piped_mtp &&
-                             bslot_ss.size() == 1 && !rope_tab_on && strata::core::qsa_kv_resident() > 0;
+                             bslot_ss.size() == 1 && !rope_blocks && strata::core::qsa_kv_resident() > 0;
+        const bool cow_elastic_attach = !batch_mtp && !piped_mtp && bslot_ss.size() == 1 && !rope_blocks &&
+                                        strata::core::qsa_kv_resident() > 0 && strata::core::qsa_cow_arena_elastic();
+        const bool slot_session_elastic = kv_grow || cow_elastic_attach;
         if (kv_grow_want && !kv_grow)
             std::fprintf(stderr, "strata serve: conversation cache: STRATA_SLOT_KV_GROW is off: it needs "
-                                 "STRATA_SLOT_DETACH_MS, one stage, no --batch-mtp/STRATA_PIPED_MTP and no "
+                                 "STRATA_SLOT_DETACH_MS, one stage, no --batch-mtp/STRATA_PIPED_MTP and shared/no "
                                  "STRATA_ROPE_TABLE\n");
         const int64_t kv_resident0 = strata::core::qsa_kv_resident();
         // (S8-v2) with the cow arenas on, every session's window is pinned to STRATA_COW_SLOT_CELLS at
@@ -15722,13 +15748,29 @@ int main(int argc, char** argv) {
         const int64_t cow_cells0 = [] { const char* e = hg_getenv("STRATA_COW_SLOT_CELLS");
                                         return e != nullptr ? std::atoll(e) : (int64_t) 0; }();
         const int64_t lo0 = 0, hi0 = multi_gpu ? split_at[0] : (int64_t) -1;
-        const uint64_t slot_bytes0 = strata::core::session_bytes(g, o.max_context, K, lo0, hi0);
-        // Re-carve a freed slot's session, bigger where the budget allows: keep one ordinary session's bytes
-        // reserved for every OTHER freed slot (a later admission must find a home) plus a 64 MiB safety band,
-        // and try a doubled resident window first, falling back to the boot size. Returns false only when even
-        // the ordinary size fails to carve; the caller then treats the admission as it treats a failed copy.
+        const uint64_t slot_bytes0 = strata::core::session_bytes(g, o.max_context, K, lo0, hi0, main_rope0 == nullptr);
+        // Re-carve a freed or boot-deferred slot's session, bigger where the budget allows: keep one ordinary
+        // session's bytes reserved for every OTHER freed slot (a later admission must find a home) plus a 64 MiB safety
+        // band, and try a doubled resident window first, falling back to the boot size. Returns false when host-RAM
+        // admission or device carving fails; the caller then treats the admission as it treats a failed copy.
         auto ensure_slot_session = [&](int b) -> bool {
-            if (!kv_grow || bslot_arena[0][(size_t) b] != nullptr) return true;
+            if (!slot_session_elastic || bslot_arena[0][(size_t) b] != nullptr) return true;
+            {
+                auto host_avail = strata::core::available_host_bytes();
+                const uint64_t host_floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                if (!strata::core::conversation_memory_admit(host_avail, main_kv_host_bytes, host_floor)) {
+                    pools_budget.shrink((size_t) -1);
+                    host_avail = strata::core::available_host_bytes();
+                }
+                if (!strata::core::conversation_memory_admit(host_avail, main_kv_host_bytes, host_floor)) {
+                    std::fprintf(stderr, "strata serve: conversation cache: slot %d's session refused by host-RAM "
+                                         "guard (need %.2f MiB host KV + %lld MiB floor, %.2f GiB available)\n",
+                                 b, (double) main_kv_host_bytes / 1048576.0,
+                                 (long long) o.conversation_cache_min_free_mib,
+                                 host_avail ? (double) *host_avail / 1073741824.0 : -1.0);
+                    return false;
+                }
+            }
             int nfreed = 0;
             for (void* q : bslot_arena[0]) nfreed += q == nullptr;
             const strata::core::OnDevice on0(0);
@@ -15738,14 +15780,16 @@ int main(int argc, char** argv) {
             // and the next admission died at one token.  KV-window doubling and elastic growth are one budget.
             const int64_t dbl = strata::core::qsa_cow_arena_elastic() ? kv_resident0 : kv_resident0 * 2;
             const int64_t cands[2] = {dbl, kv_resident0};
-            for (int64_t cand : cands) {
+            const int ncands = (dbl == kv_resident0) ? 1 : 2;
+            for (int ci = 0; ci < ncands; ++ci) {
+                const int64_t cand = cands[ci];
                 strata::core::qsa_set_kv_resident(cand);
                 if (cow_on && cow_cells0 > 0) strata::core::qsa_set_cow_slot_cells(cand);   // (S8-v2) the cow window follows the candidate: the arena bump guard is the real budget
                 size_t fb = 0, tb = 0;
                 cudaMemGetInfo(&fb, &tb);
                 const uint64_t reserve = (uint64_t) (nfreed - 1) * slot_bytes0 + (64ull << 20);
                 const uint64_t budget = cand == kv_resident0 ? fb : (fb > reserve ? fb - reserve : 0);
-                const uint64_t need = strata::core::session_bytes(g, o.max_context, K, lo0, hi0);
+                const uint64_t need = strata::core::session_bytes(g, o.max_context, K, lo0, hi0, main_rope0 == nullptr);
                 std::fprintf(stderr, "strata serve: conversation cache: re-carve ledger: asks %.2f GiB (cand %lld cells), "
                                      "%.2f GiB free, budget %.2f GiB, %d freed slot%s, line %lld MiB\n",
                              (double) need / 1073741824.0, (long long) cand, (double) fb / 1073741824.0,
@@ -15755,7 +15799,7 @@ int main(int argc, char** argv) {
                 mem_mark("a deferred slot's turn to attach");   // (dyn-conc P2) the claim the pricing promised to cover
                 if (need <= budget && cudaMalloc(&buf, need) == cudaSuccess) {
                     strata::core::SessionState& su = *bslot_ss[0][(size_t) b];
-                    if (strata::core::session_init(g, o.max_context, K, buf, su, lo0, hi0) != 0) {
+                    if (strata::core::session_init(g, o.max_context, K, buf, su, lo0, hi0, main_rope0) != 0) {
                         strata::core::session_zero(su, g, nullptr, nullptr);
                         bslot_arena[0][(size_t) b] = buf;
                         ver.drop_batch_graphs();   // the row layouts holding this slot bake its OLD null pools
@@ -16254,6 +16298,17 @@ int main(int argc, char** argv) {
             int A = 0;
             // (--batch-mtp: two rows a slot, at most kVerifyNarrowT; the plain windows hold up to kVerifyMaxT)
             const int win_cap = batch_mtp ? (int) strata::kernels::kVerifyNarrowT : (int) strata::kernels::kVerifyMaxT;
+            const int gov_slot_cap = (batch_mtp && !batch_df2) ? std::max(1, win_cap / 2) : win_cap;
+            std::vector<int> gov_cohort;
+            if (decode_gov.enabled()) {
+                std::vector<int> runnable_slots;
+                runnable_slots.reserve(bs.size());
+                for (size_t b = 0; b < bs.size(); ++b) {
+                    if (bs[b].active) runnable_slots.push_back((int) b);
+                }
+                const double gov_now_ms = std::chrono::duration<double, std::milli>(Clock::now() - gov_t0).count();
+                gov_cohort = decode_gov.select_cohort(runnable_slots, gov_slot_cap, gov_now_ms);
+            }
             int nrow[strata::kernels::kVerifyMaxT] = {};   // the rows slot a (the a-th active) holds: its token and its drafts
             // DFlash2 slots: the rows beyond one a slot are SPARE; they carry the slots' drafts, shared evenly in slot order (so the layout of a window
             // depends on which slots are active, not on the drafts: the captured batch graphs are reused).  More slots than rows: no drafts, the slots
@@ -16261,8 +16316,14 @@ int main(int argc, char** argv) {
             int df2_extra[64] = {};
             if (batch_df2) {
                 int act_ids[64] = {}, nact = 0;
-                for (size_t b = 0; b < bs.size() && nact < (int) (sizeof act_ids / sizeof act_ids[0]); ++b)
-                    if (bs[b].active) act_ids[nact++] = (int) b;
+                if (decode_gov.enabled()) {
+                    for (int b : gov_cohort) {
+                        if (nact < (int) (sizeof act_ids / sizeof act_ids[0])) act_ids[nact++] = b;
+                    }
+                } else {
+                    for (size_t b = 0; b < bs.size() && nact < (int) (sizeof act_ids / sizeof act_ids[0]); ++b)
+                        if (bs[b].active) act_ids[nact++] = (int) b;
+                }
                 const int spare = std::max(0, win_cap - nact);
                 for (int k = 0; k < nact && nact > 0; ++k) {
                     const BSlot& q = bs[(size_t) act_ids[k]];
@@ -16306,8 +16367,9 @@ int main(int argc, char** argv) {
                 }
 #endif
             }
-            for (size_t offset = 0; offset < bs.size(); ++offset) {
-                const int b = (int) ((next_slot + offset) % bs.size());
+            const size_t loop_n = decode_gov.enabled() ? gov_cohort.size() : bs.size();
+            for (size_t offset = 0; offset < loop_n; ++offset) {
+                const int b = decode_gov.enabled() ? gov_cohort[offset] : (int) ((next_slot + offset) % bs.size());
                 if (!bs[(size_t) b].active) continue;
                 const int extra = batch_df2 ? (b < (int) (sizeof df2_extra / sizeof df2_extra[0]) ? df2_extra[b] : 0) : batch_mtp ? 1 : 0;
                 if (S + 1 + extra > win_cap) break;
@@ -16330,7 +16392,7 @@ int main(int argc, char** argv) {
                     ++S;
                 }
             }
-            if (batch_mtp && A > 0) next_slot = ((size_t) active[A - 1] + 1) % bs.size();
+            if (!decode_gov.enabled() && batch_mtp && A > 0) next_slot = ((size_t) active[A - 1] + 1) % bs.size();
             if (S == 0) return true;
             const bool was_busy = strata::core::progress().busy.load();
             strata::core::progress().busy.store(true);
@@ -16385,6 +16447,9 @@ int main(int argc, char** argv) {
                 const int64_t from = std::max<int64_t>(ps.reply0, (int64_t) ps.ids.size() - ps.pen_n);
                 ver.set_slot_history(rows[t], ps.ids.data() + from, (int64_t) ps.ids.size() - from);
             }
+            const uint64_t gov_hits0 = drive.d.cache_hits;
+            const uint64_t gov_off0 = drive.d.offload_entries;
+            const uint64_t gov_cpu0 = drive.d.multi_entries;
             const Clock::time_point w0 = Clock::now();
             if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : (err.empty() ? "a batch window failed without a reason" : err.c_str()));
@@ -16427,7 +16492,9 @@ int main(int argc, char** argv) {
             bt_run += msd(w0, w1);
             bt_commit += msd(w1, w2);
             ++bt_windows;
+            int gov_win_tokens = 0;
             for (int a = 0; a < A; ++a) {
+                gov_win_tokens += keep[active[a]];
                 bt_rows += keep[active[a]];
                 bt_accepted += keep[active[a]] - 1;
             }
@@ -16551,6 +16618,20 @@ int main(int argc, char** argv) {
                 bt_adapt_wait += msd(wa, Clock::now());
             }
             strata::core::progress().busy.store(was_busy);
+            if (decode_gov.enabled()) {
+                const uint64_t d_hits = drive.d.cache_hits - gov_hits0;
+                const uint64_t d_off = drive.d.offload_entries - gov_off0;
+                const uint64_t d_cpu = drive.d.multi_entries - gov_cpu0;
+                const uint64_t d_tot = d_hits + d_off + d_cpu;
+                const double win_hit_pct = d_tot > 0 ? 100.0 * (double) d_hits / (double) d_tot : 100.0;
+                const double win_ms = msd(w0, Clock::now());
+                const int prev_n = decode_gov.target_width();
+                if (decode_gov.observe_window(win_ms, gov_win_tokens, A, win_hit_pct, gov_slot_cap)) {
+                    std::fprintf(stderr, "strata serve: decode governor: N %d -> %d "
+                                         "(hit=%.1f%% window=%.1fms A=%d tok=%d)\n",
+                                 prev_n, decode_gov.target_width(), win_hit_pct, win_ms, A, gov_win_tokens);
+                }
+            }
             report_batch_window(S, A, !batch_on(), w0);
             pc.window(S, A);
             if (!batch_on() && bt_windows > 0) {
@@ -17196,6 +17277,11 @@ int main(int argc, char** argv) {
                 const long long mn = std::strtoll(e1, &e2, 10);
                 if (bs.empty() || b < 0 || b >= (long) bs.size() || bs[(size_t) b].active || mn < 1 || e2 == e1) {
                     std::printf("ERR BGEN: no such free slot (--batch %d) or a bad max_new\n", o.batch);
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (!ensure_slot_session((int) b)) {
+                    std::printf("ERR BGEN: slot %ld session unavailable (memory limit)\n", b);
                     std::fflush(stdout);
                     continue;
                 }
@@ -19288,7 +19374,8 @@ int main(int argc, char** argv) {
                     std::vector<const CoReq*> used;
                     for (const CoReq& c : co_set) {
                         if (c.slot < 0 || c.slot >= (int) bs.size() || c.slot == admit_slot || bs[(size_t) c.slot].active ||
-                            bs[(size_t) c.slot].partial || (kv_grow && bslot_arena[0][(size_t) c.slot] == nullptr))
+                            bs[(size_t) c.slot].partial ||
+                            (!bslot_arena.empty() && !bslot_arena[0].empty() && bslot_arena[0][(size_t) c.slot] == nullptr))
                             continue;
                         bool dup = false;
                         for (const CoReq* u : used) dup = dup || u->slot == c.slot;

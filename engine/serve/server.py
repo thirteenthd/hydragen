@@ -2066,6 +2066,7 @@ class StrataEngine:
 
     BGEN_REFUSALS_MAX = 6    # #1994: how often one request tries another slot after the engine refused a BGEN
     SLOT_PARK_S = 2.0        # ... and how long a refused slot stays out of the picks
+    SLOT_MEM_BACKOFF_S = 30.0  # ... and how long a deferred slot refused for RAM/VRAM limit backs off
 
     def _park_slot(self, slot: int) -> None:
         """#1994: the engine refused a BGEN for `slot`.  Keep it busy here for SLOT_PARK_S (no request owns it), then
@@ -2560,9 +2561,24 @@ class StrataEngine:
                         # for a moment (busy here too), and wait for another one - never a 400 for the conversation.
                         if not (self._ctl_erred and str(e).startswith("BGEN:") and left >= 1 and not cancel.is_set()):
                             raise
-                        refused += 1
-                        print(f"[strata] parallel: the engine refused slot {slot} ({e}); trying another slot "
-                              f"({refused}/{self.BGEN_REFUSALS_MAX}) (issue #1994)", flush=True)
+                        mem_refused = "session unavailable" in str(e)
+                        if mem_refused:
+                            with self.slot_cv:
+                                self.slot_claims.discard(slot)
+                                self.slot_busy[slot] = False
+                                self.slot_t_free[slot] = time.time()
+                                self.__dict__.setdefault("_mem_backoff", {})[slot] = time.monotonic() + self.SLOT_MEM_BACKOFF_S
+                                others_busy = any(self.slot_busy)
+                                self.slot_cv.notify_all()
+                            if not others_busy:
+                                refused += 1
+                            print(f"[strata] parallel: slot {slot} refused for memory limit ({e}); backing off "
+                                  f"{self.SLOT_MEM_BACKOFF_S:.0f}s (refusals={refused}/{self.BGEN_REFUSALS_MAX})",
+                                  flush=True)
+                        else:
+                            refused += 1
+                            print(f"[strata] parallel: the engine refused slot {slot} ({e}); trying another slot "
+                                  f"({refused}/{self.BGEN_REFUSALS_MAX}) (issue #1994)", flush=True)
                         if refused > self.BGEN_REFUSALS_MAX:
                             raise GpuBusy("the engine's batch slots are not free right now; try again in a moment",
                                       retry_after=5) from e
@@ -2570,7 +2586,8 @@ class StrataEngine:
                         self.slot_held[slot] = []
                         phase = "none"
                         self._ctl_erred = False
-                        self._park_slot(slot)
+                        if not mem_refused:
+                            self._park_slot(slot)
                         slot = None
                         continue
                     cont = bool(self._ctl_result and self._ctl_result[1])
@@ -2727,7 +2744,13 @@ class StrataEngine:
         """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
         prompt (the engine then reads only the rest), else an empty one, else the one used longest ago - so the
         conversations other slots hold stay for their next turns.  None: every slot is busy."""
-        free = [b for b in self.slot_order if not self.slot_busy[b]]
+        now = time.monotonic()
+        backoff = self.__dict__.get("_mem_backoff") or {}
+        free = [b for b in self.slot_order if not self.slot_busy[b] and backoff.get(b, 0.0) <= now]
+        if not free:
+            if any(self.slot_busy):
+                return None
+            free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
         gs = getattr(self, "slot_gs", 0)
@@ -4114,8 +4137,19 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
         if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args:
             args += ["--vram-segment-mib", str(seg)]
     args += parallel_args(cfg, args)
+    args += decode_governor_args(cfg, args)
     args += pool_cores_args(cfg, args)
     return draft_costs_args(cfg, learned_profile_args(cfg, args), exe or cfg.get("exe"))
+
+
+def decode_governor_args(cfg: dict, args: list[str]) -> list[str]:
+    """P2-D1 DecodeGovernor SLA floor: forward --min-stream-tps from config when not already in args."""
+    if "--min-stream-tps" in args:
+        return []
+    val = cfg.get("min_stream_tps")
+    if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
+        return ["--min-stream-tps", str(val)]
+    return []
 
 
 PARALLEL_MAX = 8      # without a layer split the engine's batch window holds at most 8 rows (kVerifyNarrowT); --batch-mtp waves more through it
@@ -4576,6 +4610,21 @@ def parallel_slots(cfg: dict) -> int:
     return n if isinstance(n, int) and not isinstance(n, bool) and n > 1 else 0
 
 
+def configure_decode_governor_env(env: dict, cfg: dict) -> None:
+    """Forward opt-in P2-D1 DecodeGovernor settings into the child env without overriding explicit env keys."""
+    decode_auto = cfg.get("decode_auto")
+    if decode_auto is True:
+        env.setdefault("HG_DECODE_AUTO", "1")
+    elif decode_auto is False:
+        env.setdefault("HG_DECODE_AUTO", "0")
+    hit_floor = cfg.get("hit_floor_pct")
+    if isinstance(hit_floor, (int, float)) and not isinstance(hit_floor, bool) and hit_floor > 0:
+        env.setdefault("HG_HIT_FLOOR_PCT", str(hit_floor))
+    quantum = cfg.get("cohort_quantum_ms")
+    if isinstance(quantum, (int, float)) and not isinstance(quantum, bool) and quantum >= 0:
+        env.setdefault("HG_COHORT_QUANTUM_MS", str(quantum))
+
+
 def child_env(cfg: dict, *, offline: bool = False) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -4590,6 +4639,7 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ordered_gpus(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
         env[str(k)] = str(v)
+    configure_decode_governor_env(env, cfg)
     # Strict offline reaches children through the environment, because a tool subprocess or a model
     # loader is code this server does not own. Applied last so a profile's own `env` cannot remove
     # the policy by naming the same variable.
