@@ -1437,12 +1437,18 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                 a.off[3] = a.off[2] + al(sb2);
                 a.off[4] = a.off[3] + al(sb2);
                 a.off[5] = a.off[4] + al((uint64_t) T * 4);                                   // the join counter
+                // cow-m1e/§234: the hint-table tail (lin, sblk, sst, srf, sctr) exists ONLY when the
+                // shared region exists. With g_cow_shared == 0 these chunks are unmapped and every
+                // pointer stays null - the contract every map reader states and the kernel gates honor.
+                // (The pre-VMM cudaMalloc never allocated them; the VMM conversion did, and left the
+                // memset below gated, so cold misses read zero-filled pages and hint L=0: slot-0 aliasing.)
                 a.off[6] = a.off[5] + (int64_t) G64;                                          // cow-m1e: hint tables
                 a.off[7] = a.off[6] + al((uint64_t) strata::kernels::kCowLinTabs * (uint64_t) pages * 4);
                 a.off[8] = a.off[7] + al((uint64_t) g_cow_shared * 4);
                 a.off[9] = a.off[8] + al((uint64_t) g_cow_shared * 4);
                 a.off[10] = a.off[9] + al((uint64_t) g_cow_shared * 4);
-                const int64_t total = a.off[10] + (int64_t) G64;                              // + the fetch counter
+                const int64_t total = g_cow_shared > 0 ? a.off[10] + (int64_t) G64            // + the fetch counter
+                                                       : a.off[6];                            // shared OFF: the whole tail stays unmapped
                 a.vr = std::make_unique<strata::core::VmmRange>();
                 if (!a.vr->reserve((uint64_t) total)) ok = false;
                 else if (!a.vr->map_range(0, total / (int64_t) G64, [] { return (strata::core::VmmChunk) 0; })) ok = false;
@@ -1451,9 +1457,11 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                     a.k = (int8_t*) (pb + a.off[0]); a.v = (int8_t*) (pb + a.off[1]);
                     a.ks = (uint16_t*) (pb + a.off[2]); a.vs = (uint16_t*) (pb + a.off[3]);
                     a.use = (int32_t*) (pb + a.off[4]); a.jctr = (unsigned long long*) (pb + a.off[5]);
-                    a.lin = (int32_t*) (pb + a.off[6]); a.sblk = (int32_t*) (pb + a.off[7]);
-                    a.sst = (int32_t*) (pb + a.off[8]); a.srf = (int32_t*) (pb + a.off[9]);
-                    a.sctr = (unsigned long long*) (pb + a.off[10]);
+                    if (g_cow_shared > 0) {   // §234: with the shared region off these stay null (unmapped tail)
+                        a.lin = (int32_t*) (pb + a.off[6]); a.sblk = (int32_t*) (pb + a.off[7]);
+                        a.sst = (int32_t*) (pb + a.off[8]); a.srf = (int32_t*) (pb + a.off[9]);
+                        a.sctr = (unsigned long long*) (pb + a.off[10]);
+                    }
                     ok = cudaMemset(a.use, 0, (size_t) T * 4) == cudaSuccess &&
                          cudaMemset(a.jctr, 0, 8) == cudaSuccess;
                     if (ok && g_cow_shared > 0)

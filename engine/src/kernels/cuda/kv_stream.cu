@@ -100,7 +100,7 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
     if (m.reg != nullptr)
         for (int e = 0; e < m.reg_n; ++e)
             if (m.reg[e].pt == m.page_table) {
-                if (m.reg[e].conv >= 0 && m.lin_all != nullptr)
+                if (m.reg[e].conv >= 0 && m.n_shared > 0 && m.lin_all != nullptr)   // §234: hint path is a shared-region mechanism; the floor (fl) below stays live regardless
                     lin = m.lin_all + (size_t) (m.reg[e].conv % kCowLinTabs) * (size_t) m.n_blocks;
                 fl = m.reg[e].floor;
                 break;
@@ -138,7 +138,11 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
                         if (lin != nullptr && b < fl) {
                             volatile int32_t* vlin = lin;
                             const int32_t L = vlin[b];
-                            if (false && L >= 0) {   // arm-227: hint adoption OFF (miss registration stays)
+                            // arm-227 KILL restored (§234): adoption is only reachable with a properly mapped+0xFF'd
+                            // hint tab (resolve wires lin only when n_shared > 0 && lin_all != nullptr, and the arena
+                            // leaves the tab unmapped/null when the shared region is off), so the zero-init aliasing
+                            // that armed-227 for cannot recur.
+                            if (L >= 0) {
                                 // prev-gated add (the M-C1d protocol): an unpinned hint (a dead holder)
                                 // or an in-flight claim (-2) takes itself back; revalidate against a
                                 // reclaim that moved the hint mid-protocol.

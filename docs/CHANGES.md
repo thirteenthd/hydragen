@@ -2280,3 +2280,50 @@ while other windows hold pins. Arm in flight at entry-time (§227): fork ON + hi
 adoption disabled at the source (`if (false && L >= 0)` at :141) — if that goes green
 while fork splice stays live, the adoption race is the carrier and the fix is a
 pin-checked rewrite, not a knob.
+
+## §234 — VMM tail contract: hint tabs stay unmapped/null when the shared region is off; arm-227 kill reverted (ms01, 2026-11-24)
+
+§223's red axis (arena ON 1/4 vs arena OFF 8/8 on the same fixed binary) has its root
+cause in commit `4c39aa5`, the VMM conversion of the CoW arena. The pre-VMM contract,
+stated verbatim in the wiring comment at `layer.cpp:1675`, was: `lin/sblk/sst/srf/sctr`
+are null/zero when `g_cow_shared == 0`. The conversion broke it three ways: the hint-tab
+tail became ordinary always-allocated chunks, `a.lin = (int32_t*)(pb + a.off[6])` etc.
+were assigned unconditionally, and the `0xFF` memset stayed gated on `g_cow_shared > 0`
+— so with sharing off (the mechdbg config: `12 QSA layers x 18432 slots (0 shared
+region)`) the lineage hint table was **non-null, zero-filled garbage**. The resolve-time
+wiring (`kv_stream.cu:103`) gated only on `m.lin_all != nullptr` — no `n_shared` term —
+so every cold miss below the floor read `L = 0` and adopted **slot 0's bytes** as the
+missed block: the masked-KV signature, end to end. The arm-227 kill (`if (false &&
+L >= 0)`) was never a cure, only a mask: it disabled adoption, while `lin[b] == 0`
+simultaneously defeated *miss registration* (the `-1 → -2` claim CAS never fires on
+zero), which is why its runs went green measuring a dead path.
+
+Fix (both belts, applied):
+- `layer.cpp`: when `g_cow_shared == 0` the arena's total ends at `off[6]` — the whole
+  hint-table tail (`lin, sblk, sst, srf, sctr` + fetch counter) is never mapped and all
+  five pointers stay null. The comment's contract is now true by construction, and
+  ~24 MiB of unused VMM per arena is no longer reserved (user's estimate; not
+  separately measured).
+- `kv_stream.cu:103`: `lin` is wired only when `m.n_shared > 0 && m.lin_all != nullptr`;
+  the floor (`fl`) stays wired whenever `m.reg != nullptr` (cow-m1d join-at-fetch is
+  unaffected).
+- `kv_stream.cu:141`: the arm-227 kill is reverted — `if (L >= 0)` restores hint
+  adoption as live code on the `STRATA_COW_SHARED > 0` path; it is unreachable when
+  `g_cow_shared == 0` because the resolve gate above now holds.
+
+Measurement (arm-234, ms01, `~/hydragen-sync180` rebuilt clean from HEAD + this fix;
+mechdbg config, arena ON, fork at default): probe222x parallel seeds 9140/9150 →
+**4/4 + 4/4**, zero corruption markers in `base_mech.log`. The §223 run of the same
+fixed binary before this fix: 1/4 + 1/4; §224/225 identity arms: 1/4 each. The arena
+axis is closed by the tail contract, not by a knob.
+
+Retraction note: the §230–§233 measurements (386K violations, the `owner_says=-1`
+ring rows, and "FORK=0 is NOT green") are void — that binary carried the uncommitted
+arm-228 release-decrement bug (`slot_use` decaying to 0 with no re-seed ⇒
+`atomicCAS(slot_use,1,0)` fails forever ⇒ stranded slots, `page_table[b] = -1`,
+cold-miss storm). None of it is committed; the diagnostics are archived off-tree.
+
+Next: the shared-region path (`n_shared > 0`, adoption live under the restored
+`L >= 0`) has not yet been exercised end-to-end — every mechdbg config here is
+`0 shared region`. And the Windows service still runs the pre-fix pb4 binary with the
+ARENA=0 mitigation staged; the restart is pending user availability.
