@@ -2023,3 +2023,11 @@ v13, same-boot pair, b8 mech shape (FLOOR 4096, SLOTS 34816, PAR_COUNTERS):
 
 Artifacts: ms01 grid-results-v13-b8_{fund,ctrl}-1123-23*.log, logs/v13-b8_*.log,
 ~/s8_tune_grid_v13.sh; engine: generate.cpp collateral hunks (.bak-p2c5 backup).
+
+ctest gate on the merged arm tree (green, 2026-11-24 00:25): 340/352 at -j4; the
+serial re-run of the 12 fails shows 10 are -j4 contention flakes (snapshot
+families, prefill_fused_iq_*, gr_upmix all pass solo). Only two true fails, both
+pre-existing in the ctest190 baseline: ple_parity (wants ../../Q2_0/*.gguf, an
+asset path absent in the arm tree) and cuda_spill_guard (known). Ops law: the
+ctest gate is full-suite -j4 then re-run-failures serially; never conclude a
+regression from a -j4 parity/snapshot fail alone.
