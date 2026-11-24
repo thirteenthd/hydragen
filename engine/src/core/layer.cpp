@@ -899,6 +899,28 @@ int64_t qsa_cow_fork(const QsaState& from, QsaState& to, int64_t upto, std::stri
         from.map.slot_use != to.map.slot_use) return 0;   // not a forkable pair: a silent no-op
     const int64_t P = std::min(to.map.n_blocks, std::min(from.map.n_blocks, upto / 4));   // only COMPLETE pages: the partial tail page stays cold, its cells read from the host copy; two sessions appending into one shared page would trample each other
     if (P <= 0) return 0;
+    // dyn-conc §222: every forked page pins one of the SOURCE's slots, and resolve never takes a
+    // pinned slot as the owner's victim (kv_stream.cu cow_hold): forking the whole window leaves the
+    // source no slot to refill, resolve overflows (page -1, ctl[3]), and attention silently masks the
+    // unresolvable blocks. Keep the source's window usable: pin at most its own count minus a headroom.
+    static const int64_t headroom_env = [] {
+        const char* v = hg_getenv("STRATA_COW_FORK_HEADROOM");
+        const int64_t h = v ? atoll(v) : 512;   // slots; the top-k window never needs more than kTopkMaxCells/4
+        return h < 0 ? (int64_t) 0 : h;
+    }();
+    int64_t allowed = P;
+    if (headroom_env > 0 && from.map.n_slots > 0) {
+        const int64_t fn0 = from.map.n_slots;
+        std::vector<int32_t> use((size_t) fn0, 0);
+        if (cudaMemcpy(use.data(), from.map.slot_use + from.map.slot_base,
+                       (size_t) fn0 * 4, cudaMemcpyDeviceToHost) == cudaSuccess) {
+            int64_t pinned = 0;
+            for (const int32_t u : use)
+                if (u > 1) ++pinned;
+            const int64_t room = fn0 - std::min(headroom_env, fn0 / 2) - pinned;
+            allowed = room <= 0 ? 0 : std::min(P, room);
+        } else cudaGetLastError();   // pins unreadable: fork everything (the pre-§222 behaviour)
+    }
     std::vector<int32_t> ftab((size_t) P);
     if (cudaMemcpy(ftab.data(), from.map.page_table, (size_t) P * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
         error = "cow fork: the source page table could not be read";
@@ -909,10 +931,11 @@ int64_t qsa_cow_fork(const QsaState& from, QsaState& to, int64_t upto, std::stri
     int64_t shared = 0;
     for (int64_t b = 0; b < P; ++b) {
         const int32_t sl = ftab[b];
-        if (sl >= fb && sl < fb + fn) ++shared;                                   // the source's own page: fork it
+        if (sl >= fb && sl < fb + fn && shared < allowed) ++shared;                    // the source's own page: fork it
         else ftab[b] = -1;   // cow-m1e: everything else goes cold (to's own range, claims, a sibling's or
-                             // region page): a table may only name slots it (or the kernel right after the
-                             // splice) counted a ref for; siblings re-adopt shared pages at resolve in one step
+                             // region page, or a §222 headroom refusal): a table may only name slots it
+                             // (or the kernel right after the splice) counted a ref for; siblings re-adopt
+                             // shared pages at resolve in one step
     }
     if (cudaMemcpy(to.map.page_table, ftab.data(), (size_t) P * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
         error = "cow fork: the table splice failed";
@@ -928,7 +951,9 @@ int64_t qsa_cow_fork(const QsaState& from, QsaState& to, int64_t upto, std::stri
         if (pf != nullptr && pt2 != nullptr) {
             if (pf->conv < 0) { pf->conv = (int32_t) (++g_cow_conv_serial); cow_reg_conv(*pf); cow_lin_reset(pf->conv); }
             pt2->conv = pf->conv; cow_reg_conv(*pt2);
-            if (g_cow_shared > 0) cow_lower_floor(pf->conv, (int32_t) P);   // cow-m1e: complete prefix pages only, floor never rises
+            cow_lower_floor(pf->conv, (int32_t) P);   // cow-m1e: complete prefix pages only, floor never rises.
+            // dyn-conc §222: unconditionally, not only when the cow-m1e shared region is on: the
+            // joins-at-fetch (cow-m1d) consult the same floor and must not join a sibling's divergent tail.
         }
     }
     return shared;
@@ -1679,6 +1704,10 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     const QsaShapes s = qsa_shapes(g);
     cudaStream_t cs = (cudaStream_t) stream;
+    // dyn-conc §222: a re-armed streamed state must let go of its fork pins first (mirrors
+    // refresh_residency): a stale pin leaked by a zeroed table starves the slots it names, and a
+    // stale registry stamp lets resolve join the previous conversation's pages into the next one's.
+    if (st.kv_mode == 1) qsa_cow_release(const_cast<QsaState&>(st));
     // an elastic state zeroes what is mapped (the rest is zeroed when it is mapped)
     const int64_t live_slots = st.kv_elastic >= 0 ? pool_slots_mapped(*g_pools[(size_t) st.kv_elastic]) : st.n_slots;
     const size_t rows = (size_t) live_slots * s.n_head_kv * s.page_size;
@@ -1691,12 +1720,36 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
         cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
     } else if (st.kv_int8) {
         // cow-m1: an arena state zeroes only its own slot range inside the layer arena.
+        // dyn-conc §222: slots still pinned by a live fork (`slot_use > 1`) are being decoded by a
+        // batch slot; wiping them under the fork corrupts that session. Zero the mapped range in
+        // runs, skipping the pinned slots; a range with no pins zeroes exactly as before.
         const uint64_t zc = (uint64_t) st.cow_codes;
         const uint64_t zs = (uint64_t) st.cow_scale;
-        cudaMemsetAsync(st.k_q + zc, 0, rows * s.head_dim, cs);
-        cudaMemsetAsync(st.v_q + zc, 0, rows * s.head_dim, cs);
-        cudaMemsetAsync(st.k_scale + zs, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
-        cudaMemsetAsync(st.v_scale + zs, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
+        const uint64_t sq = (uint64_t) s.n_head_kv * s.page_size * s.head_dim;
+        const uint64_t ssz = (uint64_t) s.n_head_kv * s.page_size * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+        std::vector<int32_t> use;
+        bool scan = st.map.slot_use != nullptr && live_slots > 0;
+        if (scan) {
+            use.assign((size_t) live_slots, 1);
+            if (cudaMemcpy(use.data(), st.map.slot_use + st.map.slot_base,
+                           (size_t) live_slots * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                cudaGetLastError();
+                scan = false;   // pins unreadable: fall back to the blanket zero (the pre-§222 behaviour)
+            }
+        }
+        for (int64_t i = 0; i < live_slots; ) {
+            int64_t j = i;
+            if (scan) { while (j < live_slots && use[(size_t) j] <= 1) ++j; }
+            else j = live_slots;
+            if (j > i) {
+                const uint64_t span = (uint64_t) (j - i);
+                cudaMemsetAsync(st.k_q + zc + (uint64_t) i * sq, 0, span * sq, cs);
+                cudaMemsetAsync(st.v_q + zc + (uint64_t) i * sq, 0, span * sq, cs);
+                cudaMemsetAsync(st.k_scale + zs + (uint64_t) i * ssz, 0, span * ssz, cs);
+                cudaMemsetAsync(st.v_scale + zs + (uint64_t) i * ssz, 0, span * ssz, cs);
+            }
+            i = (j > i) ? j : i + 1;   // skip a pinned slot
+        }
     } else {
         cudaMemsetAsync(st.k_pool, 0, rows * s.head_dim * 2, cs);
         cudaMemsetAsync(st.v_pool, 0, rows * s.head_dim * 2, cs);

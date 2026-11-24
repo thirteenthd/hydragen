@@ -95,10 +95,12 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
     // cow-m1e: this map's lineage hint table and byte-identity floor (found once in the registry)
     int32_t* lin = nullptr;
     int32_t fl = 0x7FFFFFFF;
-    if (m.reg != nullptr && m.lin_all != nullptr)
+    // dyn-conc §222: the floor gates joins-at-fetch (cow-m1d) and must be read whenever the registry
+    // exists; only the cow-m1e lineage hint table needs the shared region (lin_all) to be mapped.
+    if (m.reg != nullptr)
         for (int e = 0; e < m.reg_n; ++e)
             if (m.reg[e].pt == m.page_table) {
-                if (m.reg[e].conv >= 0)
+                if (m.reg[e].conv >= 0 && m.lin_all != nullptr)
                     lin = m.lin_all + (size_t) (m.reg[e].conv % kCowLinTabs) * (size_t) m.n_blocks;
                 fl = m.reg[e].floor;
                 break;
