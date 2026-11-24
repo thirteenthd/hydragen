@@ -2080,34 +2080,36 @@ the && chain silently reverts nothing while still booting the old binary;
 (3) overlapping arms on one host contaminate each other - one experiment,
 one queue.
 
-### §221. Unification: the CoW fork is the carrier for both degradation families (2026-11-24)
+### §221. Bisection audit: the carrier is the arena window machinery; the fork claim was a false positive (2026-11-24)
 
-Single-variable arms on the committed C.5 tree (3eff8fd contents; live files md5-verified:
-generate=4f11fc10, layer=d964a48c, snapshot=76073a26), cold park store, m25_churnpar v2
-battery (seeds 8100+):
+Corrected verdict table (C.5 tree 3eff8fd, cold store, m25_churnpar v2 battery; and the
+4-up parallel probe at mt 900 with per-arm seeds):
 
-- c5fork0 = C.5 + STRATA_COW_FORK=0: 8/8 green, W1 4/4 TRUE, W3 4/4 TRUE (walls
-  16.8-17.3 s), restore_qc_fail=0. First full-tree battery pass ever recorded.
-- The four-up parallel probe (mt 900, per-arm seeds) reproduces family 1 on every
-  arena shape with fork on (stage A 0/4 clean at ~13k, 2/4 refusals at ~1.6k; stage B
-  same), and is clean with fork off (stageA-fork0 8/8; stageB-arena0 W1 4/4).
+- arena0 (COW_ARENA=0): 8/8 green, restore_qc_fail=0. The one true green axis.
+- c5fork0 (COW_FORK=0): 8/8 green - VOID as evidence: hg_getenv("STRATA_COW_FORK") is
+  read only inside direct_slot_copy (generate.cpp:15646), which requires
+  STRATA_SLOT_COPY_DIRECT, unset on mech; layer.cpp never reads COW_FORK. On the mech
+  shape the admission-fork path is dead code, so fork0 == stock. (An earlier green on
+  the stage-A binary likewise exercised no fork site.)
+- join0 (COW_JOIN_HH=0): 0/8 red. Join-at-fetch exonerated.
+- detach0 (SLOT_DETACH_MS=0): W3 green at 4.2-4.5 s walls = shallow warm-slot restores,
+  path class changed, not a fix.
+- parkcow0 (PARK_COW=0): 0/8 red. Park COW anchor mounts exonerated.
 
-Families: (1) fresh+parallel content corruption, present since the arena-era with
-COW_FORK=1 - this is the battery's chronic W1-red (17 False/1 True history) and
-general session degradation under concurrency; (2) restore corruption, era-D only -
-the VMM re-placement (4c39aa5) did not create a new defect, it made the fork's
-aliasing hit the restore path (W3 flips red only after era-D). One carrier, two
-symptoms. The death family (§217, has_borrowed guard) is the write-side instance
-of the same borrowed-view aliasing class and stays closed: every degraded arm ran
-rc=0 with silent ERR streams.
+Green requires COW_ARENA=0. Every knob inside arena-on stays red, and the same
+fresh+parallel corruption holds at stage A (pre-era-D), so the carrier is the S8-v2-era
+arena window machinery itself (per-layer slot arenas, first-fit release/reclaim with
+range splitting, bump cursor, zombie guard; era-D adds floor mapping + elastic grow
+with chunk release/re-map), not one sub-feature.
 
-Held as static reasoning (marked unconfirmed): the fork shares page *contents*;
-the corruption pattern (survives forks of the same prompt, clean serial) fits a
-fork-time content race or aliasing, not a use-after-free (a freed cell would
-poison serial too). Next step is instrumentation, not more knobs: fork counters
-+ A/B content compare of donor-vs-forked windows.
+Leading hypothesis (static analysis, unconfirmed): conversation images and checkpoints
+carry pool slot indices; when reclaim/re-map moves a session's window base between
+park and restore (era-D floor+grow makes bases unstable; serial single-session runs
+reclaim the same base, concurrent ones do not), readers that resolve stale indices
+follow tables into other sessions' ranges. Fresh-session parallel corruption may be
+range-handling on the claim/release path (splits/zombie guard). Instrumentation
+(table-vs-window content compare, opt-in env gate) is the next step; knobs are
+exhausted.
 
-Consequences: interim config law - COW_FORK=0 on mech and on the Windows local
-engine (the user-facing :8080 engine runs COW_FORK=1 and is exposed to family 1;
-fix = config line + service restart). §219 promotion: ctest green + battery green
-under fork-off; era-D grid numbers stay suspect until re-measured with fork fixed.
+Consequences: §219 promotion stays blocked; era-D numbers stay suspect; the earlier
+"Windows :8080 fork-off mitigation" claim is also void (same dead-path reasoning).
