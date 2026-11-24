@@ -1986,3 +1986,40 @@ costs nothing and returns ~1 GiB to the cache.
 
 Artifacts: ms01 `grid-results-v{8,9,10,11,12}-*`, `logs/v{8,9,10,11,12}-b4_*.log`,
 scripts `~/s8_tune_grid_v{8..12}.sh`.
+### §219. P2-C.5 reservation-collateral: the b8 cache unlock (v13 pair, 2026-11-24)
+
+The Gemini critique's prescription, implemented: with `STRATA_COW_CACHE_FUND=1`,
+the deferred slot sessions' arena-window bytes are no longer subtracted from the
+expert cache at boot - the cache's fundable slice is their collateral - while the
+per-session buffer part stays priced in (plain cudaMalloc at attach; nothing lends
+against that). One file: the cache-pricing ledger (generate.cpp ~8552):
+`cow_reserve = deferred x session_bytes + (fund ? 0 : deferred_window_bytes)`, and
+the arena grow budget goes to zero with the fund on, so any grow pays the funder
+before the price line instead of a boot claim. FUND off: stage B byte-for-byte.
+
+v13, same-boot pair, b8 mech shape (FLOOR 4096, SLOTS 34816, PAR_COUNTERS):
+- Boot, fund arm: `reservation collateral: 672 MiB of deferred windows is NOT held
+  out of the cache`; reservation 3106 -> 2434 MiB; cache **2153 slots / 3.53 GiB**
+  vs control **1758 / 2.87 GiB**. The deferred window is 96 MiB/session at this
+  shape (demand 6144 = main + one slot + one doubled round, all priced).
+- Battery (7 legs, minutes apart): the fund arm won EVERY leg. farm C1 48.8 vs
+  42.6; farm C4 71.5 vs 69.2; farm C4-warm agg **76.7 vs 72.6**; nat C2 **52.5 vs
+  45.0**; worst C2 **53.3 vs 45.2**; nat C4 agg 62.1 vs 56.1, tail **53.0/52.4 vs
+  45.7/45.5 (+15-16%)**. Hit rate: 94.4% vs 91.6% (PCIe 3.2% vs 5.1%) on the
+  heaviest leg.
+- Runtime counters identical in both arms: `grown=0 declines=0 refused=0 funded=0
+  gave=0 back=0 cowguard=1 re-carved=0 boots=1`. The funder never had to pay:
+  session buffers arrive via the admission cudaMalloc (priced, fits), and CoW
+  claims stayed inside the mapped floor. The whole gain is the boot unlock, at
+  zero measured runtime risk - but note the corollary: with the budget at zero,
+  an uncollateralizable grow would now go straight to the funder and the price
+  line (no boot claim in front), so hysteresis care is owed before any shape
+  where the dance actually fires. The give/take dance remains unexercised.
+- §214 survivorship is untouched (same 8-slot ceiling, same attach-on-demand);
+  §218's structural verdict stands for the reachable shapes. This is the
+  b8-survivorship + b4-class-cache synthesis the concurrency goal asked for:
+  the 101 MiB indexer pool and the doubled-round window claim are the remaining
+  priced-in residue (P2-C.6 candidate).
+
+Artifacts: ms01 grid-results-v13-b8_{fund,ctrl}-1123-23*.log, logs/v13-b8_*.log,
+~/s8_tune_grid_v13.sh; engine: generate.cpp collateral hunks (.bak-p2c5 backup).

@@ -8549,10 +8549,17 @@ int main(int argc, char** argv) {
         const int64_t cow_lo = stages.empty() ? (int64_t) 0 : stages[0]->lb;
         const int64_t cow_hi = stages.empty() ? (int64_t) -1 : stages[0]->le;
         const int64_t cow_sess_bytes = (int64_t) strata::core::session_bytes(g, o.max_context, K, cow_lo, cow_hi);
+        // (dyn-conc P2 stage C.5) reservation-collateral: with cache-funded admission on, the deferred
+        // sessions' ARENA WINDOW bytes are no longer subtracted from the cache — the fundable slice of the
+        // cache IS their collateral (the grow block pays the funder before the price line, layer.cpp ~1445),
+        // and the fund floor is the safety the reservation used to hard-code. The per-session BUFFER part
+        // stays held out: it is a plain cudaMalloc at attach, and nothing lends against that. FUND off:
+        // stage B's arithmetic, byte for byte.
+        const int64_t cow_win = strata::core::qsa_cow_arena_deferred_bytes();
         const int64_t cow_reserve = cow_deferred > 0
-            ? cow_deferred * cow_sess_bytes + strata::core::qsa_cow_arena_deferred_bytes() : 0;
+            ? cow_deferred * cow_sess_bytes + (g_cow_cache_fund ? 0 : cow_win) : 0;
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first + cow_reserve;
-        strata::core::qsa_cow_arena_set_budget(cow_reserve);   // (dyn-conc P2 stage B) the same bytes, now a claim they can spend
+        strata::core::qsa_cow_arena_set_budget(g_cow_cache_fund ? 0 : cow_reserve);   // (dyn-conc P2 stage B) the same bytes, now a claim they can spend; (stage C.5) collateralized windows leave the budget too, so the grow pays the funder, not a boot claim
         const int64_t blob = (int64_t) nibble_max_slot_bytes();   // max_blob (STRATA_EXPERT_NIBBLE: or a larger 4-bit slot)
         // #496: the least a working cache needs (the verify window cannot start without one, #174): a cache too small to lend the prompt path a
         // 256-token chunk's buffers (plus the 128 slots a loan leaves; one slot without --prefill) makes it allocate its own on top
@@ -8595,9 +8602,14 @@ int main(int argc, char** argv) {
                      auto_slots.late_priced ? ", +256 MiB for what is allocated after the cache" : "", o.expert_cache);
         if (cow_deferred > 0)
             std::fprintf(stderr, "strata generate: expert cache auto: %lld slot session%s stand unattached at the arena "
-                                 "floor: %lld MiB (their buffers and their windows) stays out of the cache so their "
-                                 "admission can pay for itself\n",
-                         (long long) cow_deferred, cow_deferred == 1 ? "" : "s", (long long) (cow_reserve >> 20));
+                                 "floor: %lld MiB (their buffers%s) stays out of the cache so their admission can pay "
+                                 "for itself\n",
+                         (long long) cow_deferred, cow_deferred == 1 ? "" : "s", (long long) (cow_reserve >> 20),
+                         g_cow_cache_fund ? "" : " and their windows");
+        if (cow_deferred > 0 && g_cow_cache_fund)
+            std::fprintf(stderr, "strata generate: cow: reservation collateral: %lld MiB of deferred windows is NOT "
+                                 "held out of the cache: it is collateralized on the cache's fundable slice and pays "
+                                 "at admission (STRATA_COW_FUND_MIN_PCT floor)\n", (long long) (cow_win >> 20));
 #if defined(STRATA_USE_HIP) && !defined(_WIN32)
         // An APU's "VRAM" is system RAM: the device-free figure above counts the whole GPU-addressable pool and does not
         // subtract ordinary CPU allocations (the host expert arena), so a cache sized from it alone can ask the OOM killer
