@@ -2063,6 +2063,16 @@ Consequences, held to what is measured:
 - Local Windows engine (C:\hydragen, Nov-20 install) predates the conversion
   and is not in the affected family.
 
+Control probes (same boot, single variable, seeds varied per arm): stage A
+(11/21 binary) FAILS the 4-up parallel probe too (0/4 clean at ~13k, 2/4
+refusals at ~1.6k) while single-stream sweeps are clean at every size. Two
+families share the arena feature set: Family 1 = fresh+parallel corruption
+(present at stage A and B, absent arena-off; the battery's chronic W1-red),
+Family 2 = restore corruption (era-D only; W3 flips stage-A green -> stage-B
+red; the VMM conversion). Arena-off is clean on every probe tested, hence
+arena0's first-ever 8/8. Env-knob bisection of Family 1 (COW_FORK/PARK_COW/
+COW_JOIN_HH) follows on the stage-A binary.
+
 Method laws banked this session: (1) a battery whose mtime postdates the
 "green baseline" logs is not a baseline - check versions before bisecting;
 (2) .bak revert chains must be path-verified (src/core vs src/program) or
