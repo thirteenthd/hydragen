@@ -2327,3 +2327,43 @@ Next: the shared-region path (`n_shared > 0`, adoption live under the restored
 `L >= 0`) has not yet been exercised end-to-end — every mechdbg config here is
 `0 shared region`. And the Windows service still runs the pre-fix pb4 binary with the
 ARENA=0 mitigation staged; the restart is pending user availability.
+
+## §235 — adoption probe: hint-path fetches flow, but the shared region corrupts while it rolls (ms01, 2026-11-24)
+
+The §234 open item — "the shared-region path has not yet been exercised end-to-end" —
+is now exercised, and it does not pass. Config: ms01 mechdbg, arena ON,
+`STRATA_COW_SHARED` toggled; binary = sync180 @ `feed840` (HEAD at probe time).
+
+Adoption itself is proven live at `shared=2048`: boot reads
+`12 QSA layers x 20480 slots (2048 shared region)`; telemetry shows joins served
+(48→365) and **lineage shared fetches flowing (4286, region saturated)**; admission
+forks point at real floors (1536/488/1032/841 of ~3190 prefix pages per K/V layer).
+
+Failure matrix (probe222x, same prompt contents per seed):
+- `shared=2048`: parallel seeds 9170 and 9172 → **3/4 both** (P3 degenerates:
+  repetition loop / token-scramble, finish=length). serial 9171/9173 → 4/4.
+- `shared=0` control: parallel 9170 + 9172 → **8/8** (identical contents).
+- `shared=8192` (region ≥ the 4-lineage working set, no mid-generation roll):
+  parallel 9170 + 9172 → **8/8**; fetches 14566, joins 114.
+
+Zero corruption/wrong-naming markers in the boot itself (the 29 grep hits in
+`strata-mechdbg.log` are §230-era boot residue — the log accumulates across boots;
+retraction hygiene from the §234 retraction note applies).
+
+Finding: the failure is **deterministic per content-class when the region rolls**
+(two different seeds, same victim, serial immune), not sampling noise, and it is
+not §234's hint-tab axis (that tab hygiene held: fetches flow, windows clean).
+The mechanism the matrix points at: the region sweep's "PIN LAW holds by
+construction" claim (region slots victimable only while `slot_use == 0`) does not
+hold for **adopted** entries — `miss_sh_slot` commits a window-table entry naming
+an arena-global shared slot, but the tail slots' eviction clock is the region's
+own sweep (srf ref-bits), not the `slot_use` pins; between commit and gather a
+sweep pass can re-take the slot under another lineage. `sst` epoch stamping is
+conservative at *resolve* time only — it cannot guard an already-committed entry.
+Capacity (8192 clean) is a load-dependent margin, not a fix.
+
+Stance: `STRATA_COW_SHARED` stays **0** everywhere (ms01 mechdbg restored to 0 and
+restarted; Windows prod unaffected). Opening the shared path requires the tail-slot
+pin fix first (extend the `slot_use`/live-entry accounting over the shared tail, or
+gate the sweep on live-entry count); then re-run the 2048 arm before any region
+policy is set. counter 188.
