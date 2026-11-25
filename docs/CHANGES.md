@@ -2530,3 +2530,149 @@ Phase 0 is complete: P0.0–P0.7 each have an artifact on `main`
 Open before the first Phase 1 arm: the ms01 hygiene debt (stale `p2d1_arms.sh`
 wrapper, 10 GiB `MemAvailable` against a 16 GiB conversation cache), and the §235
 tail-slot pin fix, which remains unwritten and hard-gates Phase 4. counter 191.
+
+## §239 — Phase 1 closes: the v0.2.21 rebase lands as hydragen v0.0.1, and aggregate decode crosses 200% of single-stream on one 12 GB card (Windows + ms01, 2026-11-25)
+
+The topical stack replayed onto upstream `v0.2.21` (`d46f5f26`, engine 0.1.67) is
+complete on `rebase/v0.2.21` and has been built, gated and measured on both hosts:
+
+- `76ffe93` base: vendor Strata v0.2.21 (engine 0.1.67, `d46f5f26`) in the 0.2.16
+  layout (`engine/`, `terminal/`, `tools/`, `app/`), upstream docs confined to
+  `engine/docs/`, root `.gitignore` re-anchored to `/models/`.
+- `3a02538` L0: HydraGen identity (`OUTPUT_NAME hydragen`), `hg_env` with
+  `HG_*`-first / `STRATA_*`-fallback reads, 0.2.16 layout consumers, Windows helpers.
+- `83963b2` L1: ParkDisk v3 (BCS, S5a, S5c, S5d), `HG_PARK_COW` with the nested
+  `ParkAnchorGuard`, M-D2, `HG_RESUME_DEEPEST`.
+- `6fad73a` L2: shared RoPE table across slot sessions, S7-3 `idx_pool_f16`,
+  elastic VMM CowArena + `COW_JOIN_HH`, S4-v2 slot detach, Stage C.5 kept with
+  `qsa_cow_arena_set_budget` unbundled.
+- `d13387f` L3: Auto Batch-N DecodeGovernor (`--min-stream-tps`), serve `UNREAD`
+  ranking and `YIELD_AFTER_S`, 30 s slot memory backoff, `--engine hydragen`.
+- `cb4c5c8` L4: `ParkDiskLog`, `/slots` telemetry (`state`, `held_tokens`,
+  `idle_s`), Concurrency States panel and the split RAM / Park-disk dashboard.
+- `6cd1bfc` L0-fix: link `strata_kernels_cpu` into `strata_core` for the
+  `pinned.cu` `expert_layout` consumers — the defect that made stock `v0.2.21`
+  itself fail to link 4 targets (§Phase 1A).
+- `67fbed9` L0-version: engine identity and version set to **hydragen v0.0.1**.
+
+Locked decisions at close: the banner is `hydragen v0.0.1`
+(`engine/CMakeLists.txt` `VERSION 0.0.1`, `engine/src/program/generate.cpp`
+`std::printf("hydragen v%s\n", STRATA_VERSION)`); the 47 `engine/docs/` files whose
+blobs differ from upstream only by CR-stripping are kept as-is, because
+development and commits happen primarily from Windows; the Phase 0 prunes hold —
+**0** matches in `engine/` for `STRATA_COW_SHARED`, `g_cow_shared`,
+`qsa_set_cow_shared`, `cow_fund`, `cow_retake`, `g_cow_funder`,
+`qsa_cow_arena_set_funder`, with `COW_JOIN_HH` (7 hits) and the unbundled
+`qsa_cow_arena_set_budget` (`layer.hpp:328`, `layer.cpp:1181`,
+`generate.cpp:9318`) kept.
+
+Windows (`C:\DevOps\HydraGen`, MSVC): CPU `ctest` **46/46** (`100%`, including
+`park_disk_boot_test` and `decode_governor_test`; `dot_x4_bench` excluded on MSVC).
+Both CUDA builds rebuilt from the version-identity tree — `engine/build/p1-cuda-l1`
+(49,601,536 B, 8 rows) and `engine/build/p1-cuda-t16` (51,833,856 B, 16 rows) —
+report `hydragen v0.0.1` and carry `--min-stream-tps`. L4 serve/web: `py_compile
+terminal/serve/server.py` OK, `node --check terminal/serve/web/app.js` OK, 9
+unittest suites **65/65 OK** in 49.000 s (after the 100-test L3 pass), `smoke_l4.py`
+OK.
+
+ms01 (`~/hydragen-v0221` @ `67fbed9`, RTX 3080 Ti 12 GiB, 64 GB host RAM): both arms
+rebuilt **901/901 targets, 0 failed** — Arm 8 `build-arm8/hydragen` 58,270,896 B
+md5 `6d63e838e831ef334745db40e46e57e7`, Arm 16 `build-arm16/hydragen` 60,643,240 B
+md5 `7a301f8830f912bcd6403fc9d830b09d`, both `hydragen v0.0.1`. Provenance for the
+live A/B below: it ran on the same sources one commit earlier, at `6cd1bfc`
+(Arm 8 md5 `009f6bb32a3cb07b73d141874fe062ca`, Arm 16 md5
+`27b3d49cbaab00ebab5be4f67d7af2a7`, banner `strata 0.1.67`); the `67fbed9` rebuilds
+are the same sizes and differ only in version identity.
+
+Gates G1–G8 at `6cd1bfc`: **G1 Arm 8 429/431** — the two failures are
+`no_mmq_symbols` and `ple_parity`, the same two environment items the stock
+`v0.2.21` baseline fails (425/429), so the fork adds no test regression;
+`pinned_shared_test` passes on the rebased tree where stock cannot even link it, and
+`pool_tasks_test` passes in **7.93 s** then **8.05 s** on a later confirmation run
+where stock reports `***Timeout 180.11 sec`. **G3 10/10 run serially on both arms**
+(Arm 16 with `CUDA_MODULE_LOADING=LAZY`), mech stopped, GPU 9 MiB. G2/G4 serve
+markers and `--engine` choices present; **G6** `engine/docs/` path set identical to
+upstream (2,547 vs 2,547, `comm -3` empty) with the 47 CRLF-only blob diffs above;
+**G7** prune assertions above; **G8 27/27 OK** under `~/hydragen-live-venv/bin/python`
+(system `python3` lacks the `regex` module — environment, not code).
+
+**G9 live A/B** (`~/g9/logs/`, model `qwen3.8-flash-next-iq3_xxs-m25`, `n_ctx
+131072`, port `:8189`, flags derived mechanically from
+`~/hydragen-experimental/strata-mechdbg.json` — 43 args, 20 env entries — fresh
+scratch `STRATA_PARK_DISK` per arm, `enable_thinking:false`, fixed seeds; Control =
+`build-ctrl0221-native` md5 `2cba9f8416e25b2a031c7a8c2f7ab0c9` with its own
+`engine/serve/server.py`, arms with `terminal/serve/server.py`):
+
+| | Control `0.1.60` b4 | Arm 8 `T=8` b4 | Arm 16 `T=16` LAZY b4 | Arm 16 `T=16` b8 |
+|---|---|---|---|---|
+| expert slots / cache | 2,933 / 4,891 MiB | 3,538 / 5,930 | 3,711 / 6,212 | 3,711 / 6,212 |
+| GPU load / peak / free at load | 10,381 / 11,963 / 1,769 | 11,487 / 12,093 / 663 | 11,489 / 12,127 / 661 | 11,499 / 12,137 / 651 |
+| hit% routed / expert cache | 82.1 / 99.2 | 83.6 / 99.2 | 84.0 / 97.2 | 85.8 / 96.4 |
+| min `MemAvailable` / peak RSS | 2,213 MB / 56.2 GB | 6,865 MB / 51.6 GB | 7,770 MB / 50.7 GB | 7,803 MB / 50.7 GB |
+| solo prefill / decode tok/s | 2,242.5 / 61.6 | 2,574.9 / 62.9 | 2,530.6 / 63.0 | 2,540.5 / 63.4 |
+| solo TTFT (cold 12k) | 5.10 s | 4.42 s | 4.44 s | 4.47 s |
+| 4-up divergent wall / agg / Σdecode | 54.2 s / 44.3 / 66.2 | 49.4 s / 48.6 / 126.7 | 49.2 s / 48.8 / 127.4 | 48.6 s / 49.4 / 129.4 |
+| **Σdecode ÷ solo** | **1.07×** | **2.01×** | **2.02×** | **2.04×** |
+| fan-out (4 off one 12k header) wall / agg / Σdecode | 34.8 s / 69.0 / 80.2 | 45.3 s / 53.0 / 126.3 | 43.5 s / 55.2 / **133.2** | 44.6 s / 53.8 / 128.9 |
+| **fan-out Σdecode ÷ solo** | 1.32× | 2.01× | **2.11×** | 2.03× |
+| `bench_quick` N=1 / 2 / 4 agg | 66.9 / 62.8 / 66.4 | 65.6 / 66.0 / 59.8 | 66.4 / 65.2 / 61.6 | 65.7 / 65.2 / 59.9 |
+| `bench_quick` N=8 | 2.9 agg, 5 errors, 300 s | out of envelope | out of envelope | **58.9 agg, 14.0 per-stream, 0 errors, 54.2 s** |
+
+The campaign number is in the two Σdecode rows: on one 12 GB card at 12k depth the
+rebased tree decodes **2.01–2.11× its own single-stream rate** across four streams,
+where the control reaches 1.07–1.32×. Arm 16 costs **+2 MiB at load and +34 MiB at
+peak** over Arm 8 and is ahead on slots (3,711 vs 3,538), cache (6,212 vs 5,930
+MiB), hit% (84.0 vs 83.6) and fan-out Σdecode (133.2 vs 126.3), so **Arm 16 with
+`CUDA_MODULE_LOADING=LAZY` and `--batch 8` is the default**; `--batch 8` fits the
+card (12,137 MiB peak, 50.7 GB RSS, `OOM=0`) and turns the control's N=8 collapse
+(2.9 tok/s, 5 errors) into a clean 58.9 tok/s aggregate. G9 verdict: **pass**.
+
+**G5 live probes.** `probe222x` at seed 8300 with the arena on
+(`COW_ARENA=1`, `SLOTS=18432`, `JOIN_HH=8`, `COW_SHARED=0`) scored **4/4 QC in the
+4-up pass and 4/4 in the serial pass on every arm** — 10 probe runs across five
+boots, no §223 corruption reproduced. `/slots` returned `state`, `held_tokens`,
+`idle_s` cleanly (8 rows at `--batch 8`). DecodeGovernor honored its flag and
+telemetered: `decode governor: on (min_stream_tps=25.0 hit_floor=86.0% init_n=4
+quantum=2000 ms)`, 206 lines, width walking `N 4→3→2→1` then oscillating `1↔2` as
+hit% crossed the floor; with the floor on, N=4 aggregate fell 59.8 → 52.0 tok/s.
+Zero `out of memory`, `CUDA error`, `corrupt` or `assert` lines in all five engine
+logs; `S4v2 sweep:` lines present (`detached 0, idle-cached slots 1-3`); CoW anchors
+mounted (`park COW anchor mounted for N of M tokens`, 13-15 lines per pass); parks
+and restores recorded (`parks 36-37`, `reused_tokens 63,054` identical on Arm 8 and
+Arm 16, so the traffic is deterministic).
+
+Two corrections to the first reading of the G5 evidence, both from the logs. First,
+the spill/restore traffic in the arms is the **conversation-cache SSD tier**, not
+the ParkDisk v2 chunk store: Arm 8 spilled 10 snapshots of 12,357–12,420 tokens at
+277.2–846.0 ms reaching 3,932 MiB on SSD, and restored checkpoints of 12,776 tokens
+in 38.5 ms and 12,736 in 40.8 ms; the 768 MiB-budget pass spilled 12,745–12,872
+tokens at 404.2–889.0 ms. On all three arms the chunk store stayed empty
+(`park disk: ON … index 0 files`, `v2 dedup tier active (store 0 chunks, 0.0 GiB)`,
+metrics `entries 0, spills 0, chunks 0`), while the Control's pass wrote 9 entries /
+2.6 GiB / 8,722 chunks and restored 11,806 tokens in 532–541 ms. Why the rebased
+tree never reaches the chunk store under this traffic is an open Phase 2 question,
+not a failure: the tier reports itself enabled and its counters are wired. Second,
+the fan-out `cached_tokens 0` on siblings S1–S3 is a prefill-chunking effect, not a
+cache miss: Arm 8 prefills the 11,791-token header in one chunk
+(`prompt 11791 tokens = 0 reused + 11791 read in 4281 ms (2754.4 tok/s), 1
+checkpoints`) because 11,791 ≤ the 16,384 `--prefill auto:16384` chunk, while
+`0.1.60` split at 6,144 and left a claimable checkpoint
+(`… = 6144 reused + 5650 read in 2589 ms …, 1 checkpoints`), which is why the
+control's fan-out wall is shorter (34.8 s) and its `agg` higher (69.0) despite
+decoding at half the rate. Sibling reuse itself is healthy on the arms: the
+multi-turn turns reuse 12,736–12,833 of 12,743–12,834 tokens in 0–142 ms.
+
+`:8181` was stopped for the arms and restored through `~/mechdbg_restart.sh`: one
+serve (`1479019`) plus one engine (`1479033`, `build-s180`), `/v1/models` →
+`qwen3.8-flash-next-iq3_xxs-m25` `loaded`, `/health` `ok`, GPU 10,285 MiB, and the
+live park era untouched — `park_disk entries 83`, `bytes 30,386,893,619`,
+`chunks 85,749`, byte-identical to the pre-stop sample. Every benchmark write stayed
+under `~/g9/` and `~/logs-1b/`; `~/hydragen-sync180`, `~/hydragen-ctrl-0221` (read
+only for its serve tree) and `~/strata-v0221-stock` untouched.
+
+Open for Phase 2, in priority order: fan-out prefix reuse (the arms pay full
+prefill for 3 of 4 tasks off a shared header, which is what caps `agg` below the
+control even while decoding 2× faster); the empty ParkDisk v2 chunk store on the
+arms; the 12 GiB envelope is now bound by expert cache rather than KV, with
+`vram_free` down to ~650 MiB at load; and the §235 tail-slot pin fix, still unwritten,
+still hard-gating Phase 4. counter 192.
