@@ -17098,9 +17098,11 @@ int main(int argc, char** argv) {
         strata::program::DecodeGovernor decode_gov(strata::program::parse_decode_governor_config(o.min_stream_tps));
         if (decode_gov.enabled())
             std::fprintf(stderr, "strata serve: decode governor: on (min_stream_tps=%.1f hit_floor=%.1f%% "
-                                 "init_n=%d quantum=%.0f ms)\n",
+                                 "init_n=%d quantum=%.0f ms grace=%d affinity=%d affinity_max_wait=%d)\n",
                          decode_gov.config().min_stream_tps, decode_gov.config().hit_floor_pct,
-                         decode_gov.config().initial_width, decode_gov.config().cohort_quantum_ms);
+                         decode_gov.config().initial_width, decode_gov.config().cohort_quantum_ms,
+                         decode_gov.config().grace_windows, decode_gov.config().affinity ? 1 : 0,
+                         decode_gov.config().affinity_max_wait);
         auto pc_ex = [&]() {
             strata::program::ParCounters::Ex e;
             e.misses = drive.d.multi_misses; e.entries = drive.d.multi_entries; e.hits = drive.d.cache_hits;
