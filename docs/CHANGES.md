@@ -2423,3 +2423,52 @@ successes — guard it next battery.
 Stance: p2d1 builds stay on ms01 for arms; **ms01 mechdbg remains build-s180**
 until the governor-tuning battery and the §235 pin fix land; Windows :8080
 swap still open. counter 189.
+
+## §237 — Phase 0 opens: v0.2.21 fetched, the control baseline tagged, gates written (2026-11-25)
+
+The v0.0.1 rebase base is fixed: upstream **v0.2.21** = annotated tag object
+`0f8a6b78` → commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`, tree
+`ac94d63dca450fd38be5c65bf67337c450566428`, `project(strata VERSION 0.1.67)`,
+**1,748** commits past our `38f63bc5` (0.1.60). Neither local clone had the
+objects — `hydragen-sync180`'s `upstream` sat at `c77572806` (v0.2.15) — so the
+fetch was a Phase 0 step, not a given.
+
+The control baseline is frozen as annotated tag **`control-pre-0221`** at
+`654b078` (§236), pushed to `origin` with the 21 commits that were unpushed.
+`docs/control-pre-0221.md` notarizes the **runtime** baseline too, because the tag
+cannot: the exe serving ms01 `:8181` is `build-s180/hydragen` md5
+`e5ada445f1d5f1a3967343c4f9b3b30f` (52,225,184 B, 2026-11-24 18:50:40Z), built
+from ms01's private clone at `3665a350` — an object that **does not exist in the
+public repo** — so it is pre-P2-D1 and not a build of the tag; `build-p2d1/hydragen`
+md5 `6d7a1714c4cd6c83fc98c51b3504fdf7` has no VCS at all. Both are
+`STRATA_WINDOW_MAX_T=auto` → **8 rows** on CUDA, arch `86-real`, Release.
+Phase 1's parity control must therefore be built from the tag, not re-used.
+
+Mech posture recorded verbatim (20 env entries + 27 args). `STRATA_COW_CACHE_FUND`
+is **absent** → `g_cow_cache_fund = false` (`generate.cpp:306`): the control runs
+**CACHE_FUND=0**, so the locked Stage-C prune is behaviour-preserving here.
+
+`docs/PHASE1_GATES.md` writes the gates before the work: G1 ctest re-notarized
+against v0.2.21 (not §181's 322/352), G2 §177 identity against a tag-built binary,
+G3 upstream's KV/batch parity suite (§181 never ran it), G4 both traffic shapes
+(divergent `bench_quick` **and** agentic fan-out — §236's evidence base is
+divergent-only), G5 the §223 4-up probe riding the agentic arm, G6 the
+`git ls-files` 7,332/7,403 gate across the 0.2.16 layout move (upstream `docs/`
+holds `MODELS.md` and `HOW_IT_WORKS.md` — exact-name collisions with our root
+`docs/`), G7 the 8-row vs 16-row arms, G8 the CACHE_FUND unbundle (prune the
+funder, keep C.5's boot pricing, leave the grow budget funded from new VRAM),
+G9 upstream's `slot save/restore … not available with parallel requests`
+(`terminal/serve/server.py:4460`) checked by test, not assumption.
+
+P0.3 separability, settled in code: the join registry (`CowPeer`, `st.map.reg`) is
+gated at `layer.cpp:1653/1665` on the **arena** and on `slot_use`, never on
+`g_cow_shared`, so `COW_JOIN_HH` survives the `COW_SHARED` prune — matching §204's
+`joins 0 → 80` with `(0 shared region)`. Two prune depths; Phase 1 takes depth 1
+(host-side knob and allocation, map fields pinned null/0, byte-identical).
+**The prune is hygiene, not the §235 fix**: §235 lives in the arena slot pin law
+(`slot_use`, `ablk[L] == b`), which it does not touch; the pin fix stays a hard
+gate on Phase 4.
+
+Live ms01 state at capture: a stale `p2d1_arms.sh` wrapper alive 9,364 s after its
+battery finished (not killed), and 10 GiB `MemAvailable` against a 16 GiB
+conversation cache. counter 190.
