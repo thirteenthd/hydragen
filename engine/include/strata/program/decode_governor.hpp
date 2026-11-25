@@ -131,6 +131,12 @@ public:
 
     bool enabled() const { return cfg_.enabled; }
     bool affinity_enabled() const { return cfg_.enabled && cfg_.affinity; }
+
+    /// P3-3A: how many cohort seats were taken by a prefix sibling, and how many waiting slots
+    /// were stepped over to do it. Pure instrumentation: the serve log prints both so an
+    /// affinity arm can show the mechanism fired instead of only that it was enabled.
+    uint64_t affinity_picks() const { return affinity_picks_; }
+    uint64_t affinity_deferrals() const { return affinity_deferrals_; }
     const DecodeGovernorConfig& config() const { return cfg_; }
     int target_width() const { return target_n_; }
     double ema_hit_pct() const { return ema_hit_pct_; }
@@ -250,7 +256,7 @@ public:
                     const int64_t dom = dominant_affinity();
                     if (dom != 0) {
                         for (const int id : waiting) {
-                            if (aff_of(id) == dom) { pick = id; break; }
+                            if (aff_of(id) == dom) { pick = id; ++affinity_picks_; break; }
                         }
                     }
                 }
@@ -261,6 +267,7 @@ public:
                 // front and passes nobody, so it must not put the whole pool behind a queue.
                 for (size_t i = 0; i < waiting.size(); ++i) {
                     if (waiting[i] == pick) break;
+                    ++affinity_deferrals_;
                     bool seen = false;
                     for (auto& kv : waited_) {
                         if (kv.first == waiting[i]) { ++kv.second; seen = true; break; }
@@ -415,6 +422,8 @@ private:
     std::vector<int> cohort_sorted_;  ///< Canonical ascending order for batch rows
     std::vector<std::pair<int, int64_t>> aff_;    ///< slot -> prompt-prefix key, this call
     std::vector<std::pair<int, int>> waited_;     ///< slot -> times passed over by affinity
+    uint64_t affinity_picks_ = 0;                 ///< cohort seats taken by a prefix sibling
+    uint64_t affinity_deferrals_ = 0;             ///< waiting slots stepped over to do it
 };
 
 }  // namespace strata::program

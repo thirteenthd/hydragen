@@ -17989,8 +17989,10 @@ int main(int argc, char** argv) {
                 const int prev_n = decode_gov.target_width();
                 if (decode_gov.observe_window(win_ms, gov_win_tokens, A, win_hit_pct, gov_slot_cap)) {
                     std::fprintf(stderr, "strata serve: decode governor: N %d -> %d "
-                                         "(hit=%.1f%% window=%.1fms A=%d tok=%d)\n",
-                                 prev_n, decode_gov.target_width(), win_hit_pct, win_ms, A, gov_win_tokens);
+                                         "(hit=%.1f%% window=%.1fms A=%d tok=%d aff=%llu/%llu)\n",
+                                 prev_n, decode_gov.target_width(), win_hit_pct, win_ms, A, gov_win_tokens,
+                                 (unsigned long long) decode_gov.affinity_picks(),
+                                 (unsigned long long) decode_gov.affinity_deferrals());
                 }
             }
             report_batch_window(S, A, !batch_on(), w0);

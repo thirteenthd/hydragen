@@ -350,6 +350,8 @@ int main() {
         CHECK((c == std::vector<int>{0, 1, 4}));   // the sibling, not slot 2
         CHECK(is_strictly_sorted(c));              // rows[] keys stay canonical
         CHECK(gov.waited_for(2) == 1);             // the passed-over slots age
+        CHECK(gov.affinity_picks() == 2);          // seats 2 and 3 went to prefix siblings
+        CHECK(gov.affinity_deferrals() == 2);      // slots 2 and 3 were stepped over to do it
     }
 
     // 10b. aging: a prefix group cannot hold the seat forever
@@ -395,6 +397,8 @@ int main() {
         const std::vector<int64_t> key = {33, 33, 11, 22, 33, 44};
         CHECK((gov.select_cohort(r6, 8, 0.0, key) == std::vector<int>{0, 1}));
         CHECK((gov.select_cohort({0, 1, 2}, 8, 5.0, key) == std::vector<int>{0, 1}));
+        CHECK(gov.affinity_picks() == 0);          // affinity off: the counters never move
+        CHECK(gov.affinity_deferrals() == 0);
     }
 
     // 11. P3-3A prefix_affinity_key: same header -> same key whatever the tail; different header ->
