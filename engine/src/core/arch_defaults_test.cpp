@@ -635,6 +635,15 @@ int main() {
         CHECK(pcie_start_frac(true, true, true, false, false) == 0.25);
         CHECK(pcie_start_frac(false, false, true, false, true) == 0.2);
         CHECK(pcie_start_frac(false, false, true, false, false) == 0.2);
+        // Phase 3 Track 3C: the batched stage caps the start share at 0.25 (the 12 GiB bench box measured
+        // +10..16% tok/s at 0.25 over 0.50 with hit% flat); a solo stage, a cap of 0, and a start already
+        // under the cap all leave it alone.
+        CHECK(pcie_batch_frac_cap(0.55, 8, 0.25) == 0.25);
+        CHECK(pcie_batch_frac_cap(0.55, 0, 0.25) == 0.55);
+        CHECK(pcie_batch_frac_cap(0.55, 8, 0.0) == 0.55);
+        CHECK(pcie_batch_frac_cap(0.2, 8, 0.25) == 0.2);
+        CHECK(pcie_batch_frac_cap(0.25, 8, 0.25) == 0.25);
+        CHECK(pcie_batch_frac_cap(0.55, 8, 0.4) == 0.4);
     }
     std::printf(fails ? "arch_defaults_test: %d FAILED\n" : "arch_defaults_test: OK\n", fails);
     // ---- 0.2.7 CUDA defaults (sm120_series.hpp): which cards get which, and which never do

@@ -38,4 +38,18 @@ inline double pcie_start_frac(bool nvfp4_pack, bool native_pack, bool gfx12_defa
     return gfx12_default && !pf_old && !v026 ? 0.15 : 0.55;
 }
 
+/// Phase 3 Track 3C: the cap on that start share for a batched stage (--batch N, N > 0).  A batched stage
+/// puts every row's misses on one link, so the share measured for a single stream over-fills it, and PcieAuto
+/// never refines a batched stage (generate.cpp gates it on o.batch == 0) - the start value is the value.
+/// Measured on the 12 GiB RTX 3080 Ti bench box (--batch 8, 3,711 expert slots, IQ3_XXS native pack,
+/// 2026-11-25): 0.50 -> 0.25 lifted bench_quick N=1 64.9 -> 75.4, N=2 65.8 -> 73.8, N=4 64.3 -> 70.6,
+/// N=8 59.7 -> 67.2 and the agentic fan-out share 63.9 -> 72.8 tok/s (+10..16%), with the VRAM hit% flat
+/// (86.6 -> 88.0); 0.75 was worse everywhere (N=8 50.3) and 0.0 slightly below 0.25.  cap <= 0 or
+/// batch <= 0 leaves the share alone (STRATA_PCIE_FRAC_BATCH_MAX=0), and an explicit --pcie-frac never
+/// reaches this path.
+inline double pcie_batch_frac_cap(double frac, int batch, double cap) {
+    if (batch <= 0 || cap <= 0.0) return frac;
+    return frac > cap ? cap : frac;
+}
+
 }  // namespace strata

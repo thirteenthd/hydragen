@@ -5656,6 +5656,22 @@ int main(int argc, char** argv) {
             o.pcie_frac = base;
             std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
         }
+        // Phase 3 Track 3C: a batched stage (--batch N) shares one link across every row's misses and PcieAuto
+        // does not refine it (gated on o.batch == 0 below), so the solo-tuned start share over-fills the link.
+        // Cap it; --pcie-frac sets the share outright and never passes here, STRATA_PCIE_FRAC_BATCH_MAX=0 keeps
+        // the uncapped start, any other value caps there.  See strata::pcie_batch_frac_cap for the measurement.
+        {
+            const char* bmax = std::getenv("STRATA_PCIE_FRAC_BATCH_MAX");
+            const double bcap = bmax ? std::atof(bmax) : 0.25;
+            const double uncapped = o.pcie_frac;
+            const double capped = strata::pcie_batch_frac_cap(o.pcie_frac, o.batch, bcap);
+            if (capped != uncapped) {
+                o.pcie_frac = capped;
+                std::fprintf(stderr, "strata generate: batched stage (--batch %d): pcie_frac %.2f -> %.2f "
+                                     "(batched start cap; --pcie-frac overrides, STRATA_PCIE_FRAC_BATCH_MAX=0 keeps %.2f)\n",
+                             o.batch, uncapped, capped, uncapped);
+            }
+        }
         const char* dh_env = std::getenv("STRATA_VERIFY_DEVICE_HITS");
         if (dh_env != nullptr && std::atoi(dh_env) != 0 && !pf_old && native_pack && o.layer_split.empty() &&
             o.batch <= 0 && o.peer_device < 0) {
