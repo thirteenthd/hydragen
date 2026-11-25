@@ -46,18 +46,37 @@ Serving at capture: `serve/server.py --engine strata --config strata-mechdbg.jso
 | `/home/thirteenthd/hydragen-sync180/build-s180/hydragen` | `e5ada445f1d5f1a3967343c4f9b3b30f` | 52,225,184 | 2026-11-24 18:50:40 | ms01 clone `hydragen-sync180` @ `3665a350` "dyn-conc P2 stage B" |
 | `/home/thirteenthd/hydragen-p2d1/build-p2d1/hydragen` | `6d7a1714c4cd6c83fc98c51b3504fdf7` | 52,234,352 | 2026-11-24 21:46:58 | `/home/thirteenthd/hydragen-p2d1` — **not a git repository** (working tree) |
 
-**Provenance gap, recorded deliberately.** `3665a350` does not exist in the public
-repo (`git cat-file -t 3665a350` → "Not a valid object name"): ms01's experimental
-clone carries its own private history, and its content is what the public tree
-bundled into `4c39aa5`. So:
+**Provenance gap, recorded deliberately — no ms01 binary traces to any public
+commit.**
 
-- the binary serving :8181 is **pre-P2-D1** (no `a417b8d` content) and is **not a
-  build of `654b078`**;
-- `build-p2d1` has no VCS provenance at all — identity is md5 + mtime only.
+- `hydragen-sync180` (the s180 build tree) has HEAD `3665a350` "dyn-conc P2 stage
+  B: the reservation becomes a claim the admission can spend" — an object that
+  does **not** exist in the public repo (`git cat-file -t 3665a350` → "Not a valid
+  object name") — **and six engine files modified but uncommitted** in its working
+  tree: `conversation_buffer.hpp`, `layer.hpp`, `kv_stream.hpp`, `layer.cpp`,
+  `kv_stream.cu`, `generate.cpp`. Alongside them sit arm backups
+  (`layer.cpp.bak-arm223`, `layer.cpp.bak-hrcap`, `conversation_snapshot.cpp.bak-md2`, …).
+- `hydragen-p2d1` (the p2d1 build tree) is **not a git repository at all** —
+  identity is md5 + mtime only.
 
-Consequence for Phase 1: a true parity control must be **built from
-`control-pre-0221`**, not re-used from `build-s180`. §236's A0-vs-A1 parity remains
-valid as a same-shape binary comparison; it is not a comparison against the tag.
+Source identity by md5, at capture:
+
+| file | ms01 working tree | public `4c39aa5` | public `654b078` |
+|---|---|---|---|
+| `engine/src/core/layer.cpp` | `f32b1dc212ba662e16f0435ebe964525` | `d964a48c189de5a5aa7caecb444d19a9` | `5ec03355b535430503fceb1034c68c67` |
+| `engine/src/program/generate.cpp` | `b1430daacfed9366f32aea75d0045e37` | `94d81616fb23c00eb88521b19e5a8ef2` | `a984d7381f4919d83584b541f4ccc82d` |
+| `engine/include/strata/core/layer.hpp` | `fad6d751365c2a27ecdc10292ba4699a` | `a8749ebf2b02f377d1241368a050d645` | `ca12b2c4e483164a822d13991397479c` |
+
+The `4c39aa5` column is the hashes that commit's own message names ("five engine
+files byte-identical to the ms01 build"). **The ms01 tree matches neither public
+column** — it is a third, uncommitted state.
+
+Consequence for Phase 1: the exe serving `:8181` is a build of a dirty working
+tree, not of `control-pre-0221`. A true parity control must be **built from
+`control-pre-0221`** and re-baselined; the ms01 binaries are a reference for
+*posture* (args, env, hardware), never for *identity*. §236's A0-vs-A1 parity
+stays valid as a same-shape binary comparison — it was never a comparison against
+the tag.
 
 ### Build configuration (both build dirs, from `CMakeCache.txt`)
 

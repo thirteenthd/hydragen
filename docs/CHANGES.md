@@ -2437,12 +2437,17 @@ The control baseline is frozen as annotated tag **`control-pre-0221`** at
 `654b078` (§236), pushed to `origin` with the 21 commits that were unpushed.
 `docs/control-pre-0221.md` notarizes the **runtime** baseline too, because the tag
 cannot: the exe serving ms01 `:8181` is `build-s180/hydragen` md5
-`e5ada445f1d5f1a3967343c4f9b3b30f` (52,225,184 B, 2026-11-24 18:50:40Z), built
-from ms01's private clone at `3665a350` — an object that **does not exist in the
-public repo** — so it is pre-P2-D1 and not a build of the tag; `build-p2d1/hydragen`
-md5 `6d7a1714c4cd6c83fc98c51b3504fdf7` has no VCS at all. Both are
-`STRATA_WINDOW_MAX_T=auto` → **8 rows** on CUDA, arch `86-real`, Release.
-Phase 1's parity control must therefore be built from the tag, not re-used.
+`e5ada445f1d5f1a3967343c4f9b3b30f` (52,225,184 B, 2026-11-24 18:50:40Z). Its build
+tree `~/hydragen-sync180` sits at HEAD `3665a350` — an object that **does not exist
+in the public repo** — **with six engine files modified and uncommitted**, and its
+`layer.cpp` / `generate.cpp` / `layer.hpp` md5s (`f32b1dc2` / `b1430daa` /
+`fad6d751`) match **neither** `4c39aa5` (`d964a48c` / `94d81616` / `a8749ebf`, the
+hashes that commit's own message names) **nor** `654b078` (`5ec03355` / `a984d738`
+/ `ca12b2c4`). `build-p2d1/hydragen` md5
+`6d7a1714c4cd6c83fc98c51b3504fdf7` has no VCS at all. Both builds are
+`STRATA_WINDOW_MAX_T=auto` → **8 rows** on CUDA, arch `86-real`, Release. **No ms01
+binary today traces to a public commit**, so Phase 1's parity control must be built
+from the tag and re-baselined; the ms01 binaries pin *posture*, not identity.
 
 Mech posture recorded verbatim (20 env entries + 27 args). `STRATA_COW_CACHE_FUND`
 is **absent** → `g_cow_cache_fund = false` (`generate.cpp:306`): the control runs
@@ -2468,6 +2473,15 @@ gated at `layer.cpp:1653/1665` on the **arena** and on `slot_use`, never on
 **The prune is hygiene, not the §235 fix**: §235 lives in the arena slot pin law
 (`slot_use`, `ablk[L] == b`), which it does not touch; the pin fix stays a hard
 gate on Phase 4.
+
+P0.2's input is now complete and on disk: the engine-touching stack since §181 is
+**30 commits** (`scratch/phase0_engine_commits.txt`, oldest first), and the range
+that earlier recon lost is recovered — `0a3d105` (M-D2 §217 `has_borrowed()`
+guard), `6270e23` (§219 P2-C.5), `c172460` (`STRATA_COW_DEBUG` arena event log),
+`7cb7f1e` (§222 CoW fork fixes + `COW_FORK_HEADROOM` 512). Note `5074249` (§235)
+touches **no engine file** — the adoption probe was run with existing knobs, so the
+pin fix is still unwritten, not merely unfixed. `4c39aa5` remains the one
+non-topical commit to decompose: 7 files, **+740/−32**, bundling five experiments.
 
 Live ms01 state at capture: a stale `p2d1_arms.sh` wrapper alive 9,364 s after its
 battery finished (not killed), and 10 GiB `MemAvailable` against a 16 GiB
