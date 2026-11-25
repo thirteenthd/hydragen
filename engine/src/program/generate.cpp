@@ -155,6 +155,7 @@
 #include "strata/program/bdone_drafts.hpp"
 #include "strata/program/batch_groups.hpp"
 #include "strata/program/par_counters.hpp"
+#include "strata/program/decode_governor.hpp"
 #if defined(__linux__)
 #include <execinfo.h>
 #include <fcntl.h>
@@ -828,6 +829,7 @@ struct Options {
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     bool kv_grow = false;              ///< the elastic K/V (--kv-grow, STRATA_KV_GROW=1; kvg_ensure)
+    double min_stream_tps = 0.0;       ///< P2-D1 DecodeGovernor SLA floor (tok/s per active stream; 0 = throughput mode)
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the 794 MB GEMV does not.
@@ -1325,6 +1327,7 @@ void usage() {
                  "                       window (STRATA_BATCH_MTP=1 does the same); works on one GPU and on a layer split (the\n"
                  "                       slot drafters sit on the last stage's GPU; not with --batch-groups); needs VRAM per slot\n"
                  "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
+                 "  --min-stream-tps F   --batch decode-width governor: minimum tok/s per active stream (0 = throughput mode)\n"
                  "  --pipeline-windows N --serve with a layer split on two GPUs (on by default for 2+ stages on AMD gfx12;\n"
                  "                       STRATA_PIPELINE_AUTO=0 or N=0 turns it off): one conversation's verify windows\n"
                  "                       with the GPUs overlapped - 1 = the prompt's short reads, 2 = decode as well\n"
@@ -4074,6 +4077,7 @@ int main(int argc, char** argv) {
             if (std::strcmp(bgv, "auto") == 0) o.batch_groups_auto = true;
             else o.batch_groups = std::atoi(bgv);
         }
+        else if (a == "--min-stream-tps") o.min_stream_tps = std::atof(next("--min-stream-tps"));
         else if (a == "--batch-mtp") o.batch_mtp = true;
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
@@ -17057,6 +17061,13 @@ int main(int argc, char** argv) {
                                              batch_telemetry_env[0] == '1' && batch_telemetry_env[1] == '\0';
         strata::core::BatchWindowSampler batch_telemetry(batch_telemetry_enabled);
         strata::program::ParCounters pc;   // STRATA_PAR_COUNTERS=1: counters only (par_counters.hpp); off: a branch
+        const Clock::time_point gov_t0 = Clock::now();
+        strata::program::DecodeGovernor decode_gov(strata::program::parse_decode_governor_config(o.min_stream_tps));
+        if (decode_gov.enabled())
+            std::fprintf(stderr, "strata serve: decode governor: on (min_stream_tps=%.1f hit_floor=%.1f%% "
+                                 "init_n=%d quantum=%.0f ms)\n",
+                         decode_gov.config().min_stream_tps, decode_gov.config().hit_floor_pct,
+                         decode_gov.config().initial_width, decode_gov.config().cohort_quantum_ms);
         auto pc_ex = [&]() {
             strata::program::ParCounters::Ex e;
             e.misses = drive.d.multi_misses; e.entries = drive.d.multi_entries; e.hits = drive.d.cache_hits;
@@ -17528,6 +17539,17 @@ int main(int argc, char** argv) {
             int A = 0;
             // (--batch-mtp: two rows a slot, at most kVerifyNarrowT; the plain windows hold up to kVerifyMaxT)
             const int win_cap = batch_mtp ? (int) strata::kernels::kVerifyNarrowT : (int) strata::kernels::kVerifyMaxT;
+            const int gov_slot_cap = (batch_mtp && !batch_df2) ? std::max(1, win_cap / 2) : win_cap;
+            std::vector<int> gov_cohort;
+            if (decode_gov.enabled()) {
+                std::vector<int> runnable_slots;
+                runnable_slots.reserve(bs.size());
+                for (size_t b = 0; b < bs.size(); ++b) {
+                    if (bs[b].active) runnable_slots.push_back((int) b);
+                }
+                const double gov_now_ms = std::chrono::duration<double, std::milli>(Clock::now() - gov_t0).count();
+                gov_cohort = decode_gov.select_cohort(runnable_slots, gov_slot_cap, gov_now_ms);
+            }
             int nrow[strata::kernels::kVerifyMaxT] = {};   // the rows slot a (the a-th active) holds: its token and its drafts
             // DFlash2 slots: the rows beyond one a slot are SPARE; they carry the slots' drafts, shared evenly in slot order (so the layout of a window
             // depends on which slots are active, not on the drafts: the captured batch graphs are reused).  More slots than rows: no drafts, the slots
@@ -17535,8 +17557,14 @@ int main(int argc, char** argv) {
             int df2_extra[64] = {};
             if (batch_df2) {
                 int act_ids[64] = {}, nact = 0;
-                for (size_t b = 0; b < bs.size() && nact < (int) (sizeof act_ids / sizeof act_ids[0]); ++b)
-                    if (bs[b].active) act_ids[nact++] = (int) b;
+                if (decode_gov.enabled()) {
+                    for (int b : gov_cohort) {
+                        if (nact < (int) (sizeof act_ids / sizeof act_ids[0])) act_ids[nact++] = b;
+                    }
+                } else {
+                    for (size_t b = 0; b < bs.size() && nact < (int) (sizeof act_ids / sizeof act_ids[0]); ++b)
+                        if (bs[b].active) act_ids[nact++] = (int) b;
+                }
                 const int spare = std::max(0, win_cap - nact);
                 for (int k = 0; k < nact && nact > 0; ++k) {
                     const BSlot& q = bs[(size_t) act_ids[k]];
@@ -17580,8 +17608,9 @@ int main(int argc, char** argv) {
                 }
 #endif
             }
-            for (size_t offset = 0; offset < bs.size(); ++offset) {
-                const int b = (int) ((next_slot + offset) % bs.size());
+            const size_t loop_n = decode_gov.enabled() ? gov_cohort.size() : bs.size();
+            for (size_t offset = 0; offset < loop_n; ++offset) {
+                const int b = decode_gov.enabled() ? gov_cohort[offset] : (int) ((next_slot + offset) % bs.size());
                 if (!bs[(size_t) b].active) continue;
                 const int extra = batch_df2 ? (b < (int) (sizeof df2_extra / sizeof df2_extra[0]) ? df2_extra[b] : 0) : batch_mtp ? 1 : 0;
                 if (S + 1 + extra > win_cap) break;
@@ -17604,7 +17633,7 @@ int main(int argc, char** argv) {
                     ++S;
                 }
             }
-            if (batch_mtp && A > 0) next_slot = ((size_t) active[A - 1] + 1) % bs.size();
+            if (!decode_gov.enabled() && batch_mtp && A > 0) next_slot = ((size_t) active[A - 1] + 1) % bs.size();
             if (S == 0) return true;
             const bool was_busy = strata::core::progress().busy.load();
             strata::core::progress().busy.store(true);
@@ -17654,9 +17683,12 @@ int main(int argc, char** argv) {
                 const int64_t from = std::max<int64_t>(ps.reply0, (int64_t) ps.ids.size() - ps.pen_n);
                 ver.set_slot_history(rows[t], ps.ids.data() + from, (int64_t) ps.ids.size() - from);
             }
+            const uint64_t gov_hits0 = drive.d.cache_hits;
+            const uint64_t gov_off0 = drive.d.offload_entries;
+            const uint64_t gov_cpu0 = drive.d.multi_entries;
             const Clock::time_point w0 = Clock::now();
             if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
-                std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
+                std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : (err.empty() ? "a batch window failed without a reason" : err.c_str()));
                 return false;
             }
             const Clock::time_point w1 = Clock::now();
@@ -17698,7 +17730,9 @@ int main(int argc, char** argv) {
             bt_run += msd(w0, w1);
             bt_commit += msd(w1, w2);
             ++bt_windows;
+            int gov_win_tokens = 0;
             for (int a = 0; a < A; ++a) {
+                gov_win_tokens += keep[active[a]];
                 bt_rows += keep[active[a]];
                 bt_accepted += keep[active[a]] - 1;
                 if (batch_mtp) {   // #5890: the slot's own counters, for its BDONE (the response's draft_n / draft_n_accepted)
@@ -17887,6 +17921,20 @@ int main(int argc, char** argv) {
                 bt_adapt_wait += msd(wa, Clock::now());
             }
             strata::core::progress().busy.store(was_busy);
+            if (decode_gov.enabled()) {
+                const uint64_t d_hits = drive.d.cache_hits - gov_hits0;
+                const uint64_t d_off = drive.d.offload_entries - gov_off0;
+                const uint64_t d_cpu = drive.d.multi_entries - gov_cpu0;
+                const uint64_t d_tot = d_hits + d_off + d_cpu;
+                const double win_hit_pct = d_tot > 0 ? 100.0 * (double) d_hits / (double) d_tot : 100.0;
+                const double win_ms = msd(w0, Clock::now());
+                const int prev_n = decode_gov.target_width();
+                if (decode_gov.observe_window(win_ms, gov_win_tokens, A, win_hit_pct, gov_slot_cap)) {
+                    std::fprintf(stderr, "strata serve: decode governor: N %d -> %d "
+                                         "(hit=%.1f%% window=%.1fms A=%d tok=%d)\n",
+                                 prev_n, decode_gov.target_width(), win_hit_pct, win_ms, A, gov_win_tokens);
+                }
+            }
             report_batch_window(S, A, !batch_on(), w0);
             pc.window(S, A);
             if (!batch_on() && bt_windows > 0) {

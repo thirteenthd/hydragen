@@ -455,6 +455,10 @@ try:
 except ValueError:
     ADMIT_SHORT_FIRST = 0
 ADMIT_MAX_WAIT_S = _timeout_env("STRATA_ADMIT_MAX_WAIT_S", 30.0) or 0.0
+try:
+    YIELD_AFTER_S = max(0.0, float(os.environ.get("STRATA_YIELD_AFTER_S") or 0))
+except ValueError:
+    YIELD_AFTER_S = 0.0
 
 
 VISION_READY_S = _timeout_env("STRATA_VISION_READY_S", 300.0)
@@ -997,6 +1001,10 @@ class StrataEngine:
         # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
         # the slot that has its start (the engine checks it again); when the slot was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
+        # #656b: the prompts recently admitted, newest last: a conversation's cached prefix outlives its slot (the
+        # engine's conversation cache re-serves it), but slot_held is overwritten the moment a new admission lands.
+        # _unread consults both, so a continuation's estimate survives a cold request taking its slot.
+        self._recent_reads: collections.deque = collections.deque(maxlen=2 * self.batch)
         # Inkling-2-Mini: the prompt of the request a slot ran last (valid while slot_held[b] is not empty).  Its engine resumes the
         # next turn at the end of that prompt (the prompt-end checkpoint), not only from the whole held stream: the reply it
         # decoded (hidden thinking, a call's own spacing) is never sent back token for token (#6733)
@@ -1757,6 +1765,7 @@ class StrataEngine:
 
     BGEN_REFUSALS_MAX = 6    # #1994: how often one request tries another slot after the engine refused a BGEN
     SLOT_PARK_S = 2.0        # ... and how long a refused slot stays out of the picks
+    SLOT_MEM_BACKOFF_S = 30.0  # ... and how long a deferred slot refused for RAM/VRAM limit backs off
 
     def _park_slot(self, slot: int) -> None:
         """#1994: the engine refused a BGEN for `slot`.  Keep it busy here for SLOT_PARK_S (no request owns it), then
@@ -1929,14 +1938,17 @@ class StrataEngine:
 
     def _admit_next(self):
         """STRATA_ADMIT_SHORT_FIRST=<tokens> (the caller holds slot_cv): the new request that takes the control lines
-        next - one whose prompt is at most that long (it reads little) before a longer one, in arrival order within
-        each; a longer one that has waited STRATA_ADMIT_MAX_WAIT_S counts as short (it is never held back for good).
-        Off (unset or 0): whoever gets the lock first, as before.  Only the order changes, never what is read."""
+        next - one whose UNREAD tokens (see _unread: prompt length minus the longest prefix a slot already holds) are
+        at most that long (it reads little) before a longer one, in arrival order within each; a longer one that has
+        waited STRATA_ADMIT_MAX_WAIT_S counts as short (it is never held back for good).  Off (unset or 0): whoever
+        gets the lock first, as before.  Only the order changes, never what is read.  #656b: a 100k continuation
+        with 99.5k already in a slot reads ~500 tokens, and is short by this measure (it was "long" by raw length,
+        which starved continuations behind cold full reads).  STRATA_YIELD_UNREAD=0 restores the raw-length rule."""
         now = time.monotonic()
         ordered = [e for e in self.wait_lens if len(e) > 2 and e[2]]
         if not ordered:
             return None
-        return min(ordered, key=lambda e: (0 if e[0] <= ADMIT_SHORT_FIRST or now - e[1] >= ADMIT_MAX_WAIT_S else 1,
+        return min(ordered, key=lambda e: (0 if self._unread(e) <= ADMIT_SHORT_FIRST or now - e[1] >= ADMIT_MAX_WAIT_S else 1,
                                            e[1]))
 
     SOLO_AGAIN_MAX = 2      # how often a request left alone in a slot goes back to the solo path
@@ -2015,10 +2027,52 @@ class StrataEngine:
                                                     self.slot_used[b]))
             return 0
 
+    @staticmethod
+    def _prefix_agree(h, p) -> int:
+        """the number of leading tokens h and p share (binary slice compare: streams reach 100k tokens, as pick_slot
+        already does for slot choice)."""
+        lo, hi = 0, min(len(h), len(p))
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if h[:mid] == p[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    UNREAD_ON = staticmethod(lambda: os.environ.get("STRATA_YIELD_UNREAD", "1") != "0")
+
+    def _unread(self, e) -> int:
+        """#656b: how many tokens a waiting entry must still READ: its prompt length minus the longest prefix any
+        slot already holds (a continuation is a turn's tokens, not its whole context).  Entries carry the prompt
+        token list (e[3]); without it (or the prompt not a token list) the estimate falls back to the raw length,
+        which is the pre-#656b rule, so the estimate can only ever make a request look shorter than before by
+        as much as a real prefix match."""
+        p = e[3] if len(e) > 3 else None
+        if not (isinstance(p, list) and p) or not self.UNREAD_ON():
+            return e[0]
+        best = 0
+        for src in (self.slot_held[:self.batch] + list(self._recent_reads)):
+            h = src
+            if h:
+                a = self._prefix_agree(h, p)
+                if a > best:
+                    best = a
+                    if best == len(p):
+                        break
+        return max(e[0] - best, 0)
+
     def _shorter_waiting(self, plen: int) -> bool:
-        """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to."""
+        """#656: someone waits for the control lines whose UNREAD tokens (not raw prompt length - #656b) are under
+        half this one's: worth giving way to."""
         with self.slot_cv:
-            return any(e[0] * 2 <= plen for e in self.wait_lens)
+            # #656c: STRATA_YIELD_AFTER_S=<seconds> (0: off): a waiter that has simply waited long enough
+            # yields it too, whatever its length - the engine takes a BYIELD at its next piece boundary and
+            # the part read stays in the slot (the resumption reuses it), so two comparable cold reads
+            # interleave instead of serializing; YIELDS_MAX still caps one request's yields.
+            now = time.monotonic()
+            return any(self._unread(e) * 2 <= plen or
+                       (YIELD_AFTER_S > 0 and now - e[1] >= YIELD_AFTER_S) for e in self.wait_lens)
 
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
@@ -2065,7 +2119,7 @@ class StrataEngine:
         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
         yielded_legs = []    # prompt reads that gave way before producing output
         ok = yield from self._take_control(cancel, len(prompt), new=True,
-                                           prompt=prompt if (COALESCE_PREFILL > 1 and not embeddings) else None)
+                                           prompt=prompt if not embeddings else None)
         if not ok:
             self._release_preslot(cancel)
             return
@@ -2086,7 +2140,7 @@ class StrataEngine:
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
-                    ok = yield from self._take_control(cancel, len(prompt))
+                    ok = yield from self._take_control(cancel, len(prompt), prompt=prompt if not embeddings else None)
                     if not ok:
                         return
                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
@@ -2120,6 +2174,7 @@ class StrataEngine:
                     if started is not None:
                         started()
                     phase = "solo"
+                    self._recent_reads.append(prompt)
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
                     self._ctl_erred = False
                     def others():
@@ -2221,7 +2276,7 @@ class StrataEngine:
                             if cancel.is_set():
                                 return
                             if not holding:
-                                ok = yield from self._take_control(cancel, len(prompt))
+                                ok = yield from self._take_control(cancel, len(prompt), prompt=prompt if not embeddings else None)
                                 if not ok:
                                     return
                                 holding, born = True, self.gen
@@ -2264,6 +2319,7 @@ class StrataEngine:
                     if started is not None:
                         started()
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
+                    self._recent_reads.append(prompt)
                     self.slot_prompt[slot] = list(prompt)   # (Inkling: valid once the BDONE sets slot_held again)
                     adm_from = len(out)                     # (the admission's own token comes after these)
                     admission_pending, admission_before = True, self.last
@@ -2300,9 +2356,25 @@ class StrataEngine:
                         # for a moment (busy here too), and wait for another one - never a 400 for the conversation.
                         if not (self._ctl_erred and str(e).startswith("BGEN:") and left >= 1 and not cancel.is_set()):
                             raise
-                        refused += 1
-                        print(f"[strata] parallel: the engine refused slot {slot} ({e}); trying another slot "
-                              f"({refused}/{self.BGEN_REFUSALS_MAX}) (issue #1994)", flush=True)
+                        mem_refused = "session unavailable" in str(e)
+                        if mem_refused:
+                            with self.slot_cv:
+                                self.slot_claims.discard(slot)
+                                self.slot_busy[slot] = False
+                                if hasattr(self, "slot_t_free"):
+                                    self.slot_t_free[slot] = time.time()
+                                self.__dict__.setdefault("_mem_backoff", {})[slot] = time.monotonic() + self.SLOT_MEM_BACKOFF_S
+                                others_busy = any(self.slot_busy)
+                                self.slot_cv.notify_all()
+                            if not others_busy:
+                                refused += 1
+                            print(f"[strata] parallel: slot {slot} refused for memory limit ({e}); backing off "
+                                  f"{self.SLOT_MEM_BACKOFF_S:.0f}s (refusals={refused}/{self.BGEN_REFUSALS_MAX})",
+                                  flush=True)
+                        else:
+                            refused += 1
+                            print(f"[strata] parallel: the engine refused slot {slot} ({e}); trying another slot "
+                                  f"({refused}/{self.BGEN_REFUSALS_MAX}) (issue #1994)", flush=True)
                         if refused > self.BGEN_REFUSALS_MAX:
                             raise GpuBusy("the engine's batch slots are not free right now; try again in a moment",
                                       retry_after=5) from e
@@ -2310,7 +2382,8 @@ class StrataEngine:
                         self.slot_held[slot] = []
                         phase = "none"
                         self._ctl_erred = False
-                        self._park_slot(slot)
+                        if not mem_refused:
+                            self._park_slot(slot)
                         slot = None
                         continue
                     cont = bool(self._ctl_result and self._ctl_result[1])
@@ -2572,7 +2645,13 @@ class StrataEngine:
                 sp = self.slot_prompt[b]
                 if self.slot_busy[b] and sp and len(prompt) > len(sp) and prompt[:len(sp)] == sp:
                     return None
-        free = [b for b in self.slot_order if not self.slot_busy[b]]
+        now = time.monotonic()
+        backoff = self.__dict__.get("_mem_backoff") or {}
+        free = [b for b in self.slot_order if not self.slot_busy[b] and backoff.get(b, 0.0) <= now]
+        if not free:
+            if any(self.slot_busy):
+                return None
+            free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
         gs = getattr(self, "slot_gs", 0)
@@ -3756,6 +3835,7 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
         if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args:
             args += ["--vram-segment-mib", str(seg)]
     args += parallel_args(cfg, args)
+    args += decode_governor_args(cfg, args)
     args += pool_cores_args(cfg, args)
     # Older engines and the SYCL engine can use the prompt cache but do not understand this checkpoint policy.
     if "--prompt-cache-spread" in args and binary and engine_has_text(binary, b"--prompt-cache-spread") is False:
@@ -3764,6 +3844,16 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
             print("[strata] This engine does not support spreading prompt cache checkpoints, so it uses its usual checkpoint policy.", flush=True)
     args = conversation_cache_min_tokens_args(args, exe or cfg.get("exe"))
     return draft_costs_args(cfg, learned_profile_args(cfg, args), exe or cfg.get("exe"))
+
+
+def decode_governor_args(cfg: dict, args: list[str]) -> list[str]:
+    """P2-D1 DecodeGovernor SLA floor: forward --min-stream-tps from config when not already in args."""
+    if "--min-stream-tps" in args:
+        return []
+    val = cfg.get("min_stream_tps")
+    if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
+        return ["--min-stream-tps", str(val)]
+    return []
 
 
 CONVERSATION_CACHE_MIN_TOKENS_DEFAULT = 1024
@@ -4004,6 +4094,21 @@ def hip_auto_devices(cfg: dict, env: dict) -> list[int] | None:
 # src/core/arch_defaults.cpp, generate.cpp, metal window.cpp.  Nothing here sets them.)
 
 
+def configure_decode_governor_env(env: dict, cfg: dict) -> None:
+    """Forward opt-in P2-D1 DecodeGovernor settings into the child env without overriding explicit env keys."""
+    decode_auto = cfg.get("decode_auto")
+    if decode_auto is True:
+        env.setdefault("HG_DECODE_AUTO", "1")
+    elif decode_auto is False:
+        env.setdefault("HG_DECODE_AUTO", "0")
+    hit_floor = cfg.get("hit_floor_pct")
+    if isinstance(hit_floor, (int, float)) and not isinstance(hit_floor, bool) and hit_floor > 0:
+        env.setdefault("HG_HIT_FLOOR_PCT", str(hit_floor))
+    quantum = cfg.get("cohort_quantum_ms")
+    if isinstance(quantum, (int, float)) and not isinstance(quantum, bool) and quantum >= 0:
+        env.setdefault("HG_COHORT_QUANTUM_MS", str(quantum))
+
+
 def child_env(cfg: dict, *, offline: bool = False) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -4026,6 +4131,7 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ordered_gpus(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
         env[str(k)] = str(v)
+    configure_decode_governor_env(env, cfg)
     # #6497: honor an explicit CPU thread cap (`--pool-workers N` or `threads`) in OpenMP/BLAS runtimes too unless
     # the user already set OMP_NUM_THREADS explicitly.
     pw = _configured_pool_workers(cfg)
@@ -9155,7 +9261,8 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
             event_sink = None
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
+    ap.add_argument("--engine", choices=["mock", "strata", "hydragen"], default="mock",
+                    help="strata = the vendored C++ engine; hydragen = the same engine under the product name")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
@@ -9237,6 +9344,8 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                          "{\"prefill_gpu\": 0, \"decode_gpu\": 1}; docs/SPLIT_SERVE.md)")
     launch_args = list(sys.argv[1:] if argv is None else argv)
     a = ap.parse_args(launch_args)
+    if a.engine == "hydragen":
+        a.engine = "strata"   # the product name selects the same vendored C++ engine
     if a.engine == "strata" and (_rt := rttime_limit_note()):   # #3238: say it before the first unexplained -9
         print("[strata] WARNING: " + _rt, flush=True)
     global OPENS_BROWSER
