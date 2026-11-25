@@ -178,10 +178,13 @@ def main(argv: list[str]) -> int:
 
     stage = Path(tempfile.mkdtemp(prefix="strata-engine-stage-"))
     try:
-        for name in ("strata.exe", "strata_kq.dll"):
+        engine_exes = [n for n in ("hydragen.exe", "strata.exe") if (build / n).is_file()]
+        if not engine_exes:
+            fail("the build made no engine exe (hydragen.exe or strata.exe)")
+        for name in engine_exes + ["strata_kq.dll"]:
             if (build / name).is_file():
                 shutil.copy2(build / name, stage / name)
-            elif name in targets or name == "strata.exe":
+            elif name in targets:
                 fail("the build made no %s" % name)
         (stage / "BUILD.json").write_text(json.dumps({"version": version, "source": "packaging/build_cuda_windows.py", "commit": commit[:12],
                                                       "archs": list(archs), "ptx": True, "cuda": cu, "vision": "gpu-cuda" + cu.split(".")[0],

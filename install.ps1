@@ -19,10 +19,10 @@
 #   CUDA toolkit:  https://developer.nvidia.com/cuda-downloads
 #   MSVC:          winget install Microsoft.VisualStudio.2022.BuildTools --override `
 #                    "--wait --quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
-#   cmake + ninja come from pip (engine/requirements-build.txt); nothing else to install.
+#   cmake + ninja come from pip (terminal/requirements-build.txt); nothing else to install.
 #
 #   Run it from a clone of THIS repo (the serve layer, configs, expert-routing
-#   profile and SETUP.bat all live here; the prebuilt zip only carries the engine
+#   profile and setup scripts all live here; the prebuilt zip only carries the engine
 #   binary and its CUDA DLLs):
 #     git clone https://github.com/thirteenthd/hydragen && cd hydragen
 #   .\install.ps1                                  # prebuilt if available, else source (sm_86)
@@ -159,7 +159,7 @@ if ($PY -eq "py") { $pyv = "py"; $pya = @("-3") } else { $pyv = "python"; $pya =
 if (-not (Test-Path ".venv\Scripts\python.exe")) { & $pyv @pya -m venv .venv }
 & .venv\Scripts\python.exe -m pip -q install -U pip
 Write-Host "Python: installing runtime and build packages into .venv ..."
-& .venv\Scripts\python.exe -m pip -q install -r engine/requirements.txt -r engine/requirements-build.txt
+& .venv\Scripts\python.exe -m pip -q install -r terminal/requirements.txt -r terminal/requirements-build.txt
 if ($LASTEXITCODE -ne 0) { Write-Error "install.ps1: pip install failed" }
 
 # ------------------------------------------------------------------ engine build (fallback path)
@@ -200,7 +200,7 @@ $blobTargets = @{
   "--pack" = "$mdFwd/packs/$ModelTag";
   "--native" = "$ggufDir/Qwen3.8-Flash-Next-GSQ-RCO-$Model-00001-of-00002.gguf";
   "--ple-gguf" = "$ggufDir/Qwen3.8-Flash-Next-GSQ-RCO-$Model-00002-of-00002.gguf";
-  "--expert-profile" = ((Join-Path $PWD "engine\data\expert-profile.bin") -replace '\\','/');
+  "--expert-profile" = ((Join-Path $PWD "terminal\data\expert-profile.bin") -replace '\\','/');
   "--mtp" = "$mdFwd/mtp/rt"
 }
 # per-artifact learned-profile loop (mirrors install.sh): --expert-profile-save persists the
@@ -233,7 +233,7 @@ if (-not (Test-Path hydragen-local.json)) {
   if ($cfg.args -notcontains "--prompt-cache-tail") { $cfg.args += "--prompt-cache-tail" }
   ($cfg | ConvertTo-Json -Depth 6) | Set-Content hydragen-local.json
   Write-Host "created hydragen-local.json (canonical cow stack wired, model tier: $Model) - model paths point under $ModelDir (overrides: .\install.ps1 -ModelDir D:\models -Model IQ3_XXS|IQ3_S)."
-  Write-Host "  the expert-routing profile is already in this repo (engine\data\expert-profile.bin); the GGUFs/pack/MTP come next."
+  Write-Host "  the expert-routing profile is already in this repo (terminal\data\expert-profile.bin); the GGUFs/pack/MTP come next."
 } else {
   Write-Host "hydragen-local.json already exists; leaving it alone."
 }
@@ -241,15 +241,15 @@ if (-not (Test-Path hydragen-local.json)) {
 Write-Host ""
 Write-Host "Install complete. Next:"
 Write-Host "  1. model blobs (~76 GB IQ3_XXS / ~84 GB IQ3_S set), sources and layout: docs\MODELS.md. Easiest:"
-Write-Host "       cmd /c engine\SETUP.bat --model $Model --data-dir `"$ModelDir`""
+Write-Host "       .venv\Scripts\python.exe terminal\setup.py --model $Model --data-dir `"$ModelDir`""
 Write-Host "     (Strata's own downloader: resumable, SHA-256-checked; builds the pack and fetches MTP)."
 Write-Host "     Or: uvx hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF --include `"$Model/*`" --local-dir DIR"
-Write-Host "         then engine\SETUP.bat --gguf-dir DIR"
+Write-Host "         then .venv\Scripts\python.exe terminal\setup.py --gguf-dir DIR"
 if (-not (Test-Path (Join-Path $ModelDir "packs\$ModelTag\tokenizer\vocab.json"))) {
   Write-Host "     NOTE: the model pack (and with it the tokenizer serve checks for) does not exist yet" -ForegroundColor Yellow
   Write-Host "           under $ModelDir\packs\$ModelTag - serve will refuse to start until step 1 runs." -ForegroundColor Yellow
 }
-Write-Host "  2. .venv\Scripts\python.exe engine\serve\server.py --engine hydragen --config hydragen-local.json --port 8181"
+Write-Host "  2. .venv\Scripts\python.exe terminal\serve\server.py --engine hydragen --config hydragen-local.json --port 8181"
 Write-Host "  3. dashboard + Monitor: http://127.0.0.1:8181/"
 Write-Host "  4. the canonical stack is pre-wired: STRATA_PARK_COW=1, park-disk v2 tier (park-disk\),"
 Write-Host "     STRATA_RESUME_DEEPEST=1, --prompt-cache-tail (tier budget: STRATA_PARK_DISK_MIB, default 64 GiB -"

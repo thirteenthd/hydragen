@@ -1,7 +1,7 @@
 """Service wrapper for HydraGen on Windows.
 
 Applies a GPU core V/F curve offset (undervolt via nvapi64.dll), power limit,
-and clock clamp via nvidia-smi before starting ``engine/serve/server.py``, and
+and clock clamp via nvidia-smi before starting ``terminal/serve/server.py``, and
 restores stock settings on exit.
 """
 
@@ -156,7 +156,7 @@ def main() -> int:
 
     if not server_args:
         server_args = [
-            "engine/serve/server.py",
+            "terminal/serve/server.py",
             "--engine",
             "hydragen",
             "--config",

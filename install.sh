@@ -11,7 +11,7 @@
 #
 # Source-build path needs: an NVIDIA driver, a CUDA toolkit (nvcc), a C++
 # toolchain, Python 3.10+. CUDA toolkit: https://developer.nvidia.com/cuda-downloads
-# cmake + ninja come from pip (engine/requirements-build.txt); nothing else to install.
+# cmake + ninja come from pip (terminal/requirements-build.txt); nothing else to install.
 #
 #   ./install.sh                       # prebuilt if available, else source (sm_86)
 #   ./install.sh --build-from-source   # never run a downloaded binary; compile locally
@@ -27,8 +27,8 @@ RELEASE_TAG="prebuilt-1"
 # Model blob location: --model-dir DIR (default: <this repo>/models). The generated
 # config's --pack/--native/--ple-gguf/--mtp paths are rewritten to live under DIR.
 # The expert-routing profile needs no download - it ships in this repo at
-# engine/data/expert-profile.bin. See docs/MODELS.md for sources and the
-# vendored Strata downloader (engine/setup.sh / engine/SETUP.bat).
+# terminal/data/expert-profile.bin. See docs/MODELS.md for sources and the
+# vendored Strata downloader (setup.sh / terminal/setup.py).
 MODEL_DIR=""
 MODEL="IQ3_XXS"
 BUILD_FROM_SOURCE=0
@@ -138,10 +138,10 @@ fi
 [ -x .venv/bin/python ] || "$PY" -m venv .venv
 .venv/bin/python -m pip -q install -U pip
 echo "Python: installing runtime and build packages into .venv ..."
-.venv/bin/python -m pip -q install -r engine/requirements.txt -r engine/requirements-build.txt
+.venv/bin/python -m pip -q install -r terminal/requirements.txt -r terminal/requirements-build.txt
 
 # ------------------------------------------------------------------ engine build (fallback path)
-# Upstream's cuda-compile preset flags (the release flags of packaging/build_cuda_linux.sh);
+# Upstream's cuda-compile preset flags (the release flags of tools/packaging/build_cuda_linux.sh);
 # the default arch is sm_86 because that is the card HydraGen was developed and measured on.
 if [ -z "$BIN" ]; then
 echo "Building the HydraGen engine from source (CUDA arch: $ARCH) ..."
@@ -180,7 +180,7 @@ targets = {
     "--pack": os.path.join(md, "packs", mdl.lower()),
     "--native": os.path.join(gguf, f"Qwen3.8-Flash-Next-GSQ-RCO-{mdl}-00001-of-00002.gguf"),
     "--ple-gguf": os.path.join(gguf, f"Qwen3.8-Flash-Next-GSQ-RCO-{mdl}-00002-of-00002.gguf"),
-    "--expert-profile": os.path.join(repo, "engine", "data", "expert-profile.bin"),
+    "--expert-profile": os.path.join(repo, "terminal", "data", "expert-profile.bin"),
     "--mtp": os.path.join(md, "mtp", "rt"),
 }
 # per-artifact learned-profile loop: the adaptive tier re-ranks experts from live traffic
@@ -231,14 +231,14 @@ Next steps
      model dir printed above. Easiest is the vendored Strata setup - it downloads the
      pinned GGUFs (resumable, SHA-256-checked), builds the expert pack and fetches the
      MTP draft into that dir:
-         bash engine/setup.sh --model $MODEL --data-dir <model-dir>
+         bash setup.sh --model $MODEL --data-dir <model-dir>
      Or fetch them yourself and let setup reuse them:
          uvx hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF --include "$MODEL/*" --local-dir DIR
-         bash engine/setup.sh --gguf-dir DIR
+         bash setup.sh --gguf-dir DIR
      Source table and licenses: docs/MODELS.md. The expert-routing profile is already
-     in this repo (engine/data/expert-profile.bin) - nothing to download for it.
+     in this repo (terminal/data/expert-profile.bin) - nothing to download for it.
   2. Serve:
-       .venv/bin/python engine/serve/server.py --engine hydragen --config hydragen-local.json
+       .venv/bin/python terminal/serve/server.py --engine hydragen --config hydragen-local.json
      Dashboard + Monitor (concurrency panel): http://127.0.0.1:8181/
      LAN serving: set "host": "0.0.0.0" and "api_key" in the config (the key gates the
      API; the dashboard page itself is open, so keep it on a trusted network).
