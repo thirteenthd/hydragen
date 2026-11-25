@@ -2676,3 +2676,104 @@ control even while decoding 2× faster); the empty ParkDisk v2 chunk store on th
 arms; the 12 GiB envelope is now bound by expert cache rather than KV, with
 `vram_free` down to ~650 MiB at load; and the §235 tail-slot pin fix, still unwritten,
 still hard-gating Phase 4. counter 192.
+
+## §240 — Phase 2 closes: fan-out siblings reuse the shared header, the park-disk tier gets the cache's own evictions, and the CoW reserve stays unpriced (ms01 + Windows, 2026-11-25)
+
+Three tracks on `phase2/v0.0.1`, branched from `main` (`448a3b2`) in four commits
+(`a8848c7` 2B → `eb3b184` 2A → `d26b03b` 2C → `e42087b` 2A fix), measured on
+`modelserver01` (RTX 3080 Ti 12 GiB, Arm 16, `CUDA_MODULE_LOADING=LAZY`) against the
+`448a3b2` Arm 16 baseline at `--batch 4` and `--batch 8`.
+
+**Track 2B — `a8848c7`: the park-disk tier gets the cache's own evictions.**
+`ConversationCache::drop_oldest()`, the path `make_room()` takes inside `put()`, checked
+only `sink_` and bypassed `spill_hook`, so a RAM-cache eviction never reached the ParkDisk
+v2 store: the arms booted with `v2 dedup tier active (store 0 chunks, 0.0 GiB)` and stayed
+there. One line routes it through `evict_slot(i, 0)` whenever a hook is wired, which keeps
+the `bytes_` / `entries_` / `evictions_` accounting in the one place that already had it and
+brings the donor cascade for free; `sink_` stays the path only when no disk tier is wired.
+The second half of the bug was upstream's auto-enable: a `--pack` under
+`<data>/packs/` turned on the non-dedup `ConversationSpill` even with `STRATA_PARK_DISK`
+set, so evictions landed in `conversation-spill/` instead. That auto-enable is now gated on
+`park_owns_ssd` (`STRATA_PARK_DISK` set and no explicit `--conversation-spill-dir`), and the
+engine names the owner at boot. Runtime is the mirror image: upstream
+`conversation cache: spilled` **10 → 0**, `park disk: spilled` **0 → 9–10**,
+`park disk: restored` **0 → 5–8**, chunk files on disk **0 → 10,820–15,330 (3.9–5.0 GiB)**.
+Sample pair: `park disk: spilled 12410 tokens, 2.0 MiB in 1283 ms (2 entries, 0.8 GiB)` →
+`park disk: restored 12410 tokens, 2.0 MiB read in 371 ms`. `conversation_cache_test`
+grew 9 checks (13,924 → 13,933) covering hook-vs-sink precedence, donor-first cascade, and
+the sink-only regression.
+
+**Track 2A — `eb3b184` + `e42087b`: a fan-out's shared header gets a checkpoint of its own.**
+A hybrid GDN+QSA stream can only resume from a saved `ConvCheckpoint` at
+`L <= common_prefix`. At `--prefill auto:16384` an 11,791-token shared header prefills in
+one chunk and stores only `turn_at = 11,784`, which sits *past* the 11,751-token divergence,
+so siblings `S1..S3` of an agent fan-out reused `0` tokens and re-read the whole header.
+`engine/include/strata/program/fanout_prefix.hpp` adds the decision layer — `fanout_lcp()`
+over non-owning peers (`live`, the request's own `checks`, sibling `bs[]` slots, the parked
+conversation cache, all matched on `cvec` and free of pictures) and
+`fanout_prefix_cut()`, which asks whether that shared length deserves a cut of its own.
+`HG_FANOUT_PREFIX_CKPT` gates it (default ON when `prompt_cache >= 2`),
+`HG_FANOUT_PREFIX_MIN` (default `2048`) is the smallest gain worth a checkpoint. The cut is
+appended to the existing `cuts` list and rides the existing `checkpoint_at()` path, so solo
+and unrelated traffic pays nothing.
+
+Measured at `--batch 4`, `HG_COW_RESERVE_MODE=0`, sizing identical on both arms
+(`expert_slots 3711`, `expert_cache_mib 6212`, `vram_free_mib 661`):
+
+| fan-out | share wall | share agg | agg decode | `cached_tokens` |
+|---|---|---|---|---|
+| off (`p2f-2aoff-b4`) | 46.06 s | 52.11 tok/s | 125.9 | `[11784, 0, 0, 0]` |
+| on (`p2f-m0-b4`) | **37.67 s** | **63.71** | **144.0** | `[11784, 11751, 0, 11751]` |
+
+−18 % wall, +22 % aggregate, and aggregate decode **144.0 tok/s = 2.26× the 63.6 tok/s a
+single stream gets on the same card**. `--batch 8` repeats it: 46.55 s → 39.87 s,
+51.56 → 60.20 agg, 124.2 → 135.3 decode. Solo and divergent traffic are unmoved within
+noise (solo prefill 2548.1 → 2557.2 tok/s, solo decode 62.3 → 63.6, 4-up divergent
+48.29 → 47.89). The engine says it once per fan-out: `strata serve: fan-out prefix: 11751
+of 11789 tokens shared with another stream: the header is checkpointed there for the
+siblings after it`.
+
+Two corrections landed with the track. Sibling slots are **peers for length, never for
+coverage**: the first pass fed every sibling's own checkpoint lengths into the
+"already covered" list, which suppressed the cut in exactly this shape (seed checkpoint
+11,784 > divergence 11,751) and is why the line never appeared before the fixup. And the
+near-checkpoint guard is asymmetric — a checkpoint *deeper* than the shared prefix belongs
+to another branch and can never be resumed from by this prompt, so only a checkpoint at or
+before `lcp` makes the cut redundant. `e42087b` then makes `cuts` sort unconditional: the
+read loop walks the list and skips anything at or behind where it already is, so with
+`pin_at < 0` an unsorted list would read the deeper `fanout_at` first and never write
+`turn_at`. `fanout_prefix_test` 26 → 29 checks.
+
+**Track 2C — `d26b03b`: the deferred-slot reserve is priced where the cache is sized, and the
+default is the unpriced one.**
+`cow_reserve` was counted into the uniform slot math but not into `post_cache_extra_b`,
+which is what the sized-slot loop and the post-write shrink actually use.
+`HG_COW_RESERVE_MODE` (1 full / 0 off / 2 half) made that priceable, and the A/B on the
+12 GiB card picked the unpriced side as the shipped default (`value_or(0)`). Pricing it does
+clear every attach refusal — `session unavailable` 10 → 0 — and opens wider batch windows
+(3.98 rows against 2.0), but it buys that with expert capacity: `expert_slots` 3,711 → 2,981
+at `--batch 4` (−8 % solo prefill, −10 % solo decode) and 3,711 → 1,990 at `--batch 8`
+(−26 % solo prefill, −22 % solo decode, `bench_quick` N=8 falling to 6.8 tok/s per stream
+against 12.6 uncounted). The refusals it removes are admission control, not failures: every
+request completes either way. The mode-0 line holds `3,711` slots / `6,212 MiB` cache /
+`661 MiB` free and sustains `2.0` rows at `86.9–89.1 %` routed-expert VRAM hit, which beats
+mode 1's `3.98` rows at `79.8 %` hit on every throughput measure. Booting the branch tip
+with no `HG_*` keys at all reproduces that line (`expert_slots 3711`,
+`expert_cache_mib 6212`, `vram_free_mib 661`), so the default is proven at runtime rather
+than by inspection. What the concurrency ceiling actually is — achieved rows, not
+configured `--batch` — is now a Phase 3 question about routed-expert VRAM hit, not about
+slot count.
+
+**Gates.** Windows CPU `ctest -E 'dot_x4_bench'`: **100 % tests passed out of 47**
+(34.10 s), `fanout_prefix_test: 29 checks passed`, `conversation_cache_test: 13933 checks
+passed`. Windows CUDA: `hydragen.exe --version` → `hydragen v0.0.1`. ms01 Arm 16 + `LAZY`:
+`NINJA-EXIT=0`, **G3 10/10**, **G5 `probe222x` 4/4 four-up and 4/4 serial on all six final
+legs**, `OOM=0` everywhere. The `dot_x4_bench`, `flag_order_test.cu` and
+`gemm_w16_parity.cu` MSVC targets are pre-existing upstream portability failures
+(`type_info` ambiguity, `__atomic_load_n`, `setenv`) and are outside these tracks.
+
+Open for Phase 3: one fan-out sibling still reports `cached_tokens 0` in most runs
+(`[11784, 11751, 0, 11751]` at `--batch 4`, `[11784, 0, 11751, 11751]` at `--batch 8`) — two
+of three siblings reuse, the third's cause is not established; the routed-expert VRAM hit%
+as the binding concurrency limit; and the §235 tail-slot pin fix, still unwritten, still
+hard-gating Phase 4. counter 193.
