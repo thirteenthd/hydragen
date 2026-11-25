@@ -90,6 +90,7 @@
 #include "strata/core/geometry.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 
 namespace strata::kernels {
 
@@ -105,6 +106,14 @@ struct QsaShapes {
     int64_t idx_block = 0;  ///< r = 4: the indexer pools one key per 4 cells
     int64_t idx_top_k = 0;  ///< 2048 cells of selection budget
     int64_t page_size = 0;  ///< KV page granule in CELLS; 1 is a legal unpaged configuration
+    // S7-3: pooled indexer keys stored FP16 (uint16 holding IEEE half, the house
+    // f16_bits form) instead of FP32.  One value, process-wide, read once from
+    // STRATA_IDX_POOL_F16 in qsa_real_shapes(): it decides the ALLOCATION size in
+    // layer.cpp, the kernel variants in qsa.cu/qsa_select.cu, and the snapshot/park
+    // format flag (+32) in conversation_snapshot.cpp.  A pool taken in one format
+    // never restores into a state of the other - the same rejection law as the
+    // rotated-INT8 +16 flag.
+    int64_t idx_pool_f16 = 0;
 };
 
 /// The real artifact's geometry, so no caller transcribes it by hand.
@@ -117,6 +126,18 @@ inline QsaShapes qsa_real_shapes() {
     // one page = one indexer block (4 cells): the granule KV streaming keeps resident (kv_stream.hpp). The readers
     // resolve a row per cell anyway, so the page size costs them nothing (measured: identical output and speed).
     s.page_size = 4;
+    // S7-3: the pool storage format, once per process.  Read from the environment exactly where the geometry
+    // itself is decided, so every caller of qsa_real_shapes() - allocation, kernels, snapshots, hashes - sees
+    // the same value with no plumbing.  Unset keeps today's FP32 bytes bit for bit.
+    static const int64_t pool_f16 = [] {
+#if defined(__HIPCC__) || defined(STRATA_USE_HIP) || defined(STRATA_GPU_METAL)
+        return (int64_t) 0;   // the f16 pool kernels live in the CUDA tree: every other build stays FP32
+#else
+        const char* v = std::getenv("STRATA_IDX_POOL_F16");
+        return v != nullptr && v[0] == '1' && v[1] == '\0' ? (int64_t) 1 : (int64_t) 0;
+#endif
+    }();
+    s.idx_pool_f16 = pool_f16;
     return s;
 }
 
@@ -175,6 +196,11 @@ inline uint64_t qsa_step_bytes() { return sizeof(int32_t) * (uint64_t) kStepCoun
 /// arithmetic here rather than at the call site is the point of the buffer: `n_kv` and `width` are derived,
 /// and a caller computing them by hand is a caller who can compute them differently.
 void qsa_step_fill(int32_t* host_step, int64_t pos, const QsaShapes& s);
+
+/// S7-3: FP32 values -> FP16 pool storage, the same `pool_put` round the append kernel uses.  A checkpoint or
+/// park restore writes the saved `dead` row into the pooled row the next token fills; in the f16 format that
+/// row must arrive rounded, not as the FP32 bytes.  Queued on `stream` like the copy it replaces.
+void qsa_pool_round_copy(void* dst, const float* src, int64_t count, void* stream);
 
 
 /// One token's K and V into the paged FP16 cache, at logical cell `pos`.

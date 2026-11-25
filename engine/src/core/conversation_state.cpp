@@ -455,7 +455,12 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
             !copy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, error)) return false;
         if (!c.ids.empty()) {
             const size_t row = c.ids.size() / strata::kernels::qsa_real_shapes().idx_block;
-            if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error)) return false;
+            if (strata::kernels::qsa_real_shapes().idx_pool_f16) {
+                cudaStream_t ps = nullptr;
+                if (conversation_detail::private_stream(ps) != cudaSuccess) return fail(error, "no private copy stream");
+                strata::kernels::qsa_pool_round_copy((uint16_t*) st.idx_pooled + row * g.idx_key_dim,
+                                                    st.idx_dead, (int64_t) g.idx_key_dim, ps);
+            } else if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error)) return false;
         }
     }
     const size_t tokens = c.ids.size();
@@ -486,7 +491,12 @@ bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, co
             !acopy(b.idx_block_pos, a.idx_block_pos, zf.block_pos)) return false;
         if (!ids.empty()) {   // restore writes the saved `dead` row into the pooled row the next token fills
             const size_t row = ids.size() / strata::kernels::qsa_real_shapes().idx_block;
-            if (!acopy(b.idx_pooled + row * g.idx_key_dim, a.idx_dead, zf.dead)) return false;
+            if (strata::kernels::qsa_real_shapes().idx_pool_f16) {
+                cudaStream_t ps = nullptr;
+                if (conversation_detail::private_stream(ps) != cudaSuccess) return fail(error, "no private copy stream");
+                strata::kernels::qsa_pool_round_copy((uint16_t*) b.idx_pooled + row * g.idx_key_dim,
+                                                    a.idx_dead, (int64_t) g.idx_key_dim, ps);
+            } else if (!acopy(b.idx_pooled + row * g.idx_key_dim, a.idx_dead, zf.dead)) return false;
         }
     }
     const size_t tokens = ids.size();

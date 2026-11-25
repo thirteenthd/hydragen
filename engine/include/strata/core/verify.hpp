@@ -285,6 +285,11 @@ public:
     // after the verdict, replays from there.  Everything else the commit reads is per slot already.
     /// The saved buffers for `rows` hand-off rows (after init_slots).
     bool init_deferred_commit(int rows, std::string& err);
+
+    /// KV-GROW (window recycling): drop every captured batch-window graph - the slot-session pools baked into
+    /// them have changed (freed at detach, re-carved at admission). They re-capture on demand (capture_batch);
+    /// callers hold the device quiet (park_slot's device sync / a not-yet-running admission).
+    void drop_batch_graphs();
     bool deferred_commit_on() const { return dc_rows_ > 0; }
     /// The window over the slots `rows` (a slot's rows contiguous) at hand-off rows [hbase, hbase + S), its save right
     /// behind it, and no commit (batch_commit_rows, after the verdict).  The PLE history advances at the commit.

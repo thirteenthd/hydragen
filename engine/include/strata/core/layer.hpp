@@ -228,6 +228,10 @@ struct QsaState {
     /// back: always for Q4_0, for INT8 by qsa_set_kv_int8_rotate (spreads outlier channels over the scale groups)
     bool kv_rot = false;
     int32_t* page_table = nullptr;   ///< (n_pages,) logical page -> physical page (-1: not resident, streamed)
+    /// cow-m1: element offsets of this state's slot range inside the layer K/V arena (0: private pool).
+    int64_t cow_codes = 0;   ///< (codes arrays: k_q, v_q) element offset = slot_base * n_head_kv * page_size * head_dim
+    int64_t cow_scale = 0;   ///< (scale arrays: k_scale, v_scale) element offset = slot_base * n_head_kv * page_size * (head_dim/64)
+    int16_t cow_ordinal = -1; ///< (S8-v2) the layer whose arena owns this state's slot range; -1: private pool / no range claimed
     int64_t n_pages = 0;
     int64_t max_cells = 0;
 
@@ -285,6 +289,71 @@ struct QsaState {
 /// QSA layer. `with_rope = false` sizes a state that borrows it; `share_rope` points `st` at another state's table
 /// instead of building a copy (the session builds it once, in the first QSA layer).
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0);
+/// cow-m1: the streamed INT8 states' VRAM slots live in one global arena per QSA ordinal (the K/V
+/// slot arenas; 0: off). qsa_cow_session_begin() claims the next session's slot range (call once per
+/// session before its qsa_state_init loop). Pages named by a page table are arena-global.
+void qsa_set_cow_arena(int64_t slots_per_layer);
+void qsa_cow_session_begin();
+/// cow-m1: streamed states after the first (the batch-slot sessions) get this smaller VRAM window; the
+/// first session keeps the full one and holds the shared prefix the forks point at. 0: off.
+void qsa_set_cow_slot_cells(int64_t cells);
+/// (dyn-conc P2) elastic arena windows: grow/shrink the CoW arenas' physical slots at runtime,
+/// quiesced like the elastic K/V (--kv-grow).  need() reports the chunks a grow to `slots` wants;
+/// grow takes chunk providers (0 = fresh), shrink hands released chunks to `give`.  shrink refuses
+/// while a live or zombie range reaches past the target.  Capacity is in window slots/layer.
+int64_t qsa_cow_arena_need(int64_t slots);
+bool qsa_cow_arena_grow(int64_t slots, const std::function<strata::core::VmmChunk()>& take);
+int64_t qsa_cow_arena_shrink(int64_t slots, const std::function<void(strata::core::VmmChunk)>& give);
+int64_t qsa_cow_arena_mapped();
+/// (dyn-conc P2 stage B) the demand side of the elastic window.  demand() reports the window slots the NEXT
+/// session's range would need (the per-ordinal bump high-water plus its own window; cells 0 = the configured
+/// STRATA_COW_SLOT_CELLS window) - what the boot --batch carve compares against the mapped floor.  trim()
+/// drops the mapped window to the highest range still owned (never below the boot floor) and parks the chunks
+/// it releases for the next grow, returning how many it freed; bank() counts the parked chunks.  The policy is
+/// off unless qsa_set_cow_arena_elastic(true, ...) (STRATA_COW_ARENA_ELASTIC=1): grow at admission, trim on detach.
+int64_t qsa_cow_arena_demand(int64_t cells);
+int64_t qsa_cow_arena_trim();
+int64_t qsa_cow_arena_bank();
+// (dyn-conc P2 stage B) the sessions the boot left unattached, and what their admission will take back.  The
+// expert cache is sized once and never re-sized, so the memory a deferred session has to `cudaMalloc` for
+// itself (its private buffers plus the arena window it maps) is priced into the cache's reserve here; unpriced,
+// the cache spends it and the admission that follows has nowhere to grow.
+void qsa_set_cow_arena_min_free_mib(int64_t mib);
+int64_t qsa_cow_arena_min_free_mib();
+// (dyn-conc P2 stage B) the deferred sessions' claim, as a budget rather than a subtraction.  The cache
+// sizing gives up cow_reserve bytes once; the admission that arrives later SPENDS them - its session
+// buffers and its arena window - and until it does, those bytes must not be read as "the line is crossed".
+// Without this the same GiB is charged twice: the private allocation passes (it fits), the window that
+// follows it is refused, and the session dies with 750 MiB free that was reserved for exactly this.
+void qsa_cow_arena_set_budget(int64_t bytes);
+int64_t qsa_cow_arena_budget_left();
+bool qsa_cow_arena_draw(int64_t bytes);          // claim what the reservation covers; false if it does not
+void qsa_cow_arena_give_back(int64_t bytes);     // a detached session's claim is available to the next one   // (dyn-conc P2 stage B) the growth line: STRATA_COW_ARENA_MIN_FREE_MIB
+void qsa_set_cow_arena_trim_debug(bool on);         // STRATA_COW_ARENA_TRIM_DEBUG: say why a trim gave up
+int64_t qsa_cow_arena_trim_calls();                 // how many detaches asked for one
+void qsa_cow_arena_note_deferred(int64_t demand_observed);
+int64_t qsa_cow_arena_deferred();
+int64_t qsa_cow_arena_deferred_bytes();
+bool qsa_cow_arena_elastic();
+void qsa_set_cow_arena_elastic(bool on, int64_t bank_mib);
+void qsa_cow_arena_bank_give(strata::core::VmmChunk h);   // the funder's parking route (honours the bank cap)
+strata::core::VmmChunk qsa_cow_arena_bank_take();         // the reverse leg: the cache takes a parked chunk back
+int64_t qsa_cow_arena_grow_fails();                       // grow attempts the driver could not satisfy
+void qsa_set_cow_join_hh(int64_t v);   // cow-m1d: STRATA_COW_JOIN_HH join headroom per range; 0 disables joins
+/// cow-m1: point `to`'s page table at `from`'s resident pages for the prefix [0, upto): shared pages
+/// name from's arena slots (refcounts bumped); from's cold pages stay cold and stream into to's range.
+/// Returns the number of shared pages, -1 on failure. Requires both states on the same layer arena.
+// §224: `ids` is the conversation being copied; the lineage is keyed by its fingerprint. A null ids
+// falls back to the from-state's lineage (legacy callers with no conversation identity in hand).
+int64_t qsa_cow_fork(const QsaState& from, QsaState& to, int64_t upto, std::string& error,
+                     const std::vector<int32_t>* ids = nullptr);
+/// cow-m1: decrement the refcounts of the foreign pages `to`'s table names, before its map is reset.
+void qsa_cow_release(QsaState& st);
+/// (S8-v2) session teardown hook: drops the state's fork refs AND hands its claimed arena range back
+/// to the bump cursor when nothing else pins it.  Ranges a sibling still pins stay owned (a counted gap).
+void qsa_cow_state_release(QsaState& st);
+/// cow-m1d: telemetry: joins-at-fetch this arena has served.
+uint64_t qsa_cow_joins(int64_t qsa_ordinal);
 /// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
 /// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully
@@ -332,7 +401,8 @@ inline int qsa_kv_format(const QsaState& st) {
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
 }
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
+                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0,
+                        int64_t qsa_ordinal = -1);
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,
