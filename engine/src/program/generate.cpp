@@ -22223,10 +22223,12 @@ int main(int argc, char** argv) {
                                  (long long) fanout_at, (long long) n);
             }
             std::vector<int64_t> cuts = {reread_to, root_at, message_at, fanout_at, turn_at, n - 1};
-            if (pin_at >= 0) {
-                cuts.push_back(pin_at);
-                std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
-            }
+            if (pin_at >= 0) cuts.push_back(pin_at);
+            // sorted always, not only when a pin is in play: the read loop walks `cuts` and skips anything at or behind
+            // where it already is, so an unsorted list loses the earlier cut.  The fan-out cut is the first one that can
+            // sit past another (a header shared to 11,751 with the turn boundary at 11,784 puts turn_at behind it), and
+            // without the sort that is the turn checkpoint that never gets written.  The skipped -1s first, n - 1 last.
+            std::sort(cuts.begin(), cuts.end());
             int64_t at = read_from;
             // STRATA_ADMIT_MERGE_FIRST: the last part, when it goes through the windows, leaves its last tokens (up to
             // max_t with the last prompt token) to the first window, which starts at merge_at (-1: the first window

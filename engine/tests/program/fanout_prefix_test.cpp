@@ -91,6 +91,16 @@ int main() {
     CHECK(fanout_prefix_cut(ids, 0, 0, 0, near_tol, {n - 1}, {}) == -1);
     CHECK(fanout_prefix_cut(ids, 1, 0, 0, near_tol, {n - 1}, {}) == 1);
 
+    // ---- the ordering contract the caller has to honour ---------------------------------
+    // The cut is a length, not a position in the read list, and it may land on either side of another boundary.
+    // The read loop walks `cuts` in order and skips anything at or behind where it already is, so the caller must
+    // sort the list it appends this to: unsorted, the deeper cut runs first and the earlier boundary is never read.
+    const int64_t turn_at = head - 500;
+    CHECK(fanout_prefix_cut(ids, head, 0, min_len, near_tol, {turn_at, n - 1}, {}) == head);   // past the turn cut
+    CHECK(fanout_prefix_cut(ids, head, 0, min_len, near_tol, {head + 33, n - 1}, {}) == head); // before a deeper one
+    // ... and it stays strictly below the prompt's end, so the sorted list still ends at n - 1
+    CHECK(fanout_prefix_cut(ids, n - 2, 0, min_len, near_tol, {n - 1}, {}) == n - 2);
+
     if (fails == 0) std::printf("fanout_prefix_test: %d checks passed\n", checks);
     return fails != 0;
 }
