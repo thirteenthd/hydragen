@@ -2367,3 +2367,59 @@ restarted; Windows prod unaffected). Opening the shared path requires the tail-s
 pin fix first (extend the `slot_use`/live-entry accounting over the shared tail, or
 gate the sweep on live-entry count); then re-run the 2048 arm before any region
 policy is set. counter 188.
+
+## §236 — P2-D1 arms: batch-8 lives on 12 GB, the governor and the admit floor both hold their laws (ms01, 2026-11-24)
+
+Arms (ms01 3080 Ti, :8181, harness `~/hydragen-experimental/p2d1_arms.sh`,
+evidence `bench_A0..A3.json` + `logs/p2d1/`): A0 = build-s180 baseline
+(batch-4 mechcfg), A1 = p2d1 `a417b8d` identical args, A2 = p2d1 `--batch 8`,
+A3 = A2 + `--min-stream-tps 30`, A4 = p2d1 batch-4 +
+`--conversation-cache-min-free-mib 20000`.
+
+Parity (A0 vs A1): throughput identical to noise — N=1 **65.1 = 65.1**,
+N=2 59.0/59.6, N=4 63.3/61.7. Battery: 5/8 QC lines byte-identical; QC0/2/7
+diverge only at greedy fork points ("as we grow"→"as we go"). Cross-binary
+parity is near-identical, not token-identical; the same-binary token-identity
+law (§177) is untouched — no kernel or numeric path changed, the divergences
+are float-order forks amplified at decision tokens.
+
+N=8 on the batch-4 config fails on **both** binaries (A0: 400 tok/6 errors,
+A1: 400 tok/7 errors): the §235 churn/adopt corruption, unchanged by P2-D1 —
+as scoped, `COW_SHARED` stays 0.
+
+A2 — the payload: **`--batch 8` boots and runs on the 12 GB card.** 8-row
+boot fits with GPU 11,111 MiB vs 11,883 at batch-4 — the shared RoPE tables
+(session_init `share_rope`) bought back ~0.77 GiB; elastic arenas grew to the
+`main + 8 slot windows` window (34,816 slots/layer) with a 4,096-slot mapped
+floor, the rest of the VRAM left for the expert cache. N=8: **8/8 conversations
+complete (2,400 tok)**, 50.5 agg tok/s, 8.6 per-stream; two first attempts hit
+`ERR BGEN: slot session unavailable (memory limit)` (the new admit gate) and
+the server's slot-retry recovered both when turns reclaimed. Cost, honestly:
+N=1 drops 65.1→56.2 (−14%) and hit rate 88–91%→78–82% at N=8 — the row tables
+squeeze the expert cache. Batch-8 on 12 GB is reachable and graceful, at a
+per-stream tax.
+
+A3 — governor law: `decode governor: on (min_stream_tps=30.0 hit_floor=86.0%
+init_n=4 quantum=2000ms)`; it shrinks with evidence (N 4→3→2→1 at hit 71/63/64%)
+and grows back only into warm cache (hit 90–96%). With the floor at 30 — above
+this host's width-2 per-stream ceiling (~23) — it collapses to width 1–2 and
+N=8 aggregate falls 50.5→39.9 (per-stream 6.1 with queue wait; all 2,800 tok
+still delivered, 1 error). **Law: `min_stream_tps` above the box's per-stream
+ceiling forces width→1; the governor is correct, the knob was mis-set.** Tuning
+arm (floor ~15–20) queued for the next battery.
+
+A4 — floor law: the host-RAM admit floor is a **hard policy valve, not a
+self-healing one**. Floor 20,000 MiB: N=1 posts the run's best 66.2 (GPU
+10,523 MiB), then at load, headroom < floor ⇒ *sustained* refusal (28 refuses;
+N=4 loses all slots, retries exhaust, requests error). Server and engine
+survive throughout — refusal is graceful but useless when mis-set. A2/A3's
+transient refusals+recovery remain the well-behaved regime.
+
+Harness notes (not engine): the first run's `make_cfg` died on a python
+scoping bug (`a +=` inside `setv` ⇒ UnboundLocalError) so A2–A4 re-ran clean;
+`bench_quick` then crashed on `statistics.mean([])` when A4 N=4 had zero
+successes — guard it next battery.
+
+Stance: p2d1 builds stay on ms01 for arms; **ms01 mechdbg remains build-s180**
+until the governor-tuning battery and the §235 pin fix land; Windows :8080
+swap still open. counter 189.
