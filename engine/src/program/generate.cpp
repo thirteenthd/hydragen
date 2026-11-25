@@ -3731,7 +3731,7 @@ int main(int argc, char** argv) {
     // `strata --version` / `-V` (also `strata generate --version`): the version and nothing else, before any GPU is touched
     for (int i = 1; i < argc && i < 3; ++i) {
         if (std::strcmp(argv[i], "--version") == 0 || std::strcmp(argv[i], "-V") == 0) {
-            std::printf("strata %s\n", STRATA_VERSION);
+            std::printf("hydragen v%s\n", STRATA_VERSION);
             return 0;
         }
         // `strata --families`: the GGUF architectures this build runs (setup asks before it installs one)
