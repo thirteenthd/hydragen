@@ -29,8 +29,9 @@ import sys
 import zipfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent          # engine/
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT.parent / "terminal"))        # setup.py, strata_control and the tools are the Terminal's
 import setup as S  # noqa: E402
 from strata_control import mac_fit as _fit  # noqa: E402
 from strata_control.mac_fit import (  # noqa: E402,F401  (re-exported: the tests and callers use these names here)
@@ -156,7 +157,7 @@ def build_engine(llama: Path, jobs: int | None = None) -> Path:
 def engine_args(pack: Path, shards: list, rt: Path, ctx: int, stream: bool = False, ram_gb: float = 0.0,
                 model: str = "") -> list[str]:
     """The Metal defaults (strata_control/mac_fit.py), with this checkout's expert profile."""
-    return _fit.engine_args(pack, shards, rt, ctx, stream, ram_gb, ROOT / "data" / "expert-profile.bin", model)
+    return _fit.engine_args(pack, shards, rt, ctx, stream, ram_gb, ROOT.parent / "terminal" / "data" / "expert-profile.bin", model)
 
 
 # the image encoder's projector (setup.py's pinned revision): name -> (bytes, SHA-256)
@@ -181,8 +182,8 @@ def build_vision(llama: Path) -> Path:
     env = dict(os.environ, PATH=str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""))
     log = ROOT / "build-vision.log"
     with open(log, "w", encoding="utf-8") as f:
-        for cmd in ([tool("cmake"), "-S", str(ROOT / "tools" / "vision"), "-B", str(ROOT / "build-vision"), "-G", "Ninja",
-                     "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_MAKE_PROGRAM={tool('ninja')}", f"-DLLAMA_DIR={S.vision_llama(llama)}",
+        for cmd in ([tool("cmake"), "-S", str(ROOT.parent / "terminal" / "tools" / "vision"), "-B", str(ROOT / "build-vision"), "-G", "Ninja",
+                     "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_MAKE_PROGRAM={tool('ninja')}",
                      "-DSTRATA_VISION_CUDA=OFF", "-DSTRATA_VISION_METAL=ON", "-DSTRATA_PORTABLE=OFF"],
                     [tool("ninja"), "-C", str(ROOT / "build-vision"), "strata-vision"]):
             if subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT, env=env) != 0:
@@ -320,7 +321,7 @@ def start(cfg_path: Path, port: int | None, open_browser: bool = True) -> int:
     cfg_path.touch()
     if "--mtp" in cfg["args"][:-1]:
         S.refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
-    cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
+    cmd = [sys.executable, str(ROOT.parent / "terminal" / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
            "--port", str(port or cfg.get("port", 8080))]
     if open_browser and cfg.get("open_browser") is not False:
         cmd.append("--open")
@@ -559,7 +560,7 @@ def main(argv=None) -> int:
     else:
         shards = files
     if not (pack / "native_experts.txt").exists() or not (pack / "tokenizer" / "vocab.json").exists():
-        S.run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
+        S.run([sys.executable, str(ROOT.parent / "terminal" / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
                *fam.get("pack_args", [])], env=env)   # Unsloth: --compat-bf16 (the host's copies; the GPU reads the file)
     S.ok(f"model prepared: {pack}")
     prep_lock.unlink(missing_ok=True)
@@ -578,9 +579,9 @@ def main(argv=None) -> int:
     if use_mtp and not (mtp / "mtp-q2_0.gguf").exists():
         S.say("  The MTP draft layer (speculative decoding) comes from the original Qwen checkpoint: only its ~5 GB of")
         S.say("  MTP tensors are downloaded.")
-        S.run([sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "fetch", "--out", str(mtp)],
+        S.run([sys.executable, str(ROOT.parent / "terminal" / "tools" / "mtp_fetch.py"), "fetch", "--out", str(mtp)],
               env={**env, "STRATA_SOURCE": S.model_source()})
-        S.run([sys.executable, str(ROOT / "tools" / "mtp_pack.py"), "--src", str(mtp), "--experts", "q2_0",
+        S.run([sys.executable, str(ROOT.parent / "terminal" / "tools" / "mtp_pack.py"), "--src", str(mtp), "--experts", "q2_0",
                "--out", str(mtp / "mtp-q2_0.gguf")], env=env)
     if use_mtp:
         rt.mkdir(parents=True, exist_ok=True)          # the Metal engine reads mtp-q2_0.gguf beside it (no rt pack)

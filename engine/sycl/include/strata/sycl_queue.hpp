@@ -7,6 +7,7 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include <cstdlib>
+#include "strata/core/device_lost.hpp"
 
 namespace strata {
 inline sycl::queue* q_of(const void* stream) {
@@ -121,8 +122,38 @@ namespace strata {
 // intel_gpu_driver() has no sysfs to read): the architecture enum when the runtime knows it, else the marketing name
 // ("Intel(R) Arc(TM) Pro B70", "... A750 ..."). Battlemage = Arc B-series / Pro B-series (B570 B580 B50 B60 B65 B70).
 enum class IntelGpuGen { Unknown, Alchemist, Battlemage };
+// Is this GPU an Xe3 (Panther Lake, built into the processor)?  It has the Battlemage cards' matrix (DPAS) units,
+// 16- and 32-lane sub-groups and 256-register threads.  By the architecture id: compute runtime 26.35 names an Arc Pro
+// B390 "Intel(R) Graphics [0xb086]", which the name rule below does not take for Battlemage, and reports it as
+// intel_gpu_ptl_h.  Other Xe3 parts (Wildcat Lake) and the Xe2 GPUs built into Lunar Lake are not matched.
+inline bool intel_gpu_xe3(const sycl::device& d) {
+    if (!d.is_gpu()) return false;
+    try {
+        namespace exp = sycl::ext::oneapi::experimental;
+        const auto a = d.get_info<exp::info::device::architecture>();
+        return a == exp::architecture::intel_gpu_ptl_h || a == exp::architecture::intel_gpu_ptl_u;
+    } catch (...) {
+    }
+    return false;
+}
+// What STRATA_INTEL_GEN asks for (battlemage | alchemist | unknown), or -1 when it is unset: a way to measure a GPU on
+// another generation's kernels, and to take one back off them.
+inline int intel_gpu_gen_override() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_INTEL_GEN");
+        if (e == nullptr || e[0] == '\0') return -1;
+        const std::string s(e);
+        if (s == "battlemage") return (int) IntelGpuGen::Battlemage;
+        if (s == "alchemist") return (int) IntelGpuGen::Alchemist;
+        if (s == "unknown") return (int) IntelGpuGen::Unknown;
+        std::fprintf(stderr, "strata: STRATA_INTEL_GEN=%s is not battlemage, alchemist or unknown; ignored\n", e);
+        return -1;
+    }();
+    return v;
+}
 inline IntelGpuGen intel_gpu_gen(const sycl::device& d) {
     if (!d.is_gpu()) return IntelGpuGen::Unknown;
+    if (const int o = intel_gpu_gen_override(); o >= 0) return (IntelGpuGen) o;
     try {
         {
             namespace exp = sycl::ext::oneapi::experimental;
@@ -135,6 +166,9 @@ inline IntelGpuGen intel_gpu_gen(const sycl::device& d) {
         }
     } catch (...) {
     }
+    // #6448: an Xe3 GPU runs the Battlemage kernels and gets their defaults.  STRATA_INTEL_GEN=unknown takes it back
+    // off them.
+    if (intel_gpu_xe3(d)) return IntelGpuGen::Battlemage;
     std::string n;
     try { n = d.get_info<sycl::info::device::name>(); } catch (...) { return IntelGpuGen::Unknown; }
     if (n.find("Intel") == std::string::npos) return IntelGpuGen::Unknown;
@@ -264,8 +298,33 @@ inline size_t device_offset_end(const void* p, size_t bytes) {
 // sycl::malloc_device for a big allocation, checked for aliased pages (arena_alias_check) and, when it has some, allocated
 // again behind a growing spacer that moves it.  Small allocations and STRATA_ARENA_ALIAS_CHECK=0 go straight to
 // sycl::malloc_device.  The memory comes back uninitialised, as from sycl::malloc_device.
+// #5557 / #5578: the largest single device allocation this GPU allows (max_mem_alloc_size: 3.77 GiB on an 8 GB A750, ~4 GiB on
+// a 16 GB A770 under NEO, 1 GiB under WSL2 GPU-PV); 0 when it cannot be read.  A test build (STRATA_SYCL_TEST_HOOKS) takes
+// STRATA_TEST_MAX_ALLOC_MIB instead, and malloc_device_guarded then refuses anything larger, as such a driver does.
+inline uint64_t device_max_alloc(sycl::queue& q) {
+#if defined(STRATA_SYCL_TEST_HOOKS)
+    if (const char* t = std::getenv("STRATA_TEST_MAX_ALLOC_MIB")) return (uint64_t) std::strtoull(t, nullptr, 10) << 20;
+#endif
+    try {
+        return (uint64_t) q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    } catch (...) {
+        return 0;
+    }
+}
+
 inline void* malloc_device_guarded(size_t bytes, sycl::queue& q, const char* what = "device buffer") {
-    void* p = sycl::malloc_device(bytes, q);
+    const uint64_t max_alloc = device_max_alloc(q);
+    void* p = nullptr;
+#if defined(STRATA_SYCL_TEST_HOOKS)
+    if (!(std::getenv("STRATA_TEST_MAX_ALLOC_MIB") && max_alloc && (uint64_t) bytes > max_alloc))
+#endif
+        p = sycl::malloc_device(bytes, q);
+    if (p == nullptr && max_alloc && (uint64_t) bytes > max_alloc)
+        // #5557: sycl::malloc_device answers null, not an error, for one allocation above the GPU's limit: say so here, for
+        // every caller (the weight arena, the expert cache, the K/V), instead of a silent null or "failed: no error"
+        std::fprintf(stderr, "strata: the %s needs one %.2f GiB GPU allocation, and this GPU allows at most %.2f GiB in one "
+                             "allocation (max_mem_alloc_size)\n",
+                     what, (double) bytes / 1073741824.0, (double) max_alloc / 1073741824.0);
     if (p == nullptr || bytes < ((size_t) 32 << 20) || !arena_alias_guard_enabled()) {
         device_alloc_register(p, bytes);
         return p;

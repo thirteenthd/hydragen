@@ -5,8 +5,11 @@
 #include "conversation_trace.hpp"
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +17,8 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <thread>
+#include <vector>
 
 namespace strata::core {
 namespace {
@@ -56,16 +61,12 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
     // snapshot or prompt checkpoint taken with the rotation never restores into one without it, nor the reverse.
     // (Q4_0 is always rotated: nothing to tell apart; without the rotation the format is the one it always was.)
     const int rotated = st.kv_rot && !st.kv_q4 && !st.kv_hybrid ? 16 : 0;
-    // S7-3 (+32): the pooled indexer keys as IEEE halfs (STRATA_IDX_POOL_F16) - the bytes of one format mean
-    // nothing to a state of the other, exactly the rotated-INT8 rule: a snapshot or park taken in one format
-    // never restores into a state of the other; every restore site below compares this int whole.
-    const int pool_f16 = s.idx_pool_f16 ? 32 : 0;
-    l = {(st.kv_hybrid ? 3 : qsa_kv_format(st)) + rotated + pool_f16, cells, pooled, s.page_size, 0, 0, 0, 0, 0};
+    l = {(st.kv_hybrid ? 3 : qsa_kv_format(st)) + rotated, cells, pooled, s.page_size, 0, 0, 0, 0, 0};
     using conversation_detail::product;
     if (!product(l.data, {(uint64_t) cells, (uint64_t) g.n_head_kv, per}) ||
         !product(l.scales, {(uint64_t) cells, (uint64_t) g.n_head_kv,
                            int8_keys && !st.kv_q4 ? (uint64_t) (g.head_dim / 64) * 2 : 0}) ||
-        !product(l.pooled, {(uint64_t) pooled, (uint64_t) g.idx_key_dim, sizeof(float) / (s.idx_pool_f16 ? 2 : 1)})) {
+        !product(l.pooled, {(uint64_t) pooled, (uint64_t) g.idx_key_dim, sizeof(float)})) {
         error = "conversation snapshot: K/V byte count overflow";
         return false;
     }
@@ -90,10 +91,8 @@ std::array<void*, 5> pools(const QsaState& st, bool resident = false) {
     if (st.kv_q4)
         return {host ? st.host.k_q4 : st.k_q4, host ? st.host.v_q4 : st.v_q4, nullptr, nullptr, st.idx_pooled};
     if (st.kv_int8)
-        // cow-m1: an arena state's device pools are the layer arenas; this state's slots are its range inside them.
-        return {host ? st.host.k_q : st.k_q + st.cow_codes, host ? st.host.v_q : st.v_q + st.cow_codes,
-                host ? st.host.k_scale : st.k_scale + st.cow_scale,
-                host ? st.host.v_scale : st.v_scale + st.cow_scale, st.idx_pooled};
+        return {host ? st.host.k_q : st.k_q, host ? st.host.v_q : st.v_q,
+                host ? st.host.k_scale : st.k_scale, host ? st.host.v_scale : st.v_scale, st.idx_pooled};
     return {host ? st.host.k_pool : st.k_pool, host ? st.host.v_pool : st.v_pool, nullptr, nullptr, st.idx_pooled};
 }
 
@@ -271,6 +270,126 @@ bool transfer(void* dst, const void* src, size_t n, std::string& error) {
     error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
     return false;
 }
+
+// STRATA_PARK_HOST_MEMCPY=1 (opt-in, default OFF): for kv_mode != 0 (streamed/draft-ring K/V whose parts 0..3 live
+// in pinned host memory st.host.*), use resize_for_overwrite() and multi-threaded host std::memcpy instead of
+// zero-filling resize() plus per-segment synchronous CUDA/WDDM copy calls.
+bool park_host_memcpy_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PARK_HOST_MEMCPY");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+
+int park_copy_threads() {
+    static const int n = [] {
+        const char* v = std::getenv("STRATA_PARK_COPY_THREADS");
+        const int parsed = v != nullptr ? std::atoi(v) : 8;
+        return std::max(1, std::min(16, parsed > 0 ? parsed : 8));
+    }();
+    return n;
+}
+
+struct HostCopySpan {
+    uint8_t* dst;
+    const uint8_t* src;
+    size_t n;
+};
+
+// Persistent worker pool for parallel host-to-host K/V copies (leaked intentionally on process exit so Windows CRT
+// teardown never deadlocks on parked threads; 0% CPU while idle).
+class HostCopyPool {
+public:
+    explicit HostCopyPool(int total_threads) : n_workers_(std::max(0, total_threads - 1)) {
+        workers_.reserve((size_t) n_workers_);
+        for (int i = 0; i < n_workers_; ++i) {
+            workers_.emplace_back([this] {
+                conversation_detail::background_thread_placement();
+                uint64_t seen = 0;
+                for (;;) {
+                    const std::vector<HostCopySpan>* tasks = nullptr;
+                    {
+                        std::unique_lock<std::mutex> lk(mu_);
+                        cv_start_.wait(lk, [&] { return gen_ != seen; });
+                        seen = gen_;
+                        tasks = cur_tasks_;
+                    }
+                    if (tasks != nullptr) drain(*tasks);
+                    if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                        std::lock_guard<std::mutex> lk(mu_);
+                        cv_done_.notify_one();
+                    }
+                }
+            });
+        }
+    }
+
+    void run(const std::vector<HostCopySpan>& tasks) {
+        if (tasks.empty()) return;
+        if (n_workers_ <= 0 || tasks.size() <= 1) {
+            for (const auto& t : tasks) {
+                std::memcpy(t.dst, t.src, t.n);
+                core::progress_beat();
+            }
+            return;
+        }
+        std::lock_guard<std::mutex> run_lk(run_mu_);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            cur_tasks_ = &tasks;
+            next_idx_.store(0, std::memory_order_relaxed);
+            remaining_.store(n_workers_, std::memory_order_release);
+            ++gen_;
+        }
+        cv_start_.notify_all();
+        drain(tasks);
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_done_.wait(lk, [&] { return remaining_.load(std::memory_order_acquire) == 0; });
+        cur_tasks_ = nullptr;
+    }
+
+private:
+    void drain(const std::vector<HostCopySpan>& tasks) {
+        const size_t total = tasks.size();
+        for (;;) {
+            const size_t idx = next_idx_.fetch_add(1, std::memory_order_relaxed);
+            if (idx >= total) return;
+            const HostCopySpan& t = tasks[idx];
+            std::memcpy(t.dst, t.src, t.n);
+            core::progress_beat();
+        }
+    }
+
+    int n_workers_ = 0;
+    std::mutex run_mu_;
+    std::mutex mu_;
+    std::condition_variable cv_start_;
+    std::condition_variable cv_done_;
+    uint64_t gen_ = 0;
+    const std::vector<HostCopySpan>* cur_tasks_ = nullptr;
+    std::atomic<size_t> next_idx_{0};
+    std::atomic<int> remaining_{0};
+    std::vector<std::thread> workers_;
+};
+
+void parallel_host_memcpy(const std::vector<HostCopySpan>& spans) {
+    if (spans.empty()) return;
+    static HostCopyPool* pool = new HostCopyPool(park_copy_threads());
+    constexpr size_t kChunk = (size_t) 4 << 20;   // 4 MiB sub-spans for even thread load balancing
+    std::vector<HostCopySpan> chunks;
+    chunks.reserve(spans.size() * 2);
+    for (const auto& s : spans) {
+        if (s.n == 0) continue;
+        size_t off = 0;
+        while (off < s.n) {
+            const size_t piece = std::min(kChunk, s.n - off);
+            chunks.push_back({s.dst + off, s.src + off, piece});
+            off += piece;
+        }
+    }
+    pool->run(chunks);
+}
 } // namespace
 
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
@@ -298,8 +417,7 @@ size_t conversation_kv_bytes(const QsaState& st, const ModelGeometry& g, int64_t
 
 bool conversation_kv_save(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error,
-                          int64_t unchanged_tokens, size_t* reused_bytes,
-                          const ConversationKv* anchor, int64_t anchor_tokens) {
+                          int64_t unchanged_tokens, size_t* reused_bytes) {
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error)) return false;
@@ -318,65 +436,32 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     const auto src = pools(st);
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<ConversationBuffer*,5> dst = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
-    // M-C2: the donor image's prefix bytes this session was RESTORED from (byte-identical to its own
-    // through whole pages and complete indexer rows below anchor_tokens). Geometry mismatch: no anchor.
-    std::array<const ConversationBuffer*,5> anchor_part{};
-    std::array<size_t,5> anchor_keep{};
-    if (anchor != nullptr && anchor_tokens > 0) {
-        if (anchor->format != l.format || anchor->cells < l.cells || anchor->heads != g.n_head_kv ||
-            anchor->head_dim != g.head_dim || anchor->page_size != l.page_size || anchor->idx_dim != g.idx_key_dim)
-            anchor = nullptr;
-        else {
-            const int64_t at = std::min<int64_t>(anchor_tokens, upto);
-            const int64_t ac = (at / l.page_size) * l.page_size;
-            const int64_t arows = at / strata::kernels::qsa_real_shapes().idx_block;
-            anchor_part = {&anchor->k, &anchor->v, &anchor->k_scale, &anchor->v_scale, &anchor->pooled};
-            for (size_t i = 0; i < 5; ++i)
-                anchor_keep[i] = i == 4 ? (index ? size_t(arows) * g.idx_key_dim * (strata::kernels::qsa_real_shapes().idx_pool_f16 ? 2 : 4) : 0)
-                                        : (l.cells ? (sizes[i] / size_t(l.cells)) * size_t(ac) : 0);
-            for (size_t i = 0; i < 5; ++i)
-                if (anchor_keep[i] > anchor_part[i]->size()) {
-                    anchor = nullptr;
-                    for (auto& x : anchor_keep) x = 0;
-                    break;
-                }
-        }
-    }
     // STRATA_PARK_VRAM_MIB: this layer's parts go into the park's slot under a fresh tag (0: no slot this park)
     image.dev_tag = park_async().slot != nullptr ? vram_kv().next_tag++ : 0;
+    const bool fast_host = park_host_memcpy_on() && st.kv_mode != 0;
+    std::vector<HostCopySpan> host_spans;
     for (size_t i = 0; i < dst.size(); ++i) {
         // Recopy the partial page and the indexer's moving spare row. Completed
         // pages/rows strictly before the first rewritten token remain identical.
-        size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim
-                                      * (strata::kernels::qsa_real_shapes().idx_pool_f16 ? 2 : 4) : 0)
-                             : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
+        const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
+                                  : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
-        const size_t anc = anchor ? anchor_keep[i] : 0;
-        if (anc > keep && src[i] && !on_device(src[i]) && dst[i]->adopt_shared(*anchor_part[i], anc,
-                                                         static_cast<const uint8_t*>(src[i]))) {
-            // (device-resident pools - the indexer pooled part, kv_mode 0 - are verified by copying, not memcmp)
-            // M-C2: verified identical - view the donor's bytes; copy only past the views
-            dst[i]->resize_for_overwrite(sizes[i]);   // appends owned segments past the views
-            if (!dst[i]->visit(anc, sizes[i] - anc, [&](uint8_t* p, size_t n, size_t at2) {
-                    return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at2 : nullptr, n, error);
+        if (fast_host && i < 4) {
+            if (sizes[i] > keep && src[i] == nullptr) { error = "conversation snapshot: missing state buffer"; return false; }
+            const bool trace = park_trace_on();
+            const auto t1 = trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const long rf0 = trace ? conversation_trace::thread_minflt() : 0;
+            dst[i]->resize_for_overwrite(sizes[i]);
+            if (trace) {
+                kv_save_trace().resize += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+                kv_save_trace().resize_faults += conversation_trace::thread_minflt() - rf0;
+            }
+            if (sizes[i] > keep && !dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
+                    host_spans.push_back({p, static_cast<const uint8_t*>(src[i]) + at, n});
+                    return true;
                 })) return false;
-            if (reused_bytes) *reused_bytes += anc;
+            if (reused_bytes) *reused_bytes += keep;
             continue;
-        }
-        // M-D2: this part's buffer may be the conversation's own previous park image, which can still
-        // hold CoW view segments from its last park's anchor (or the adopt above was refused and left
-        // the buffer untouched). A write landing on a borrowed segment aborts visit() with NO error
-        // string, which surfaced as the b8-elastic battery's exit-code-1 park deaths with an empty
-        // `ERR`. Drop this part's reuse when the rewrite range hits a view: copy it whole, fresh.
-        if (dst[i]->has_borrowed(keep, sizes[i] - keep)) {
-            static const bool said = [] {
-                std::fprintf(stderr, "strata: conversation park: the reused K/V part holds CoW views under "
-                                     "this park's rewrite range; copying the part fresh\n");
-                return true;
-            }();
-            (void) said;
-            *dst[i] = ConversationBuffer{};
-            keep = 0;
         }
         {   // STRATA_PARK_VRAM_MIB: with a slot, the whole part goes device to device into it (a restore of this image
             // reads it from there) and the host buffer gets only the bytes past the kept prefix, read from the slot on
@@ -440,6 +525,13 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         if (!copied) return false;
         if (reused_bytes) *reused_bytes += keep;
     }
+    if (!host_spans.empty()) {
+        const bool trace = park_trace_on();
+        const auto tc0 = trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        parallel_host_memcpy(host_spans);
+        if (trace)
+            kv_save_trace().copy += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc0).count();
+    }
     return true;
 }
 
@@ -468,10 +560,7 @@ namespace {
 // After the authoritative pools were rewritten: the VRAM slots of a streamed state still hold the outgoing
 // conversation, so resolve must refill them before any attention reads (shared by restore and direct copy).
 bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
-    if (st.kv_mode == 1) {
-        strata::core::qsa_cow_release(const_cast<QsaState&>(st));   // cow-m1b: let go of forked pages before the map resets
-        strata::kernels::kv_stream_reset(st.map, nullptr);
-    }
+    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
     if (st.kv_mode == 2 && upto > 0) {
         auto shapes = strata::kernels::qsa_real_shapes();
         shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
@@ -483,6 +572,53 @@ bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto,
     if (status == cudaSuccess) return true;
     error = std::string("conversation snapshot residency restore: ") + cudaGetErrorString(status);
     return false;
+}
+
+// A direct copy between two streamed states that are carved alike on one device (a batch slot's and the solo
+// session's) can take the source's residency with it: the VRAM slots' pages and the map, device to device.  The
+// reset above empties them, and the copied conversation then reads every block it attends to from the host copy
+// again, a page at a time: measured on 2x RTX 3090 (1M context, 32K cells in VRAM, a 35K-token conversation), the
+// windows behind an admission took 23 + 19 ms where the same windows take 12 + 10 once their blocks are in, and a
+// solo request behind a slot's hand-back read 11% of 175K block reads from RAM (0.4% in a session that was never
+// copied).  The pages are the source's view of the same bytes the host copy just received: a writer updates the
+// host copy always and a slot's page when its block is resident, on either state, so a page copied here says what
+// its block says in the target's host copy for every cell the conversation holds.  The call counters stay the
+// target's.  Opt-in (#5864, off until the two-card measurement): STRATA_KV_COPY_RESIDENT=1; unset, the reset, as
+// before.  False: not applicable (the caller resets).
+bool copy_residency(const QsaState& from, const QsaState& to, const ModelGeometry& g, bool queued, bool& copied,
+                    std::string& error) {
+    copied = false;
+    static const bool on = [] { const char* e = std::getenv("STRATA_KV_COPY_RESIDENT"); return e != nullptr && e[0] != '\0' && e[0] != '0'; }();
+    const auto& mf = from.map;
+    const auto& mt = to.map;
+    if (!on || from.kv_mode != 1 || to.kv_mode != 1 || from.n_slots != to.n_slots || mf.n_slots != mt.n_slots ||
+        mf.n_blocks != mt.n_blocks || mf.n_slots <= 0 || !mf.page_table || !mt.page_table || !mf.slot_block ||
+        !mt.slot_block || !mf.slot_stamp || !mt.slot_stamp || !mf.slot_ref || !mt.slot_ref || !mf.ctl || !mt.ctl)
+        return true;
+    const auto s = strata::kernels::qsa_real_shapes();
+    Layout lr{};
+    if (!layout(from, g, from.n_slots * s.page_size, false, lr, error)) return false;   // the slots' pages: n_slots pages a pool
+    const auto src = pools(from, true);
+    const auto dst = pools(to, true);
+    const std::array<size_t,4> sizes = {lr.data, lr.value_data, lr.scales, lr.value_scales};
+    for (size_t i = 0; i < sizes.size(); ++i)
+        if (sizes[i] && (!src[i] || !dst[i])) return true;   // (a pool this format does not have in VRAM: the reset)
+    auto put = [&](void* d, const void* f, size_t bytes) {
+        const cudaError_t e = conversation_detail::copy_nonblocking(d, f, bytes, queued);
+        if (e == cudaSuccess) return true;
+        error = std::string("conversation snapshot residency copy: ") + cudaGetErrorString(e);
+        return false;
+    };
+    for (size_t i = 0; i < sizes.size(); ++i)
+        if (sizes[i] && !put(dst[i], src[i], sizes[i])) return false;
+    const size_t per_slot = (size_t) mf.n_slots * sizeof(int32_t);
+    if (!put(mt.page_table, mf.page_table, (size_t) mf.n_blocks * sizeof(int32_t)) ||
+        !put(mt.slot_block, mf.slot_block, per_slot) || !put(mt.slot_stamp, mf.slot_stamp, per_slot) ||
+        !put(mt.slot_ref, mf.slot_ref, per_slot) ||
+        !put(mt.ctl, mf.ctl, 4 * sizeof(int32_t)))   // the epoch, the clock hand, the last call's misses and overflow
+        return false;
+    copied = true;
+    return true;
 }
 } // namespace
 
@@ -514,6 +650,14 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
         const cudaError_t e = conversation_detail::order_after_queued();
         if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
     }
+    bool resident = false;
+    if (!copy_residency(from, to, g, queued, resident, error)) return false;
+    if (resident) {
+        const auto status = cudaGetLastError();
+        if (status == cudaSuccess) return true;
+        error = std::string("conversation snapshot residency copy: ") + cudaGetErrorString(status);
+        return false;
+    }
     return refresh_residency(to, g, upto, error);
 }
 
@@ -531,6 +675,21 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     if (slot != nullptr) {
         for (size_t i = 0; i < src.size(); ++i)
             if (!transfer(dst[i], static_cast<const uint8_t*>(slot->p) + off[i], sizes[i], error)) return false;
+        return refresh_residency(st, g, upto, error);
+    }
+    if (park_host_memcpy_on() && st.kv_mode != 0) {
+        std::vector<HostCopySpan> host_spans;
+        for (size_t i = 0; i < 4; ++i) {
+            if (src[i]->size() > 0 && !dst[i]) { error = "conversation snapshot: missing state buffer"; return false; }
+            if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
+                    host_spans.push_back({static_cast<uint8_t*>(dst[i]) + at, p, n});
+                    return true;
+                })) return false;
+        }
+        parallel_host_memcpy(host_spans);
+        if (!src[4]->visit(0, src[4]->size(), [&](const uint8_t* p, size_t n, size_t at) {
+                return transfer(static_cast<uint8_t*>(dst[4]) + at, p, n, error);
+            })) return false;
         return refresh_residency(st, g, upto, error);
     }
     for (size_t i = 0; i < src.size(); ++i)
@@ -564,6 +723,21 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
             if (!transfer(dst[i], static_cast<const uint8_t*>(slot->p) + off[i], sizes[i], error)) return false;
         return refresh_residency(st, g, upto, error);
     }
+    if (park_host_memcpy_on() && st.kv_mode != 0) {
+        std::vector<HostCopySpan> host_spans;
+        for (size_t i = 0; i < 4; ++i) {
+            if (sizes[i] > 0 && !dst[i]) { error = "conversation snapshot: missing state buffer"; return false; }
+            if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
+                    host_spans.push_back({static_cast<uint8_t*>(dst[i]) + at, p, n});
+                    return true;
+                })) return false;
+        }
+        parallel_host_memcpy(host_spans);
+        if (!src[4]->visit(0, sizes[4], [&](const uint8_t* p, size_t n, size_t at) {
+                return transfer(static_cast<uint8_t*>(dst[4]) + at, p, n, error);
+            })) return false;
+        return refresh_residency(st, g, upto, error);
+    }
     for (size_t i = 0; i < src.size(); ++i)
         if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
@@ -577,6 +751,247 @@ bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int6
     if (!layout(st, g, upto, index, l, error)) return false;
     sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     return true;
+}
+
+namespace {
+std::array<ConversationBuffer*, 5> swap_buffers(ConversationKv& kv) {
+    return {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale, &kv.pooled};
+}
+
+bool swap_range(const void* p, size_t n) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    return n == 0 || (p != nullptr && n <= UINTPTR_MAX - a);
+}
+
+bool swap_overlap(const void* a, size_t an, const void* b, size_t bn) {
+    if (!an || !bn) return false;
+    const uintptr_t x = reinterpret_cast<uintptr_t>(a), y = reinterpret_cast<uintptr_t>(b);
+    return x < y + bn && y < x + an;
+}
+
+// Check full allocated segment capacities, not merely the currently used bytes.
+// Device aliases are compared in their own address space; they may have the
+// same numeric value as their corresponding CPU mapping on a UVA platform.
+bool swap_ranges_valid(const ConversationSwapPlan& plan, const uint8_t* scratch, size_t scratch_bytes,
+                       std::string& error) {
+    auto bad = [&] { error = "conversation swap: overlapping or invalid address range"; return false; };
+    if (scratch_bytes && !swap_range(scratch, scratch_bytes)) return bad();
+    for (size_t l = 0; l < plan.layers.size(); ++l) {
+        const auto& x = plan.layers[l];
+        const auto xd = pools(*x.state);
+        for (size_t p = 0; p < 5; ++p) {
+            const size_t n = std::max(x.active_bytes[p], x.incoming_bytes[p]);
+            if (!swap_range(xd[p], n) || (p < 4 && !swap_range(x.active[p], n))) return bad();
+            if (scratch_bytes && (swap_overlap(xd[p], n, scratch, scratch_bytes) ||
+                                  (p < 4 && swap_overlap(x.active[p], n, scratch, scratch_bytes)))) return bad();
+            for (size_t m = 0; m < plan.layers.size(); ++m) {
+                const auto& y = plan.layers[m];
+                const auto yd = pools(*y.state);
+                for (size_t q = 0; q < 5; ++q) {
+                    const size_t z = std::max(y.active_bytes[q], y.incoming_bytes[q]);
+                    if ((l != m || p != q) && swap_overlap(xd[p], n, yd[q], z)) return bad();
+                    if (p < 4 && q < 4 && (l != m || p != q) &&
+                        swap_overlap(x.active[p], n, y.active[q], z)) return bad();
+                    if (p < 4 && q == 4 && swap_overlap(x.active[p], n, yd[q], z)) return bad();
+                }
+            }
+        }
+    }
+    // Include the new outgoing pooled buffers as well as every incoming part.
+    for (size_t l = 0; l < plan.layers.size(); ++l) {
+        const auto xb = swap_buffers(*plan.layers[l].image);
+        for (size_t p = 0; p < 6; ++p) {
+            const ConversationBuffer& a = p == 5 ? plan.layers[l].pooled : *xb[p];
+            if (!a.visit_allocations([&](const uint8_t* ap, size_t an, size_t ai) {
+                strata::core::progress_beat();
+                if (!swap_range(ap, an) || swap_overlap(ap, an, scratch, scratch_bytes)) return false;
+                for (size_t m = 0; m < plan.layers.size(); ++m) {
+                    const auto& y = plan.layers[m];
+                    const auto yd = pools(*y.state);
+                    const auto yb = swap_buffers(*y.image);
+                    for (size_t q = 0; q < 5; ++q) {
+                        const size_t n = std::max(y.active_bytes[q], y.incoming_bytes[q]);
+                        if (swap_overlap(ap, an, yd[q], n) ||
+                            (q < 4 && swap_overlap(ap, an, y.active[q], n))) return false;
+                    }
+                    for (size_t q = 0; q < 6; ++q) {
+                        const ConversationBuffer& b = q == 5 ? y.pooled : *yb[q];
+                        if (!b.visit_allocations([&](const uint8_t* bp, size_t bn, size_t bi) {
+                            if (!swap_range(bp, bn)) return false;
+                            return (l == m && p == q && ai == bi) || !swap_overlap(ap, an, bp, bn);
+                        })) return false;
+                    }
+                }
+                return true;
+            })) return bad();
+        }
+    }
+    return true;
+}
+} // namespace
+
+bool conversation_kv_swap_prepare(ConversationSwapPlan& plan, SavedConversation& incoming,
+                                  const SessionState& ss, const ModelGeometry& g,
+                                  const QsaState* draft, int64_t active_tokens, std::string& error) {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
+    (void) plan; (void) incoming; (void) ss; (void) g; (void) draft; (void) active_tokens;
+    error = "conversation swap: host mapping is not verified on this backend";
+    return false;
+#else
+    const size_t main_layers = (size_t) std::max<int64_t>(ss.qsa_alloc, 0);
+    if (!main_layers || incoming.kv.size() != main_layers + (draft ? 1 : 0)) {
+        error = "conversation swap: incompatible layer count";
+        return false;
+    }
+    plan.layers.clear();
+    plan.layers.reserve(incoming.kv.size());
+    const int64_t incoming_tokens = (int64_t) incoming.live.ids.size();
+    for (size_t j = 0; j < incoming.kv.size(); ++j) {
+        const bool index = j < main_layers;
+        const QsaState& st = index ? ss.qsa_states[(size_t) ss.qsa_ord0 + j] : *draft;
+        ConversationKv& image = incoming.kv[j];
+        Layout a{}, b{};
+        if ((index && st.kv_mode != 1) || (!index && st.kv_mode != 1 && st.kv_mode != 2) ||
+            image.dev_tag || image.pending || !st.host_cpu_base || !st.host_device_base || !st.host_allocation_bytes ||
+            !layout(st, g, active_tokens, index, a, error) || !valid(st, a, active_tokens, error) ||
+            !layout(st, g, incoming_tokens, index, b, error) || !valid(st, b, incoming_tokens, error) ||
+            !conversation_kv_validate(image, st, g, incoming_tokens, index, error)) {
+            if (error.empty()) error = "conversation swap: unsupported host K/V";
+            return false;
+        }
+        ConversationKvSwapLayer layer;
+        layer.state = &st;
+        layer.image = &image;
+        layer.active_bytes = {a.data, a.value_data, a.scales, a.value_scales, a.pooled};
+        layer.incoming_bytes = {b.data, b.value_data, b.scales, b.value_scales, b.pooled};
+        if (index && (st.idx_pooled != st.idx_pooled_allocation ||
+                      std::max(a.pooled, b.pooled) > st.idx_pooled_allocation_bytes ||
+                      !swap_range(st.idx_pooled_allocation, st.idx_pooled_allocation_bytes))) {
+            error = "conversation swap: device index outside its allocation";
+            return false;
+        }
+        layer.format = a.format; layer.cells = a.cells; layer.pooled_rows = a.pooled_rows; layer.page_size = a.page_size;
+        const auto aliases = pools(st);
+        const uintptr_t cpu = reinterpret_cast<uintptr_t>(st.host_cpu_base);
+        const uintptr_t base = reinterpret_cast<uintptr_t>(st.host_device_base);
+        if (!swap_range(st.host_cpu_base, st.host_allocation_bytes) ||
+            !swap_range(st.host_device_base, st.host_allocation_bytes)) {
+            error = "conversation swap: invalid mapped allocation";
+            return false;
+        }
+        for (size_t i = 0; i < 4; ++i) {
+            const size_t n = std::max(layer.active_bytes[i], layer.incoming_bytes[i]);
+            if (!n) continue;
+            const uintptr_t alias = reinterpret_cast<uintptr_t>(aliases[i]);
+            if (alias < base || alias - base > st.host_allocation_bytes ||
+                n > st.host_allocation_bytes - (alias - base)) {
+                error = "conversation swap: host alias outside its allocation";
+                return false;
+            }
+            layer.active[i] = reinterpret_cast<uint8_t*>(cpu + (alias - base));
+        }
+        plan.layers.push_back(std::move(layer));
+    }
+    return swap_ranges_valid(plan, nullptr, 0, error);
+#endif
+}
+
+bool conversation_kv_swap_reserve(ConversationSwapPlan& plan, uint8_t* scratch, size_t block_bytes,
+                                  bool& transfer_failed, std::string& error) {
+    transfer_failed = false;
+    if (!scratch || !block_bytes) { error = "conversation swap: no scratch block"; return false; }
+    plan.final_additional_bytes = block_bytes;
+    for (auto& layer : plan.layers) {
+        const auto buffers = swap_buffers(*layer.image);
+        for (size_t i = 0; i < 4; ++i) {
+            ConversationBuffer& buffer = *buffers[i];
+            const size_t old_size = buffer.size(), old_bytes = buffer.bytes();
+            const size_t target = std::max(layer.active_bytes[i], layer.incoming_bytes[i]);
+            size_t old_capacity = 0;
+            if (target > old_size && !buffer.visit_allocations([&](const uint8_t*, size_t n, size_t) {
+                    return conversation_detail::add(old_capacity, n);
+                })) {
+                error = "conversation swap: growth capacity overflow";
+                return false;
+            }
+            buffer.resize_for_overwrite(target);
+            const size_t new_bytes = buffer.bytes();
+            // Existing spare capacity may not have been touched by B. Charge it
+            // when A grows into it, as well as every newly reserved allocation.
+            if (new_bytes < old_bytes || (target > old_size && old_capacity < old_size) ||
+                !conversation_detail::add(plan.final_additional_bytes, new_bytes - old_bytes) ||
+                (target > old_size && !conversation_detail::add(plan.final_additional_bytes, old_capacity - old_size))) {
+                error = "conversation swap: growth byte count overflow";
+                return false;
+            }
+        }
+        layer.pooled.resize_for_overwrite(layer.active_bytes[4]);
+        // The subsequent synchronous transfer populates pooled.size() bytes.
+        // Its unused capacity and directory need not have been resident.
+        if (layer.pooled.bytes() < layer.pooled.size() ||
+            !conversation_detail::add(plan.final_additional_bytes, layer.pooled.bytes() - layer.pooled.size())) {
+            error = "conversation swap: index capacity overflow";
+            return false;
+        }
+    }
+    if (!swap_ranges_valid(plan, scratch, block_bytes, error)) return false;
+    // Save the outgoing device index, including its moving spare row, before
+    // restoring any of the incoming pooled rows or checkpoint state.
+    for (auto& layer : plan.layers) {
+        const void* source = pools(*layer.state)[4];
+        if (!layer.pooled.visit(0, layer.pooled.size(), [&](uint8_t* p, size_t n, size_t at) {
+                return transfer(p, source ? static_cast<const uint8_t*>(source) + at : nullptr, n, error);
+            })) {
+            transfer_failed = true;
+            return false;
+        }
+    }
+    return true;
+}
+
+void conversation_kv_swap_rollback(ConversationSwapPlan& plan) {
+    for (auto& layer : plan.layers) {
+        const auto buffers = swap_buffers(*layer.image);
+        for (size_t i = 0; i < 4; ++i) buffers[i]->resize_for_overwrite(layer.incoming_bytes[i]);
+    }
+}
+
+bool conversation_kv_swap_exchange(ConversationSwapPlan& plan, const ModelGeometry& g,
+                                   int64_t incoming_tokens, uint8_t* scratch, size_t block_bytes,
+                                   bool& written, std::string& error) {
+    for (auto& layer : plan.layers) {
+        const auto buffers = swap_buffers(*layer.image);
+        for (size_t i = 0; i < 4; ++i) {
+            if (!conversation_buffer_exchange(*buffers[i], layer.active[i], layer.active_bytes[i],
+                                              layer.incoming_bytes[i], scratch, block_bytes, written)) {
+                error = "conversation swap: host exchange failed";
+                return false;
+            }
+        }
+    }
+    // The device index is not a CPU mapping. Restore it using the existing
+    // transfer path, then invalidate streaming slots or refill the draft ring.
+    for (auto& layer : plan.layers) {
+        void* target = pools(*layer.state)[4];
+        if (!layer.image->pooled.visit(0, layer.incoming_bytes[4], [&](const uint8_t* p, size_t n, size_t at) {
+                return transfer(target ? static_cast<uint8_t*>(target) + at : nullptr, p, n, error);
+            }) || !refresh_residency(*layer.state, g, incoming_tokens, error)) return false;
+    }
+    return true;
+}
+
+void conversation_kv_swap_publish(ConversationSwapPlan& plan, SavedConversation& incoming,
+                                 SavedConversation& outgoing, const ModelGeometry& g) {
+    for (auto& layer : plan.layers) {
+        auto& kv = *layer.image;
+        const auto buffers = swap_buffers(kv);
+        for (size_t i = 0; i < 4; ++i) buffers[i]->resize_for_overwrite(layer.active_bytes[i]);
+        kv.pooled = std::move(layer.pooled);
+        kv.format = layer.format; kv.cells = layer.cells; kv.heads = g.n_head_kv; kv.head_dim = g.head_dim;
+        kv.page_size = layer.page_size; kv.pooled_rows = layer.pooled_rows; kv.idx_dim = g.idx_key_dim;
+        kv.dev_tag = 0;
+    }
+    outgoing.kv = std::move(incoming.kv);
 }
 
 bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const ModelGeometry& g,
@@ -835,72 +1250,3 @@ void conversation_park_join_for(const SavedConversation& image) {
 }
 
 } // namespace strata::core
-
-namespace strata::core {
-// M-C3b2a: restore-side donor adoption. Mirror of the park-side anchor rule: aligned whole pages for
-// k/v/scales (cells-scaled byte ratios) and complete indexer rows for the pooled part; strict prefix.
-bool conversation_kv_share_views(SavedConversation& img, const SavedConversation& donor,
-                                 const std::vector<std::array<size_t, 5>>& keep, size_t* reused_bytes) {
-    if (img.kv.empty() || img.kv.size() != donor.kv.size() || keep.size() != img.kv.size()) return false;
-    size_t reused = 0;
-    for (size_t li = 0; li < img.kv.size(); ++li) {
-        auto& l = img.kv[li]; const auto& d = donor.kv[li];
-        if (l.format != d.format || l.cells != d.cells || l.heads != d.heads ||
-            l.head_dim != d.head_dim || l.page_size != d.page_size || l.idx_dim != d.idx_dim) continue;
-        std::array<ConversationBuffer*, 5> dst = {&l.k, &l.v, &l.k_scale, &l.v_scale, &l.pooled};
-        std::array<const ConversationBuffer*, 5> src = {&d.k, &d.v, &d.k_scale, &d.v_scale, &d.pooled};
-        for (int i = 0; i < 5; ++i) {
-            const size_t full = dst[i]->size();
-            const size_t keepn = keep[li][i];
-            if (!keepn || keepn >= full || src[i]->size() < keepn) continue;
-            if (!dst[i]->prefix_equal(*src[i], keepn)) continue;   // bytes differ: the copy stays (should not happen:
-                                                                   // the bytes were borrowed from THIS donor's lineage)
-            std::vector<uint8_t> tail(full - keepn);
-            if (!dst[i]->visit(keepn, full - keepn, [&](uint8_t* p, size_t n, size_t at) -> bool {
-                    std::memcpy(tail.data() + (at - keepn), p, n); return true; })) continue;
-            if (!dst[i]->adopt_shared(*src[i], keepn)) continue;
-            dst[i]->resize_for_overwrite(full);   // appends owned segments past the views
-            if (!dst[i]->visit(keepn, full - keepn, [&](uint8_t* p, size_t n, size_t at) -> bool {
-                    std::memcpy(p, tail.data() + (at - keepn), n); return true; })) return false;
-            reused += keepn;
-        }
-    }
-    if (reused_bytes) *reused_bytes = reused;
-    return reused > 0;
-}
-
-bool conversation_kv_share_prefix(SavedConversation& img, const SavedConversation& donor,
-                                  int64_t tokens, size_t* reused_bytes) {
-    if (tokens <= 0 || img.kv.empty() || img.kv.size() != donor.kv.size()) return false;
-    const auto& qs = strata::kernels::qsa_real_shapes();
-    size_t reused = 0;
-    for (size_t li = 0; li < img.kv.size(); ++li) {
-        auto& l = img.kv[li]; const auto& d = donor.kv[li];
-        if (l.format != d.format || l.cells != d.cells || l.heads != d.heads ||
-            l.head_dim != d.head_dim || l.page_size != d.page_size || l.idx_dim != d.idx_dim ||
-            tokens >= l.cells) continue;                       // strict proper prefix only
-        const int64_t ac = (tokens / l.page_size) * l.page_size;
-        const int64_t arows = tokens / qs.idx_block;
-        std::array<ConversationBuffer*, 5> dst = {&l.k, &l.v, &l.k_scale, &l.v_scale, &l.pooled};
-        std::array<const ConversationBuffer*, 5> src = {&d.k, &d.v, &d.k_scale, &d.v_scale, &d.pooled};
-        std::array<size_t, 5> keep = {};
-        for (int i = 0; i < 4; ++i) keep[i] = l.cells ? (dst[i]->size() / size_t(l.cells)) * size_t(ac) : 0;
-        keep[4] = size_t(arows) * size_t(l.idx_dim) * 4;
-        for (int i = 0; i < 5; ++i) {
-            const size_t full = dst[i]->size();
-            if (!keep[i] || keep[i] >= full || src[i]->size() < keep[i]) continue;
-            if (!dst[i]->prefix_equal(*src[i], keep[i])) continue;      // bytes differ (different prefill geometry): copy
-            std::vector<uint8_t> tail(full - keep[i]);
-            if (!dst[i]->visit(keep[i], full - keep[i], [&](uint8_t* p, size_t n, size_t at) -> bool {
-                    std::memcpy(tail.data() + (at - keep[i]), p, n); return true; })) continue;
-            if (!dst[i]->adopt_shared(*src[i], keep[i])) continue;      // verified just above
-            dst[i]->resize_for_overwrite(full);   // appends owned segments past the views
-            if (!dst[i]->visit(keep[i], full - keep[i], [&](uint8_t* p, size_t n, size_t at) -> bool {
-                    std::memcpy(p, tail.data() + (at - keep[i]), n); return true; })) return false;
-            reused += keep[i];
-        }
-    }
-    if (reused_bytes) *reused_bytes = reused;
-    return reused > 0;
-}
-}

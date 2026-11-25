@@ -16,10 +16,10 @@ struct PcDqArgs { uint32_t n_in, n_out, row_bytes, perm; };
 struct PcGemmArgs { int M, N, K, pad; };
 struct PcEpiArgs { uint32_t n_tok, n_embd, hc, hc_lr; };
 struct PcGdnPArgs { uint32_t n_tok, h_k, h_v, channels; float eps; uint32_t f32; };
-struct PcMmPlanArgs { uint32_t n_ent, topk, n_expert, tm, n_blocks; };
+struct PcMmPlanArgs { uint32_t n_ent, topk, n_expert, tm, n_blocks, gu_gx, dn_gx; };   // moe_mm.metal's MmPlanArgs
 struct PcMmArgs { uint64_t gate_off, up_off, down_off, gu_stride, d_stride; uint32_t gu_row, d_row, n_embd, n_ff; };
 int pc_unit_of(int t) {
-    return t == ref::Q2_0 || t == ref::IQ3_S || t == ref::BF16 || t == ref::F32 || t == 18 || t == 16 || t == 17 || t == 22 ? 16 : 32;
+    return t == ref::Q2_0 || t == ref::NVFP4 || t == ref::IQ3_S || t == ref::BF16 || t == ref::F32 || t == 18 || t == 16 || t == 17 || t == 22 ? 16 : 32;
 }
 }  // namespace
 
@@ -58,8 +58,14 @@ bool Window::pc_setup(int C) {
         b.lqsa = cc(lib_prompt_qsa());
         b.k4 = coop_k4();
     }
+    // pc_chunk's GPU submissions complete before it returns. Only scratch buffers are replaced;
+    // the window's KV, recurrent state and compiled libraries remain alive.
+    for (auto& buffer : b.owned) cx_->free(buffer);
     b = PromptBufs{b.lib, b.lgdn, b.lqsa, b.k4};   // (re)allocated below for the larger chunk
-    b.v3e = b.k4 && T("blk.0.ffn_gate_exps.weight").type < 144;   // the trellis experts have the v2 kernels only
+    // the v3 register-operand chain covers the ordinary quant types and the pair trellis (TQP5/6/7, 147-149, whose
+    // W8 shares one window between the lane's runs); the TQK trio (144-146) has the v2 kernels only
+    const int egt = T("blk.0.ffn_gate_exps.weight").type;
+    b.v3e = b.k4 && (egt < 144 || egt >= 147);
     b.C = C;
     const size_t MT = (size_t) C;
     const int MB = (int) max_cells_ / 4 + 2;
@@ -73,10 +79,12 @@ bool Window::pc_setup(int C) {
     b.tm = b.gu3[0];
     if (b.v3e) {   // STRATA_PROMPT_V6=MS (default 4, 0 = off): ragged tiles, groups of MS (2..4) 16-row subtiles of one expert share the weight decode
         // the ragged-tile kernels exist for these expert types only (every layer's must be one of them)
-        auto gu_ok = [](int t) { return t == ref::Q4_K || t == ref::Q5_K || t == ref::Q6_K || t == ref::Q8_0 || t == ref::IQ3_XXS ||
-                                        t == ref::IQ2_S || t == ref::IQ4_XS || t == ref::IQ3_S || t == ref::IQ2_XS || t == ref::IQ2_XXS; };
-        auto dn_ok = [](int t) { return t == ref::Q5_1 || t == ref::Q8_0 || t == ref::Q5_0 || t == ref::IQ4_NL || t == ref::Q2_0 ||
-                                        t == ref::Q4_K || t == ref::Q5_K || t == ref::Q6_K || t == ref::Q3_K || t == ref::IQ4_XS || t == ref::IQ3_S; };   // (the last six: Q4-KQ, UD downs at widths divisible by 256)
+        auto gu_ok = [](int t) { return t == ref::Q2_K || t == ref::Q3_K || t == ref::Q4_K || t == ref::Q5_K || t == ref::Q6_K || t == ref::Q8_0 ||
+                                        t == ref::IQ3_XXS || t == ref::IQ2_S || t == ref::IQ4_XS || t == ref::IQ3_S || t == ref::IQ2_XS || t == ref::IQ2_XXS ||
+                                        t == ref::NVFP4; };
+        auto dn_ok = [](int t) { return t == ref::Q5_1 || t == ref::Q8_0 || t == ref::Q5_0 || t == ref::IQ4_NL || t == ref::Q2_0 || t == ref::IQ3_XXS ||
+                                        t == ref::NVFP4 || t == ref::Q2_K || t == ref::Q4_K || t == ref::Q5_K || t == ref::Q6_K || t == ref::Q3_K ||
+                                        t == ref::IQ4_XS || t == ref::IQ3_S; };   // (the last seven: Q4-KQ, UD downs at widths divisible by 256)
         bool types_ok = true;
         for (int l = 0; l < G_NL && types_ok; ++l) {
             const std::string bl = "blk." + std::to_string(l) + ".";
@@ -93,8 +101,13 @@ bool Window::pc_setup(int C) {
     if (b.dn3[0] != b.tm) { std::fprintf(stderr, "strata metal: STRATA_PROMPT_GU/DN tile heights differ: using %d for both\n", b.tm); b.dn3[0] = b.tm; }
     b.maxrows = (int) MT * TOPK + nexp_ * b.tm;
     const int nblk_max = ((int) MT * TOPK + 1023) / 1024;
-    auto F32 = [&](size_t n) { return cx_->alloc(4 * n); };
-    auto F16 = [&](size_t n) { return cx_->alloc(2 * n); };
+    auto alloc = [&](size_t bytes) {
+        mtl::Buffer buffer = cx_->alloc(bytes);
+        b.owned.push_back(buffer);
+        return buffer;
+    };
+    auto F32 = [&](size_t n) { return alloc(4 * n); };
+    auto F16 = [&](size_t n) { return alloc(2 * n); };
     b.R = F32(MT * HC * N); if (mtp_ovl_ && mtp_on_) b.R2 = F32(MT * HC * N); b.bo = F32(MT * N); b.inj[0] = F32(MT * HC); b.inj[1] = F32(MT * HC); b.xn = F32(MT * HC * N);
     b.xnh = F16(MT * HC * N); b.V = F32(MT * (LR + HC)); b.loh = F16(MT * LR); b.mixed = F32(MT * N); b.mixh = F16(MT * N);
     b.fused = gdn_fused_inputs(cx_->device_name());
@@ -109,12 +122,12 @@ bool Window::pc_setup(int C) {
     b.ggb = F32(MT * G_HV * 2); b.gkq = F32(MT * G_HK); b.go = F32(MT * G_ZV);
     b.qfull = F32(MT * G_QFULL); b.kcur = F32(MT * G_KV); b.vcur = F32(MT * G_KV); b.iqr = F32(MT * G_IQR); b.ikr = F32(MT * G_ID);
     b.qcur = F32(MT * G_QOUT); b.qcurh = F16(MT * G_QOUT); b.qidx = F32(MT * G_IH * G_ID); b.scores = F32(MT * MB);
-    b.qids = cx_->alloc(4 * MT * PC_QB); b.part = F32(MT * PC_QCHUNKS * G_QH * (G_QD + 2)); b.XQ = F32(4 * MT * G_QOUT + MT * G_QOUT / 16);
+    b.qids = alloc(4 * MT * PC_QB); b.part = F32(MT * PC_QCHUNKS * G_QH * (G_QD + 2)); b.XQ = F32(4 * MT * G_QOUT + MT * G_QOUT / 16);
     b.xqh = F16(MT * G_QOUT);
-    b.logits = F32(MT * nexp_); b.ids = cx_->alloc(4 * MT * TOPK); b.wts = F32(MT * TOPK);
-    b.bcnt = cx_->alloc(4 * (size_t) nblk_max * nexp_); b.boff = cx_->alloc(4 * (size_t) nblk_max * nexp_);
-    b.eoff = cx_->alloc(4 * nexp_); b.tiles = cx_->alloc(8 * (size_t) (b.maxrows / b.tm + 1)); b.meta = cx_->alloc(64);
-    b.stok = cx_->alloc(4 * (size_t) b.maxrows); b.sw = F32(b.maxrows); b.pos = cx_->alloc(4 * MT * TOPK);
+    b.logits = F32(MT * nexp_); b.ids = alloc(4 * MT * TOPK); b.wts = F32(MT * TOPK);
+    b.bcnt = alloc(4 * (size_t) nblk_max * nexp_); b.boff = alloc(4 * (size_t) nblk_max * nexp_);
+    b.eoff = alloc(4 * nexp_); b.tiles = alloc(8 * (size_t) (b.maxrows / b.tm + 1)); b.meta = alloc(64);
+    b.stok = alloc(4 * (size_t) b.maxrows); b.sw = F32(b.maxrows); b.pos = alloc(4 * MT * TOPK);
     b.XS = F16((size_t) b.maxrows * N); b.HS = F16((size_t) b.maxrows * NFF); b.YE = F32((size_t) b.maxrows * N);
     b.yr = F32(MT * N); b.gsh = F32(MT * NFF); b.ush = F32(MT * NFF); b.hh = F16(MT * NFF); b.ys = F32(MT * N); b.sgv = F32(MT);
     b.WD = F16((size_t) (LR + HC) * HC * N); b.WU = F16((size_t) HC * N * LR);
@@ -133,8 +146,8 @@ bool Window::pc_setup(int C) {
     b.qn = F32(MT * G_HCD); b.gated = F32(MT * G_HCD); b.normW = F32(MT * G_HCD);
     if (had_on_) b.mixr = F32(MT * N);
     b.Wpk = F16((size_t) G_HCD * N); b.Wpv = F16((size_t) N * N);
-    b.meta.as<uint32_t>()[2] = b.v3e ? NFF / (b.gu3[1] * b.gu3[3]) : NFF / 64;
-    b.meta.as<uint32_t>()[5] = b.v3e ? N / (b.dn3[1] * b.dn3[3]) : N / 64;
+    // b.meta's gate/up and down grids are mm_scan's to write, one layer's worth per layer, from the plan (pc_chunk):
+    // the v2 tile is the layer's quant type's, so one grid for the whole chunk cannot be right (src/moe_tiles.h)
     std::fprintf(stderr, "strata metal: prompt kernels (mac-kern's prompt chain) for chunks of %d rows, %s, ready in %.0f ms\n",
                  C, b.k4 ? "matrix-unit register operands (COOP_K4)" : "the older expert / attention kernels (no M5 layout)",
                  now_ms() - t0);
@@ -423,7 +436,11 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         const uint32_t nt = (uint32_t) nT;
         D(P_(b.lib, "route_topk"), {mtl::Arg::B(b.logits), mtl::Arg::B(b.ids), mtl::Arg::B(b.wts), mtl::Arg::V(nt), mtl::Arg::V((uint32_t) nexp_)}, (nT + 7) / 8, 1, 256);
         const int nent = nT * TOPK, nblk = (nent + 1023) / 1024;
-        PcMmPlanArgs pa{(uint32_t) nent, TOPK, (uint32_t) nexp_, (uint32_t) (b.v6 ? b.ms : b.tm), (uint32_t) nblk};
+        // this layer's tiles and the grid x each one is dispatched over, computed together (src/moe_tiles.h)
+        const MoeTile gu2 = gu2_tile(eg.type), dn2 = dn2_tile(ed.type);
+        PcMmPlanArgs pa{(uint32_t) nent, TOPK, (uint32_t) nexp_, (uint32_t) (b.v6 ? b.ms : b.tm), (uint32_t) nblk,
+                        (uint32_t) (b.v3e ? moe_grid_x(NFF, b.gu3[1], b.gu3[3]) : moe_grid_x(NFF, gu2.tn)),
+                        (uint32_t) (b.v3e ? moe_grid_x(N, b.dn3[1], b.dn3[3]) : moe_grid_x(N, dn2.tn))};
         const uint32_t nclr = (uint32_t) b.maxrows;
         D(P_(b.lib, "mm_clear"), {mtl::Arg::B(b.stok), mtl::Arg::V(nclr)}, (b.maxrows + 255) / 256, 1, 256);
         D(P_(b.lib, "mm_hist"), {mtl::Arg::B(b.ids), mtl::Arg::B(b.bcnt), mtl::Arg::V(pa)}, nblk, 1, 1024);
@@ -454,7 +471,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
                                         : "mm_gu3_" + std::to_string(eg.type) + "_" + tl3(b.gu3);
             gu.p = P_(b.lib, fn, mtl::Constants().b(7, true), fn + "#k4");
         } else {
-            const std::string fn = "mm_gu2_" + std::to_string(eg.type) + gu2_tile(eg.type);
+            const std::string fn = "mm_gu2_" + std::to_string(eg.type) + gu2.name;
             gu.p = P_(b.lib, fn, mtl::Constants().i(5, 0), fn + "#p0");
         }
         gu.args = {mtl::Arg::B(W_, ebase), mtl::Arg::B(b.XS), mtl::Arg::B(b.HS), mtl::Arg::B(b.tiles), mtl::Arg::V(ma)};
@@ -470,7 +487,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
                                         : "mm_down3_" + std::to_string(ed.type) + "_" + tl3(b.dn3);
             dn.p = P_(b.lib, fn, mtl::Constants().b(7, true), fn + "#k4");
         } else {
-            dn.p = P_(b.lib, "mm_down2_" + std::to_string(ed.type) + dn2_tile(ed.type));
+            dn.p = P_(b.lib, "mm_down2_" + std::to_string(ed.type) + dn2.name);
         }
         dn.args = {mtl::Arg::B(W_, ebase), mtl::Arg::B(b.HS), mtl::Arg::B(b.YE), mtl::Arg::B(b.tiles), mtl::Arg::V(ma)};
         dn.tg[0] = b.v3e ? 32 * b.dn3[3] : 64;

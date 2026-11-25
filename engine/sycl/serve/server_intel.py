@@ -25,8 +25,9 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent.parent
+ROOT = HERE.parent.parent                                # engine/
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT.parent / "terminal"))        # serve/ (server.py, telemetry.py) is the Terminal's
 sys.path.insert(0, str(HERE))
 
 import serve.server as S  # noqa: E402
@@ -127,7 +128,7 @@ def install_switcher(argv):
                     self._send(f.read_bytes(), types[f.suffix])
                     return
                 if path == "":
-                    page = (ROOT / "serve" / "web" / "index.html").read_text(encoding="utf-8")
+                    page = (ROOT.parent / "terminal" / "serve" / "web" / "index.html").read_text(encoding="utf-8")
                     page = page.replace("</head>", '<link rel="stylesheet" href="sycl-web/switcher.css">\n</head>', 1)
                     page = page.replace("</body>", '<script src="sycl-web/switcher.js"></script>\n</body>', 1)
                     self._send(page.encode("utf-8"), "text/html; charset=utf-8")
@@ -195,9 +196,10 @@ def install_logprobs():
 
     keys = Eng.sampling_keys
 
-    def sampling_keys(sampling):
-        k = top_logprobs(sampling or {})
-        return keys(sampling) + (f" logprobs={k}" if k is not None else "")
+    def sampling_keys(sampling, **kw):
+        s = sampling or {}
+        k = top_logprobs(s)
+        return keys(s, **kw) + (f" logprobs={k}" if k is not None else "")
     Eng.sampling_keys = staticmethod(sampling_keys)
 
     generate = Eng.generate

@@ -5,7 +5,6 @@
 #include <cstdlib>
 #include <cstring>
 #include "strata/kernels/qsa_select.hpp"
-#include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/qsa_two_pass.hpp"
 #include "strata/kernels/qsa_two_pass_status.hpp"
 #include "strata/kernels/gfx_arch.hpp"
@@ -35,18 +34,7 @@ __device__ __forceinline__ uint32_t order_key(float s) {
     return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
 }
 
-// S7-3: one lane's four pooled keys, from FP32 or FP16 storage.  FP16 expands EXACTLY (f32_from_f16):
-// the dot, the shuffle order and the score bits are the FP32 kernel's, computed on rounded inputs - which is
-// exactly what STRATA_IDX_FP16_CHECK measured.
-__device__ __forceinline__ float4 pool4(const float* p, size_t i) { return *reinterpret_cast<const float4*>(p + i); }
-__device__ __forceinline__ float4 pool4(const uint16_t* p, size_t i) {
-    const uint2 u = *reinterpret_cast<const uint2*>(p + i);   // 4 halfs, 8 bytes, aligned like the f32 float4 was
-    return float4{f32_from_f16((uint16_t) (u.x & 0xffffu)), f32_from_f16((uint16_t) (u.x >> 16)),
-                  f32_from_f16((uint16_t) (u.y & 0xffffu)), f32_from_f16((uint16_t) (u.y >> 16))};
-}
-
-template <typename P>
-__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_kernel(const P* __restrict__ pooled,
+__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_kernel(const float* __restrict__ pooled,
                                                                         const float* __restrict__ dead,
                                                                         const float* __restrict__ q_idx,
                                                                         const int32_t* __restrict__ steps,
@@ -57,8 +45,8 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_kernel(const P*
     const int64_t b = (int64_t) blockIdx.x * SCORE_WARPS + (threadIdx.x >> 5);
     if (b > n_bid || b >= max_blocks) return;
     const int lane = threadIdx.x & 31;
-    const float4 k4 = (b == n_bid) ? *reinterpret_cast<const float4*>(dead + lane * 4)   // dead stays FP32 in both formats
-                                   : pool4(pooled, (size_t) b * IDX_DIM + lane * 4);
+    const float* key = (b == n_bid) ? dead : pooled + b * IDX_DIM;
+    const float4 k4 = *reinterpret_cast<const float4*>(key + lane * 4);
     const float* q = q_idx + qi * IDX_HEADS * IDX_DIM + lane * 4;
     float score = 0.0f;
 #pragma unroll
@@ -988,8 +976,7 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
 // qsa_block_scores takes it for every call without an active-block count and at most MQ queries: the captured decode
 // window, the uncaptured decode, and prefill's pooled16 call.
 constexpr int MQ = 8;
-template <typename P>
-__device__ __forceinline__ void block_scores_multi_body(const P* __restrict__ pooled,
+__device__ __forceinline__ void block_scores_multi_body(const float* __restrict__ pooled,
                                                         const float* __restrict__ dead,
                                                         const float* __restrict__ q_idx,
                                                         const int32_t* __restrict__ steps, int nq, int64_t max_blocks,
@@ -1019,14 +1006,14 @@ __device__ __forceinline__ void block_scores_multi_body(const P* __restrict__ po
     for (int64_t b = (int64_t) blockIdx.x * SCORE_WARPS + (threadIdx.x >> 5); b <= top && b < max_blocks; b += wstride) {
         // srow.n > 0: each query reads its own sequence's keys; else one set of keys for every query
         const bool own = srow.n > 0;
-        const float4 kp = own ? float4{} : pool4(pooled, (size_t) b * IDX_DIM + lane * 4);
+        const float4 kp = own ? float4{} : *reinterpret_cast<const float4*>(pooled + b * IDX_DIM + lane * 4);
         const float4 kd = own ? float4{} : *reinterpret_cast<const float4*>(dead + lane * 4);
         for (int qi = 0; qi < nq; ++qi) {
             const int64_t n_bid = s_nbid[qi];
             if (b > n_bid) continue;
             const float4 k4 = !own ? ((b == n_bid) ? kd : kp)
                             : (b == n_bid) ? *reinterpret_cast<const float4*>(srow.dead[qi] + lane * 4)
-                                           : pool4(reinterpret_cast<const P*>(srow.pooled[qi]), (size_t) b * IDX_DIM + lane * 4);
+                                           : *reinterpret_cast<const float4*>(srow.pooled[qi] + b * IDX_DIM + lane * 4);
             const float* q = qs + qi * IDX_HEADS * IDX_DIM + lane * 4;
             float score = 0.0f;
 #pragma unroll
@@ -1045,14 +1032,13 @@ __device__ __forceinline__ void block_scores_multi_body(const P* __restrict__ po
     }
 }
 
-template <typename P>
-__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(const P* __restrict__ pooled,
+__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(const float* __restrict__ pooled,
                                                                               const float* __restrict__ dead,
                                                                               const float* __restrict__ q_idx,
                                                                               const int32_t* __restrict__ steps, int nq,
                                                                               int64_t max_blocks, float* __restrict__ out,
                                                                               bool early_exit, QsaScoreRows srow = {}) {
-    block_scores_multi_body<P>(pooled, dead, q_idx, steps, nq, max_blocks, out, early_exit, srow);
+    block_scores_multi_body(pooled, dead, q_idx, steps, nq, max_blocks, out, early_exit, srow);
 }
 
 // Queries of different slots, each with its own indexer keys: blockIdx.y is the query, and its CTAs run exactly the
@@ -1061,7 +1047,6 @@ struct ScoreSlotKeys {
     const float* pooled[MQ];
     const float* dead[MQ];
 };
-template <typename P>
 __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_slots_kernel(ScoreSlotKeys keys,
                                                                               const float* __restrict__ q_idx,
                                                                               const int32_t* __restrict__ steps,
@@ -1074,7 +1059,7 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_slots_kernel(Sc
 #pragma unroll
     for (unsigned i = 1; i < MQ; ++i)
         if (z == i) { pooled = keys.pooled[i]; dead = keys.dead[i]; }
-    block_scores_multi_body<P>(reinterpret_cast<const P*>(pooled), dead, q_idx + (size_t) z * IDX_HEADS * IDX_DIM,
+    block_scores_multi_body(pooled, dead, q_idx + (size_t) z * IDX_HEADS * IDX_DIM,
                             steps + (size_t) z * kStepCount, 1, max_blocks, out + (size_t) z * max_blocks, early_exit,
                             QsaScoreRows{});
 }
@@ -1090,11 +1075,11 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_slots_kernel(Sc
 // same level (float add commutes), the dot expression is the same text in the same file, the relu-and-add runs over the
 // heads in the same order: the same score bits.  The tail block and the +1e9 are as in the multi kernel.
 template <int NQ>
-__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_rows_kernel(const float* __restrict__ pooled,
-                                                                             const float* __restrict__ dead,
-                                                                             const float* __restrict__ q_idx,
-                                                                             const int32_t* __restrict__ steps, int nq,
-                                                                             int64_t max_blocks, float* __restrict__ out) {
+__device__ __forceinline__ void block_scores_rows_body(const float* __restrict__ pooled,
+                                                       const float* __restrict__ dead,
+                                                       const float* __restrict__ q_idx,
+                                                       const int32_t* __restrict__ steps, int nq,
+                                                       int64_t max_blocks, float* __restrict__ out) {
     __shared__ int64_t s_nkv[NQ], s_nbid[NQ];
     if (threadIdx.x < nq) {
         s_nkv[threadIdx.x] = steps[threadIdx.x * kStepCount + kStepNKv];
@@ -1153,6 +1138,63 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_rows_kernel(con
             }
         }
     }
+}
+
+template <int NQ>
+__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_rows_kernel(const float* __restrict__ pooled,
+                                                                             const float* __restrict__ dead,
+                                                                             const float* __restrict__ q_idx,
+                                                                             const int32_t* __restrict__ steps, int nq,
+                                                                             int64_t max_blocks, float* __restrict__ out) {
+    block_scores_rows_body<NQ>(pooled, dead, q_idx, steps, nq, max_blocks, out);
+}
+
+// Slot-grouped block scores: blockIdx.y selects one slot group g, reading that slot's pooled/dead
+// keys once across all ntok[g] contiguous draft rows with the exact QSAROWS reduce-scatter arithmetic (bitwise).
+template <int MAX_NQ>
+__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_slot_groups_rows_kernel(
+    QsaScoreGroups groups, const float* __restrict__ q_idx, const int32_t* __restrict__ steps, int64_t max_blocks,
+    float* __restrict__ out) {
+    const unsigned g = blockIdx.y;
+    const float* pooled = groups.pooled[0];
+    const float* dead = groups.dead[0];
+    int first = groups.first[0];
+    int ntok = groups.ntok[0];
+#pragma unroll
+    for (unsigned i = 1; i < (unsigned) kScoreMaxGroups; ++i) {
+        if (g == i) {
+            pooled = groups.pooled[i];
+            dead = groups.dead[i];
+            first = groups.first[i];
+            ntok = groups.ntok[i];
+        }
+    }
+    block_scores_rows_body<MAX_NQ>(pooled, dead, q_idx + (size_t) first * IDX_HEADS * IDX_DIM,
+                                   steps + (size_t) first * kStepCount, ntok, max_blocks,
+                                   out + (size_t) first * max_blocks);
+}
+
+// Slot-grouped fallback for groups with 5..MQ rows or STRATA_QSA_ROWS=0: same bitwise block_scores_multi_body.
+__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_slot_groups_multi_kernel(
+    QsaScoreGroups groups, const float* __restrict__ q_idx, const int32_t* __restrict__ steps, int64_t max_blocks,
+    float* __restrict__ out, bool early_exit) {
+    const unsigned g = blockIdx.y;
+    const float* pooled = groups.pooled[0];
+    const float* dead = groups.dead[0];
+    int first = groups.first[0];
+    int ntok = groups.ntok[0];
+#pragma unroll
+    for (unsigned i = 1; i < (unsigned) kScoreMaxGroups; ++i) {
+        if (g == i) {
+            pooled = groups.pooled[i];
+            dead = groups.dead[i];
+            first = groups.first[i];
+            ntok = groups.ntok[i];
+        }
+    }
+    block_scores_multi_body(pooled, dead, q_idx + (size_t) first * IDX_HEADS * IDX_DIM,
+                            steps + (size_t) first * kStepCount, ntok, max_blocks, out + (size_t) first * max_blocks,
+                            early_exit, QsaScoreRows{});
 }
 
 #if defined(__HIPCC__)
@@ -1247,7 +1289,7 @@ int scores_thread_arch() {
         cudaDeviceProp properties{};
         arch = 0;
         if (cudaGetDeviceProperties(&properties, device) == cudaSuccess)
-            arch = gfx_arch_is_gfx12(properties.gcnArchName) ? 2 : gfx_arch_is(properties.gcnArchName, "gfx1100") ? 1 : 0;
+            arch = gfx_arch_is_gfx12(properties.gcnArchName) ? 2 : gfx_arch_is_discrete_rdna3(properties.gcnArchName) ? 1 : 0;
         cached_device = device;
         cudaGetLastError();
     }
@@ -1966,14 +2008,47 @@ bool qsa_block_scores_slots(const float* const* pooled, const float* const* dead
         keys.pooled[z] = pooled[z];
         keys.dead[z] = dead[z];
     }
-    if (s.idx_pool_f16)
-        block_scores_slots_kernel<uint16_t><<<dim3(256, (unsigned) nq), SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(
-            keys, q_idx, steps, max_blocks, scores, scores_early_exit());
-    else
-        block_scores_slots_kernel<float><<<dim3(256, (unsigned) nq), SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(
-            keys, q_idx, steps, max_blocks, scores, scores_early_exit());
+    block_scores_slots_kernel<<<dim3(256, (unsigned) nq), SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(
+        keys, q_idx, steps, max_blocks, scores, scores_early_exit());
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_slots: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    return true;
+}
+
+bool qsa_block_scores_slot_groups(const QsaScoreGroups& groups, const float* q_idx, const int32_t* steps,
+                                  int64_t max_blocks, const QsaShapes& s, float* scores, void* stream) {
+    if (groups.ng <= 0) return true;
+    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R) {
+        std::fprintf(stderr, "qsa_block_scores_slot_groups: unsupported indexer geometry\n");
+        std::exit(1);
+    }
+    if (groups.ng > kScoreMaxGroups || !scores_multi_on()) return false;
+    int max_ntok = 0;
+    for (int g = 0; g < groups.ng; ++g) {
+        if (groups.ntok[g] < 1 || groups.ntok[g] > MQ || !groups.pooled[g] || !groups.dead[g]) return false;
+        if (groups.ntok[g] > max_ntok) max_ntok = groups.ntok[g];
+    }
+    static const bool rows_env = [] {
+        const char* v = std::getenv("STRATA_QSA_ROWS");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    const dim3 grid(256u, (unsigned) groups.ng);
+    const cudaStream_t st = (cudaStream_t) stream;
+    if (rows_env && max_ntok <= 4) {
+        if (max_ntok == 1)
+            block_scores_slot_groups_rows_kernel<1><<<grid, SCORE_WARPS * 32, 0, st>>>(groups, q_idx, steps, max_blocks, scores);
+        else if (max_ntok == 2)
+            block_scores_slot_groups_rows_kernel<2><<<grid, SCORE_WARPS * 32, 0, st>>>(groups, q_idx, steps, max_blocks, scores);
+        else if (max_ntok == 3)
+            block_scores_slot_groups_rows_kernel<3><<<grid, SCORE_WARPS * 32, 0, st>>>(groups, q_idx, steps, max_blocks, scores);
+        else
+            block_scores_slot_groups_rows_kernel<4><<<grid, SCORE_WARPS * 32, 0, st>>>(groups, q_idx, steps, max_blocks, scores);
+    } else {
+        block_scores_slot_groups_multi_kernel<<<grid, SCORE_WARPS * 32, 0, st>>>(groups, q_idx, steps, max_blocks,
+                                                                                 scores, scores_early_exit());
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_slot_groups: %s\n", cudaGetErrorString(e)); std::exit(1); }
     return true;
 }
 
@@ -2077,6 +2152,15 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_halve_kernel(co
 // #1825: the prompt path's thread-per-head scorer (bitwise the warp kernel's scores).  Default: Turing with
 // STRATA_SM75_PERF=1 (the P100 gain measured here is +1..3% at 30-60K tokens, under the 3% bar for a new default);
 // STRATA_SCORES_THREAD=1 turns it on, =0 off, on any CUDA card
+static bool sm70_default_on(int major, int minor) {
+    static const bool perf_on = [] {
+        const char* e = std::getenv("STRATA_SM70_PERF");
+        const char* d = std::getenv("STRATA_DEFAULTS");
+        return (e == nullptr || e[0] != '0') && !(d != nullptr && std::strcmp(d, "026") == 0);
+    }();
+    return strata::cc_of(major, minor) == 70 && perf_on;
+}
+
 bool scores_thread_on() {
     static const int env = [] { const char* v = std::getenv("STRATA_SCORES_THREAD"); return v ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
     if (env >= 0) return env != 0;
@@ -2087,7 +2171,7 @@ bool scores_thread_on() {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        ok[dev] = strata::sm75_default(major, minor) ? 1 : 2;   // Turing, STRATA_SM75_PERF=1
+        ok[dev] = (strata::sm75_default(major, minor) || sm70_default_on(major, minor)) ? 1 : 2;   // Turing / Volta
     }
     return ok[dev] == 1;
 }
@@ -2102,7 +2186,7 @@ bool scores_halve_on() {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        ok[dev] = strata::sm75_default(major, minor) ? 1 : 2;   // Turing, STRATA_SM75_PERF=1
+        ok[dev] = (strata::sm75_default(major, minor) || sm70_default_on(major, minor)) ? 1 : 2;   // Turing / Volta
     }
     return ok[dev] == 1;
 }
@@ -2119,7 +2203,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         // QSAROWS: STRATA_QSA_ROWS=1 (exactly) takes block_scores_rows_kernel for calls of up to 4 queries - the same bits
         static const bool rows_env = [] { const char* v = std::getenv("STRATA_QSA_ROWS"); return v != nullptr && v[0] == '1' && v[1] == '\0'; }();
         if (rows_env && qsa_block_scores_rows(pooled, dead, q_idx, steps, nq, max_blocks, s, scores, stream)) return;
-        if (scores_halve_on() && !s.idx_pool_f16) {   // Turing: block_scores_halve_kernel, the same bits; S7-3: the f16 pool takes multi below
+        if (scores_halve_on()) {   // Turing: block_scores_halve_kernel, the same bits
             const cudaStream_t st = (cudaStream_t) stream;
             if (nq <= 1) block_scores_halve_kernel<4><<<256, SCORE_WARPS * 32, 0, st>>>(pooled, dead, q_idx, steps, (int) nq, max_blocks, scores);
             else if (nq <= 2) block_scores_halve_kernel<8><<<256, SCORE_WARPS * 32, 0, st>>>(pooled, dead, q_idx, steps, (int) nq, max_blocks, scores);
@@ -2138,12 +2222,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
             if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores halve: %s\n", cudaGetErrorString(e)); std::exit(1); }
             return;
         }
-        if (s.idx_pool_f16)
-            block_scores_multi_kernel<uint16_t><<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(
-                reinterpret_cast<const uint16_t*>(pooled), dead, q_idx, steps, (int) nq,
-                max_blocks, scores, scores_early_exit());
-        else
-            block_scores_multi_kernel<float><<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, (int) nq,
+        block_scores_multi_kernel<<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, (int) nq,
                                                                                      max_blocks, scores, scores_early_exit());
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores multi: %s\n", cudaGetErrorString(e)); std::exit(1); }
@@ -2157,7 +2236,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         return value == nullptr ? -1 : (std::atoi(value) == 1 ? 1 : 0);
     }();
     // The bound is the ACTUAL live extent. A reserved 256K context never enables this by itself.
-    if (thread_env != 0 && !s.idx_pool_f16 && active_blocks >= 16385 && active_blocks <= max_blocks && nq >= 64 &&
+    if (thread_env != 0 && active_blocks >= 16385 && active_blocks <= max_blocks && nq >= 64 &&
         (scores_thread_arch() == 2 || (thread_env == 1 && scores_thread_arch() == 1))) {
         static thread_local bool logged = false;
         if (!logged && (thread_env == -1 || std::getenv("STRATA_SCORES_THREAD_TRACE"))) {
@@ -2181,7 +2260,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
 #else
     // prompt calls (an active-block count): the thread-per-head kernel, the same bits (opt-in: scores_thread_on); else the
     // warp kernel below
-    if (active_blocks > 0 && scores_thread_on() && !s.idx_pool_f16) {
+    if (active_blocks > 0 && scores_thread_on()) {
         const dim3 tgrid((unsigned) ((reach + TS_BR - 1) / TS_BR), (unsigned) ((nq + TS_Q - 1) / TS_Q));
         block_scores_thread_kernel<<<tgrid, 256, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach,
                                                                              scores);
@@ -2192,11 +2271,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     }
 #endif
     const dim3 grid((unsigned) ((reach + SCORE_WARPS - 1) / SCORE_WARPS), (unsigned) nq);
-    if (s.idx_pool_f16)
-        block_scores_kernel<uint16_t><<<grid, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(
-            reinterpret_cast<const uint16_t*>(pooled), dead, q_idx, steps, max_blocks, scores);
-    else
-        block_scores_kernel<float><<<grid, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, max_blocks,
+    block_scores_kernel<<<grid, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, max_blocks,
                                                                               scores);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores: %s\n", cudaGetErrorString(e)); std::exit(1); }
@@ -2205,7 +2280,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
 bool qsa_block_scores_rows(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                            int64_t max_blocks, const QsaShapes& s, float* scores, void* stream) {
     if (nq <= 0) return true;
-    if (nq > 4 || s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || s.idx_pool_f16) return false;
+    if (nq > 4 || s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R) return false;
     cudaStream_t st = (cudaStream_t) stream;
     const int n = (int) nq;
     if (n == 1) block_scores_rows_kernel<1><<<256, SCORE_WARPS * 32, 0, st>>>(pooled, dead, q_idx, steps, n, max_blocks, scores);
@@ -2225,11 +2300,7 @@ void qsa_block_scores_rows(const QsaScoreRows& rows, const float* q_idx, const i
         std::exit(1);
     }
     static const bool early = [] { const char* v = std::getenv("STRATA_QSA_EARLY_EXIT"); return v == nullptr || std::atoi(v) != 0; }();
-    if (s.idx_pool_f16)
-        block_scores_multi_kernel<uint16_t><<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(nullptr, nullptr, q_idx, steps, (int) nq,
-                                                                                 max_blocks, scores, early, rows);
-    else
-        block_scores_multi_kernel<float><<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(nullptr, nullptr, q_idx, steps, (int) nq,
+    block_scores_multi_kernel<<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(nullptr, nullptr, q_idx, steps, (int) nq,
                                                                                  max_blocks, scores, early, rows);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_rows: %s\n", cudaGetErrorString(e)); std::exit(1); }
@@ -2238,7 +2309,7 @@ void qsa_block_scores_rows(const QsaScoreRows& rows, const float* q_idx, const i
 bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                          int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {
     if (nq <= 0) return true;
-    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > 65535 * TC_QT || s.idx_pool_f16) return false;
+    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > 65535 * TC_QT) return false;
 #if defined(__HIPCC__)
     // AMD: the gfx12 (RDNA4) WMMA scorer, opt-in (STRATA_SELECT_WMMA=1): it selects slightly differently from the warp
     // kernel (254/256 queries the same), so the default keeps the warp kernel; every other target keeps it too (false)
@@ -2398,7 +2469,7 @@ static bool topk_active_turing_device() {
     if (dev != cached_device) {
         cudaDeviceProp prop{};
         if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return false;
-        turing = prop.major == 7 && prop.minor == 5;
+        turing = (prop.major == 7 && prop.minor == 5) || sm70_default_on(prop.major, prop.minor);
         cached_device = dev;
     }
     return turing;
@@ -2737,6 +2808,10 @@ bool qsa_block_topk_split(const float* scores, const int32_t* steps, int64_t nq,
 // order.  Otherwise (too few cells above LB, or more than SM_CAP candidates) the query is flagged and
 // block_topk_wide_kernel<true> runs it.  STRATA_TOPK_SAMPLE=0 keeps the wide kernel alone.
 constexpr int TS_STRIDE = 32, TS_CAP = 4096;
+// Past TS_CAP * TS_STRIDE blocks (524,288 cells) the sampling stride doubles (64 up to 1M cells, 128 up to 2M) instead of
+// failing every query at `ns > TS_CAP`, which handed the whole second half of a 1M prompt to the six-read wide kernel.
+// The candidate budget, the threshold and the emit are unchanged, so the ids stay the reference's.
+constexpr int TS_STRIDE_MAX = 128;
 
 __device__ __forceinline__ int ts_block_scan(int v, int* s_w) {   // exclusive scan over the CTA's TK_T threads
     const int t = threadIdx.x, lane = t & 31, w = t >> 5;
@@ -2779,14 +2854,16 @@ __global__ void __launch_bounds__(TK_T) block_topk_sample_kernel(const float* __
     const float* sc = scores + qi * max_blocks;
     const int64_t nb = n_bid + 1;
     auto weight = [&](int64_t b) -> int { return b < n_bid ? R : (int) (n_kv - n_bid * R); };
-    const int ns = (int) ((nb + TS_STRIDE - 1) / TS_STRIDE);
+    int ts = TS_STRIDE;                           // the sampling stride: a function of nb, so uniform over the CTA
+    while (ts < TS_STRIDE_MAX && nb > (int64_t) TS_CAP * ts) ts <<= 1;
+    const int ns = (int) ((nb + ts - 1) / ts);
     if (ns > TS_CAP) { if (t == 0) g_tk_fail[qi] = 1; return; }
-    // 1. the bound: the KS-th largest of every 32nd block's key (a block without cells counts as the smallest key)
+    // 1. the bound: the KS-th largest of every ts-th block's key (a block without cells counts as the smallest key)
     for (int i = t; i < ns; i += TK_T) {
-        const int64_t b = (int64_t) i * TS_STRIDE;
+        const int64_t b = (int64_t) i * ts;
         s_key[i] = weight(b) ? order_key(sc[b]) : 0u;
     }
-    const int ks_want = (int) (2 * ((width + R * TS_STRIDE - 1) / (R * TS_STRIDE)) + 16);
+    const int ks_want = (int) (2 * ((width + R * ts - 1) / (R * ts)) + 16);
     int need = ks_want < ns ? ks_want : ns;
     uint32_t prefix = 0;
     for (int shift = 24; shift >= 0; shift -= 8) {
@@ -2930,7 +3007,7 @@ bool topk_sample_on() {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        ok[dev] = strata::sm75_default(major, minor) ? 1 : 2;
+        ok[dev] = (strata::sm75_default(major, minor) || sm70_default_on(major, minor)) ? 1 : 2;
     }
     return ok[dev] == 1;
 }
@@ -3042,9 +3119,10 @@ static bool scores_dx_device(int& sms) {
     static thread_local int cached_device = -1, cached_sms = 0;
     static thread_local bool pascal = false;
     if (dev != cached_device) {
-        int major = 0;
+        int major = 0, minor = 0;
         pascal = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-                 strata::cc_major_of(major) == 6;
+                 cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess &&
+                 (strata::cc_major_of(major) == 6 || sm70_default_on(major, minor));
         if (cudaDeviceGetAttribute(&cached_sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) cached_sms = 0;
         cudaGetLastError();
         cached_device = dev;
@@ -3107,9 +3185,10 @@ static int topk_multi_mode() {
     static thread_local int cached_device = -1;
     static thread_local int mode = 0;
     if (dev != cached_device) {
-        int major = 0;
+        int major = 0, minor = 0;
         mode = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-                       strata::cc_major_of(major) == 6 ? 2 : 0;
+               cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess &&
+               (strata::cc_major_of(major) == 6 || sm70_default_on(major, minor)) ? 2 : 0;
         cudaGetLastError();
         cached_device = dev;
     }
@@ -3169,7 +3248,7 @@ void qsa_block_topk_long(const float* scores, const int32_t* steps, int64_t nq, 
 void qsa_block_scores_long(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                            int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {
 #if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
-    if (nq > 0 && !s.idx_pool_f16 && s.idx_dim == IDX_DIM && s.idx_n_head == IDX_HEADS && s.idx_block == R && scores_multi_on() &&
+    if (nq > 0 && s.idx_dim == IDX_DIM && s.idx_n_head == IDX_HEADS && s.idx_block == R && scores_multi_on() &&
         nq <= MQ && active_blocks <= 0 &&
         qsa_block_scores_dx(pooled, dead, q_idx, steps, nq, max_blocks, scores, stream))
         return;
@@ -3841,8 +3920,7 @@ uint64_t qsa_two_pass_scratch_bytes(int64_t nq_cap, int64_t max_blocks) { return
 
 bool qsa_two_pass_keys(const float* pooled, int64_t n_blocks, int64_t nq_cap, int64_t max_blocks, void* scratch,
                        uint64_t scratch_bytes, void* stream) {
-    if (!qsa_two_pass_on() || !tp_device_ok() || n_blocks > max_blocks || nq_cap <= 0 || nq_cap > 4096 ||
-        qsa_real_shapes().idx_pool_f16) return false;
+    if (!qsa_two_pass_on() || !tp_device_ok() || n_blocks > max_blocks || nq_cap <= 0 || nq_cap > 4096) return false;
     const two_pass::Layout L = two_pass::layout(nq_cap, max_blocks);
     if (scratch == nullptr || scratch_bytes < L.total || (reinterpret_cast<uintptr_t>(scratch) & 15u) != 0) return false;
     if (n_blocks <= 0) return true;
@@ -3858,7 +3936,7 @@ bool qsa_block_scores_two_pass(const float* pooled, const float* dead, const flo
                                void* scratch, uint64_t scratch_bytes, void* stream, int64_t active_blocks) {
     if (nq <= 0) return true;
     if (!qsa_two_pass_on() || s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R ||
-        nq > nq_cap || nq_cap > 4096 || s.idx_pool_f16 || !tp_device_ok())
+        nq > nq_cap || nq_cap > 4096 || !tp_device_ok())
         return false;
     const two_pass::Layout L = two_pass::layout(nq_cap, max_blocks);
     if (scratch == nullptr || scratch_bytes < L.total || (reinterpret_cast<uintptr_t>(scratch) & 15u) != 0) return false;

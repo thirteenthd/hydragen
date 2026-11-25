@@ -63,28 +63,6 @@ inline KvHostPools kv_hybrid_v_half(const KvHostPools& h) {
 }
 
 /// The residency map of a streamed layer, all device memory at fixed addresses (the graphs bake them in).
-/// cow-m1d: one registered streamed state, scanned by resolve for join-at-fetch. Only `conv` mutates
-/// after init, and only as a single 4-byte aligned store, so a concurrent scan never sees a torn entry.
-struct CowPeer {
-    int32_t conv = -1;      ///< fork lineage; -1: not in any lineage, never joins and never joined
-    int32_t hhead = 0;      ///< join headroom: joined pins cost the FETCHER's window, so a range takes at most this many foreign joins (device-atomic; the host seeds it at init/reset)
-    int32_t ord = 0;        ///< QSA ordinal: the join target must share the layer arena
-    int32_t base = 0;       ///< slot_base of the state's arena range
-    int32_t n_slots = 0;
-    int32_t n_blocks = 0;   ///< its table's length
-    int32_t* pt = nullptr;  ///< its page table (null: entry free)
-    int32_t floor = 0x7FFFFFFF;  ///< cow-m1e: byte-identity floor in COMPLETE pages: blocks >= floor
-                                 ///< diverge across the lineage (each member generates its own tail), so
-                                 ///< no sharing path may name them. Lowered by every fork of the lineage.
-};
-
-/// cow-m1e: a lineage hint table (one of kCowLinTabs rolling tables per arena): block -> the block's
-/// shared-region slot, -1 never fetched there, -2 fetch in flight. A map consults the table indexed
-/// by its registry conv % kCowLinTabs, so one table serves the whole fork lineage; the host zeroes
-/// it when a tab slot is handed to a new lineage (stale hints from a dead lineage would only cost a
-/// rollback round-trip, never a corruption).
-inline constexpr int kCowLinTabs = 16;
-
 struct KvStreamMap {
     int32_t* page_table = nullptr;  ///< (n_blocks,) block -> slot, or -1
     int32_t* slot_block = nullptr;  ///< (n_slots,) slot -> block, or -1
@@ -95,47 +73,14 @@ struct KvStreamMap {
     int32_t* miss_slot = nullptr;   ///< (n_slots,)
     int64_t n_blocks = 0;
     int64_t n_slots = 0;
-    /// cow-m1: this map's local slot j names pool page (slot_base + j) in the layer's global arena;
-    /// 0: the pool is private and the identity holds. Set once at state init; graph-baked.
-    int64_t slot_base = 0;
-    /// cow-m1: (arena capacity,) refcounts over arena pages, host-managed (fork/release), device-read by
-    /// the clock sweep: a slot named by another session's table (use > 1) is never taken as its owner's victim.
-    int* slot_use = nullptr;
-    /// cow-m1d: join-at-fetch registry (arena-global device array, entries registered at state init).
-    CowPeer* reg = nullptr;
-    int reg_n = 0;
-    unsigned long long* join_ctr = nullptr;   ///< telemetry: joins of this arena
-    /// cow-m1e: the per-lineage shared region at the arena's far end: slots [shared_base,
-    /// shared_base + n_shared) owned by NO session window. A lineage member missing a cold block
-    /// consults its hint table first: a sibling's fetched page is adopted with a refcount pin (one
-    /// host->VRAM copy per LINEAGE, not per window), and a block nobody fetched claims the hint so
-    /// the fetch lands on a region slot whose eviction clock is the region's own sweep. A region
-    /// slot is victimizable only while slot_use == 0: no live table entry names it, hence no gather
-    /// can be reading it - the PIN LAW holds by construction and pinning a shared page costs no
-    /// session window anything. Null/zero when sharing is off: every code path degrades to M-C1d.
-    int32_t* lin_all = nullptr;       ///< (kCowLinTabs, n_blocks) rolling lineage hint tables
-    int32_t shared_base = 0;          ///< arena-global slot index where the region starts
-    int32_t n_shared = 0;             ///< 0: sharing off for this map
-    int32_t* sblk = nullptr;          ///< (n_shared,) shared slot -> block it holds, or -1
-    int32_t* sst  = nullptr;          ///< (n_shared,) epoch stamp (per-map epochs: aliasing only skips a candidate, conservative)
-    int32_t* srf  = nullptr;          ///< (n_shared,) clock reference bit
-    int32_t* miss_sh = nullptr;       ///< (n_slots,) blocks whose lineage fetch this call claimed
-    int32_t* miss_sh_slot = nullptr;  ///< (n_slots,) their arena-global slots (same slot_base basis as miss_slot)
-    unsigned long long* sh_ctr = nullptr; ///< telemetry: committed lineage fetches
 };
 
 inline constexpr int kKvCtlInts = 16;   ///< [0] epoch [1] hand [2] misses [3] overflow; u64 at [4] misses, [6] lookups, [8] calls
 /// Bytes of the map's arrays besides the page table (which the state already has): 5 per-slot ints + ctl.
-inline uint64_t kv_stream_map_bytes(int64_t n_slots) { return (uint64_t) n_slots * 4 * 7 + kKvCtlInts * 4; }   // cow-m1e: + miss_sh, miss_sh_slot
+inline uint64_t kv_stream_map_bytes(int64_t n_slots) { return (uint64_t) n_slots * 4 * 5 + kKvCtlInts * 4; }
 
 /// Every block evicted: page table all -1, slots free, counters zero.
 void kv_stream_reset(const KvStreamMap& m, void* stream);
-
-/// cow-m1d: after a host-side admission splice: re-hold every spliced entry whose source still names the
-/// same page (device atomicAdd, racing no host read-modify-write), revert the rest to cold. And before a
-/// map reset: drop the holds this map pins on foreign pages. Both grid-stride table scans.
-void kv_stream_cow_fork_join(const KvStreamMap& to, const KvStreamMap& from, void* stream);
-void kv_stream_cow_release(const KvStreamMap& m, void* stream);
 
 /// Make every block named by the selections of `n_q` queries resident (ids [n_q][cap], width from
 /// steps[q * kStepCount + kStepWidth]). Capturable. `n_slots` must hold the distinct blocks of one call
@@ -143,6 +88,23 @@ void kv_stream_cow_release(const KvStreamMap& m, void* stream);
 void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const KvHostPools& host, int fmt,
                        const int32_t* ids, const int32_t* steps, int64_t n_q, int64_t cap, const QsaShapes& s,
                        void* stream);
+
+/// Multi-slot grouped KV resolve: resolves up to kKvResolveMaxGroups distinct streamed slots in
+/// one resolve launch (`grid = ng`) and one copy launch (`grid = (copy_x, ng)`). Every group in `g` MUST name a
+/// distinct KvStreamMap (cross-slot disjointness) and satisfy `ntok[i] * max_pages_per_q <= map[i].n_slots`.
+inline constexpr int kKvResolveMaxGroups = 8;
+struct KvResolveGroups {
+    KvStreamMap  map[kKvResolveMaxGroups] = {};
+    QsaAttnPools slots[kKvResolveMaxGroups] = {};
+    KvHostPools  host[kKvResolveMaxGroups] = {};
+    int fmt[kKvResolveMaxGroups] = {};
+    int first[kKvResolveMaxGroups] = {};
+    int ntok[kKvResolveMaxGroups] = {};
+    int ng = 0;
+};
+
+void kv_stream_resolve_groups(const KvResolveGroups& g, const int32_t* ids, const int32_t* steps, int64_t cap,
+                              const QsaShapes& s, void* stream);
 
 /// The static ring table `block -> block % n_slots`.
 void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void* stream);
@@ -166,6 +128,7 @@ void kv_unstage_to_host(const QsaAttnPools& stage, const KvHostPools& host, int 
 struct KvStreamCounters {
     uint64_t misses = 0, lookups = 0, calls = 0;
     bool overflow = false;
+    uint32_t overflow_count = 0;
 };
 /// Synchronous read of the counters (debug and the end-of-request summary).
 KvStreamCounters kv_stream_counters(const KvStreamMap& m);

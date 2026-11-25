@@ -6,7 +6,7 @@ import json, sys
 from pathlib import Path
 
 repo, tdir = Path(sys.argv[1]), Path(sys.argv[2])
-sys.path.insert(0, str(repo / "tools"))
+sys.path.insert(0, str(repo.parent / "terminal" / "tools"))
 import strata_tokenizer as ST
 
 vocab = json.loads((tdir / "vocab.json").read_text(encoding="utf-8"))

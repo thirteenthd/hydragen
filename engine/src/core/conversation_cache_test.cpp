@@ -2,7 +2,23 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <new>
+#include <string>
 #include <vector>
+
+// Count or fail individual deque allocations without adding production hooks.
+static long fail_after = -1;
+static bool count_allocations = false;
+static size_t allocation_count = 0;
+void* operator new(std::size_t n) {
+    if (count_allocations) ++allocation_count;
+    if (fail_after == 0) throw std::bad_alloc();
+    if (fail_after > 0) --fail_after;
+    if (void* p = std::malloc(n ? n : 1)) return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 
 using namespace strata::core;
 
@@ -19,9 +35,352 @@ SavedConversation image(std::initializer_list<int32_t> ids, bool cvec = true) {
     s.cvec = cvec;
     return s;
 }
+
+struct ThrowingPool : SegmentPoolBudget {
+    size_t idle = 0, reclaims = 0, expected_size = 0;
+    uint64_t old_serial = 0, new_serial = 0;
+    ConversationCache* cache = nullptr;
+    bool fail_next = true, saw_staged = false;
+    std::vector<ConversationCheckpoint> released;
+
+    size_t idle_bytes() const override { return idle; }
+    size_t shrink(size_t want) override {
+        ++reclaims;
+        saw_staged = cache && cache->size() == expected_size && cache->find(old_serial) &&
+                     cache->index_of(new_serial) == expected_size - 1;
+        if (fail_next) {
+            fail_next = false;
+            fail_after = 0;
+            try { released.emplace_back(); }
+            catch (...) { fail_after = -1; throw; }
+            fail_after = -1;
+        }
+        const size_t given = std::min(idle, want);
+        idle -= given;
+        return given;
+    }
+};
+
+void pool_reclaim_allocation_failure() {
+    constexpr size_t budget = 1u << 20, held = 256;
+    ThrowingPool pool;
+    ConversationCache cache(budget, 4);
+    ConversationCheckpoint checkpoint;
+    checkpoint.ids = {10, 11}; checkpoint.gdn = {1, 2, 3};
+    auto old = image({10, 11, 12});
+    old.checkpoints.push_back(checkpoint);
+    old.kv.emplace_back(); old.kv.back().k.resize(8, 0x35);
+    check(cache.put(std::move(old)) && cache.put(image({99, 98, 97})), "park entries before pool failure");
+    const uint64_t old_serial = cache.best(std::vector<int32_t>{10, 11, 12, 90}, {}, true).serial;
+    const uint64_t other_serial = cache.best(std::vector<int32_t>{99, 98, 97, 90}, {}, true).serial;
+    const size_t before_bytes = cache.bytes(), old_bytes = cache.find(old_serial)->bytes();
+    auto replacement = image({10, 11, 20});
+    replacement.checkpoints.push_back(checkpoint);
+    replacement.kv.emplace_back(); replacement.kv.back().k.resize(8, 0x5a);
+    const size_t replacement_bytes = replacement.bytes();
+    pool.idle = budget; pool.cache = &cache; pool.expected_size = 3;
+    pool.old_serial = old_serial; pool.new_serial = other_serial + 1;
+    cache.set_pool(&pool);
+    check(cache.can_fit(replacement_bytes, held), "exchange fits before pool reclaim");
+    bool threw = false;
+    try { (void) cache.put_exchanged(std::move(replacement), held); }
+    catch (const std::bad_alloc&) { threw = true; }
+    check(threw && pool.reclaims == 1 && pool.saw_staged,
+          "pool allocation fails after both queue insertions and before old removal");
+    const auto* preserved = cache.find(old_serial);
+    uint8_t old_k = 0, new_k = 0;
+    check(cache.size() == 2 && cache.index_of(old_serial) == 0 && cache.index_of(other_serial) == 1 &&
+          cache.index_of(pool.new_serial) == SIZE_MAX && cache.bytes() == before_bytes &&
+          cache.superseded() == 0 && cache.evictions() == 0 && preserved && preserved->bytes() == old_bytes &&
+          preserved->live.ids == std::vector<int32_t>({10, 11, 12}) &&
+          preserved->checkpoints.size() == 1 && preserved->checkpoints[0].ids == checkpoint.ids &&
+          preserved->checkpoints[0].gdn == checkpoint.gdn && preserved->kv.size() == 1 &&
+          preserved->kv[0].k.read(&old_k, 0, 1) && old_k == 0x35,
+          "pool failure preserves old entries, order, serials, bytes and counters");
+    check(replacement.bytes() == replacement_bytes && replacement.live.ids == std::vector<int32_t>({10, 11, 20}) &&
+          replacement.checkpoints.size() == 1 && replacement.checkpoints[0].ids == checkpoint.ids &&
+          replacement.checkpoints[0].gdn == checkpoint.gdn && replacement.kv.size() == 1 &&
+          replacement.kv[0].k.read(&new_k, 0, 1) && new_k == 0x5a,
+          "pool failure returns the intact replacement for retry");
+    check(cache.put_exchanged(std::move(replacement), held), "retry after pool failure succeeds");
+    const auto inserted = cache.best(std::vector<int32_t>{10, 11, 20, 90}, {}, true);
+    const auto* stored = cache.find(inserted.serial);
+    new_k = 0;
+    check(pool.reclaims == 2 && pool.saw_staged && cache.size() == 2 && cache.find(old_serial) == nullptr &&
+          cache.index_of(other_serial) == 0 && inserted.serial == pool.new_serial &&
+          cache.index_of(inserted.serial) == 1 && cache.bytes() == before_bytes - old_bytes + replacement_bytes &&
+          cache.superseded() == 1 && cache.evictions() == 0 && stored && stored->kv.size() == 1 &&
+          stored->kv[0].k.read(&new_k, 0, 1) && new_k == 0x5a,
+          "pool retry removes only the intended old entry and assigns its serial once");
+}
+
+void publication_allocation_failures() {
+    // Find a real deque boundary where each push allocates. This avoids assuming
+    // a particular standard library's block size or adding a production hook.
+    size_t seed_count = 0, serial_allocations = 0;
+    {
+        std::deque<uint64_t> serials;
+        std::deque<SavedConversation> entries;
+        for (size_t n = 0; n < 4096; ++n) {
+            allocation_count = 0; count_allocations = true;
+            serials.push_back(n);
+            count_allocations = false;
+            const size_t serial_calls = allocation_count;
+            allocation_count = 0; count_allocations = true;
+            entries.emplace_back();
+            count_allocations = false;
+            if (n >= 2 && serial_calls && allocation_count) {
+                seed_count = n;
+                serial_allocations = serial_calls;
+                break;
+            }
+        }
+    }
+    check(seed_count != 0, "found simultaneous deque allocation boundary");
+    for (int failed_queue = 0; failed_queue < 2; ++failed_queue) {
+        ConversationCache cache(size_t(64) << 20, seed_count + 2);
+        ConversationCheckpoint checkpoint;
+        checkpoint.ids = {10, 11}; checkpoint.gdn = {1, 2, 3};
+        SavedConversation old = image({10, 11, 12});
+        old.checkpoints.push_back(checkpoint);
+        check(cache.put(std::move(old)), "park replaceable old entry");
+        std::vector<uint64_t> serials;
+        serials.push_back(cache.best(std::vector<int32_t>{10, 11, 12, 99}, {}, true).serial);
+        for (size_t i = 1; i < seed_count; ++i) {
+            const int32_t id = 10000 + static_cast<int32_t>(i);
+            auto other = image({id, 2, 3});
+            check(cache.put(std::move(other)), "park unrelated entry");
+            serials.push_back(cache.best(std::vector<int32_t>{id, 2, 3, 99}, {}, true).serial);
+        }
+        const uint64_t old_serial = serials.front();
+        const size_t old_bytes = cache.find(old_serial)->bytes();
+        const size_t before_bytes = cache.bytes();
+        auto replacement = image({10, 11, 20});
+        replacement.checkpoints.push_back(checkpoint);
+        const size_t replacement_bytes = replacement.bytes();
+        bool threw = false;
+        fail_after = failed_queue == 0 ? 0 : static_cast<long>(serial_allocations);
+        try { (void) cache.put_exchanged(std::move(replacement)); }
+        catch (const std::bad_alloc&) { threw = true; }
+        fail_after = -1;
+        check(threw, "injected allocation failure at selected queue");
+        const auto* preserved = cache.find(old_serial);
+        check(cache.size() == seed_count && cache.bytes() == before_bytes && cache.superseded() == 0 &&
+              cache.evictions() == 0 && preserved && preserved->bytes() == old_bytes &&
+              preserved->live.ids == std::vector<int32_t>({10, 11, 12}) &&
+              preserved->checkpoints.size() == 1 && preserved->checkpoints[0].ids == checkpoint.ids &&
+              preserved->checkpoints[0].gdn == checkpoint.gdn,
+              "failed publication preserves old payload, size and accounting");
+        for (size_t i = 0; i < serials.size(); ++i)
+            check(serials[i] != 0 && cache.index_of(serials[i]) == i, "failed publication preserves every serial and order");
+        check(replacement.live.ids == std::vector<int32_t>({10, 11, 20}) &&
+              replacement.checkpoints.size() == 1, "failed queue insertion leaves the replacement intact");
+        const bool published = cache.put_exchanged(std::move(replacement));
+        const auto inserted = cache.best(std::vector<int32_t>{10, 11, 20, 99}, {}, true);
+        check(published && cache.size() == seed_count && cache.superseded() == 1 && cache.evictions() == 0 &&
+              cache.bytes() == before_bytes - old_bytes + replacement_bytes && cache.find(old_serial) == nullptr &&
+              inserted.serial == serials.back() + 1 && cache.find(inserted.serial) != nullptr,
+              "successful replacement removes only the old entry and advances its serial once");
+        for (size_t i = 1; i < serials.size(); ++i)
+            check(cache.index_of(serials[i]) == i - 1, "successful replacement keeps unrelated entries in order");
+    }
+    {
+        // Ordinary put keeps the baseline order: drop superseded, then refuse
+        // before queue insertion when a pinned entry leaves too little room.
+        ConversationCheckpoint checkpoint;
+        checkpoint.ids = {10, 11}; checkpoint.gdn = {1, 2, 3};
+        auto old = image({10, 11, 12});
+        old.checkpoints.push_back(checkpoint);
+        auto fixed = image({30000, 2, 3});
+        fixed.live.gdn.resize(1u << 20, 7);
+        ConversationCheckpoint pin;
+        pin.ids = {30000, 2}; pin.pinned = true;
+        fixed.checkpoints.push_back(pin);
+        const size_t old_bytes = old.bytes(), fixed_bytes = fixed.bytes();
+        const size_t other_bytes = image({10000, 2, 3}).bytes();
+        const size_t budget = old_bytes + fixed_bytes + (seed_count - 2) * other_bytes;
+        auto replacement = image({10, 11, 20});
+        replacement.checkpoints.push_back(checkpoint);
+        replacement.live.gdn.resize(old_bytes + seed_count * other_bytes + 1024, 7);
+        const size_t replacement_bytes = replacement.bytes();
+        check(replacement_bytes <= budget && fixed_bytes + replacement_bytes > budget,
+              "ordinary refusal fixture fits alone but not beside the pinned entry");
+        ConversationCache cache(budget, seed_count);
+        std::vector<uint64_t> serials;
+        check(cache.put(std::move(old)), "ordinary refusal: park superseded entry");
+        serials.push_back(cache.best(std::vector<int32_t>{10, 11, 12, 90}, {}, true).serial);
+        for (size_t i = 1; i + 1 < seed_count; ++i) {
+            const int32_t id = 10000 + static_cast<int32_t>(i);
+            check(cache.put(image({id, 2, 3})), "ordinary refusal: park unrelated entry");
+            serials.push_back(cache.best(std::vector<int32_t>{id, 2, 3, 90}, {}, true).serial);
+        }
+        check(cache.put(std::move(fixed)), "ordinary refusal: park pinned entry");
+        serials.push_back(cache.best(std::vector<int32_t>{30000, 2, 3, 90}, {}, true).serial);
+        const size_t before_bytes = cache.bytes();
+        check(cache.size() == seed_count && before_bytes == budget, "ordinary refusal: cache is full");
+        bool accepted = false, threw = false;
+        allocation_count = 0; count_allocations = true; fail_after = 0;
+        try { accepted = cache.put(std::move(replacement)); }
+        catch (const std::bad_alloc&) { threw = true; }
+        fail_after = -1; count_allocations = false;
+        check(!threw && !accepted && allocation_count == 0 && cache.size() == seed_count - 1 &&
+              cache.find(serials.front()) == nullptr && cache.bytes() == before_bytes - old_bytes &&
+              cache.superseded() == 1 && cache.evictions() == 0 && replacement.bytes() == replacement_bytes,
+              "ordinary refusal drops the superseded entry before refusing without queue allocations");
+        for (size_t i = 1; i < serials.size(); ++i)
+            check(cache.index_of(serials[i]) == i - 1, "ordinary refusal preserves the other serials in order");
+        (void) cache.take(cache.index_of(serials.back()));
+        check(cache.can_fit(replacement_bytes) && cache.put(std::move(replacement)),
+              "ordinary replacement can be retried after the pinned entry is taken");
+        const auto inserted = cache.best(std::vector<int32_t>{10, 11, 20, 90}, {}, true);
+        check(inserted.serial == serials.back() + 1, "ordinary refusal did not consume a serial");
+    }
+}
 }
 
 int main() {
+    publication_allocation_failures();
+    pool_reclaim_allocation_failure();
+    {
+        ConversationCache cache(1u << 20, 2);
+        const std::vector<int32_t> live = {1, 2, 3, 4, 9};
+        check(!cache.has_reuse_for(live), "no retained K/V does not block exchange");
+        std::vector<ConversationKv> retained(1);
+        retained[0].k.resize(64, 0x5a);
+        cache.retain(std::move(retained), 5, {}, {1, 2, 3, 4, 5});
+        cache.limit_reuse(4);
+        const size_t before_bytes = cache.retained_bytes();
+        check(cache.has_reuse_for(live) && cache.has_reuse_for(std::vector<int32_t>{1, 99}) &&
+              !cache.has_reuse_for(std::vector<int32_t>{9, 1, 2}) &&
+              !cache.has_reuse_for(std::vector<int32_t>{}),
+              "only a positive common retained prefix blocks exchange");
+        bool attempted = false;
+        // Use the same gate as generate.cpp: the old park keeps its reusable prefix.
+        if (!cache.has_reuse_for(live)) {
+            attempted = true;
+            (void) cache.can_fit(SIZE_MAX);
+        }
+        check(!attempted && !cache.can_fit(SIZE_MAX) && cache.retained_bytes() == before_bytes,
+              "existing retained prefix bypasses exchange and survives budget refusal");
+        auto reuse = cache.take_reuse_for(live);
+        uint8_t first = 0, last = 0;
+        check(reuse.unchanged_tokens == 4 && reuse.kv.size() == 1 && reuse.kv[0].k.size() == 64 &&
+              reuse.kv[0].k.read(&first, 0, 1) && reuse.kv[0].k.read(&last, 63, 1) && first == 0x5a && last == 0x5a,
+              "old capture path still takes the original reusable prefix and bytes");
+        cache.retain(std::move(reuse.kv), 5, {}, {1, 2, 3, 4, 5});
+        const std::vector<int32_t> one_prefix = {1, 99};
+        check(cache.has_reuse_for(one_prefix), "one shared token blocks exchange");
+        reuse = cache.take_reuse_for(one_prefix);
+        check(reuse.unchanged_tokens == 1 && !reuse.kv.empty(), "one shared token is reusable by the old path");
+        cache.retain(std::move(reuse.kv), 5, {}, {1, 2, 3, 4, 5});
+        const std::vector<int32_t> unrelated = {9, 1, 2};
+        check(!cache.has_reuse_for(unrelated), "unrelated retained K/V does not block exchange");
+        reuse = cache.take_reuse_for(unrelated);
+        check(reuse.unchanged_tokens == 0 && reuse.kv.empty(), "the old path also refuses an unrelated prefix");
+        std::vector<ConversationKv> no_identity(1);
+        no_identity[0].k.resize(64, 0x5a);
+        cache.retain(std::move(no_identity), 5);
+        check(cache.retained_tokens() > 0 && !cache.has_reuse_for(live),
+              "retained K/V without identity does not block exchange");
+    }
+    {
+        int mib = conversation_cache_swap_default_block_mib;
+        check(mib == 0 && conversation_cache_swap_block_bytes(mib) == 0,
+              "host exchange is disabled by default");
+        for (int value = 0; value <= 256; ++value) {
+            const std::string text = std::to_string(value);
+            check(parse_conversation_cache_swap_block_mib(text, mib) && mib == value &&
+                  conversation_cache_swap_block_bytes(mib) == (size_t(value) << 20),
+                  "exchange block accepts every in-range decimal");
+        }
+        for (const auto& text : {"", "257", "-0", "-1", "+1", "1x", "1,2", "1.0", " 1", "1 ", "99999999999999999999999"}) {
+            mib = 17;
+            check(!parse_conversation_cache_swap_block_mib(text, mib) && mib == 17,
+                  "exchange block rejects invalid or partial numbers without changing the option");
+        }
+    }
+    {
+        auto pattern_a = [](size_t i) { return uint8_t((i * 17 + 31) % 251); };
+        auto pattern_b = [](size_t i) { return uint8_t((i * 29 + 87) % 251); };
+        const size_t segment = ConversationBuffer::segment_bytes;
+        for (const auto& [a_size, b_size, block] : std::vector<std::array<size_t,3>>{
+                 {73,73,17}, {101,63,17}, {63,101,17}, {segment+53,segment+19,3*1024*1024+7},
+                 {segment+19,segment+53,segment+5}}) {
+            ConversationBuffer parked;
+            parked.resize_for_overwrite(b_size);
+            check(parked.visit(0,b_size,[&](uint8_t* p,size_t n,size_t at) {
+                for (size_t i=0;i<n;++i) p[i]=pattern_b(at+i);
+                return true;
+            }), "initialize parked exchange image");
+            uint8_t* original = nullptr;
+            parked.visit(0,1,[&](uint8_t* p,size_t,size_t) { original=p; return true; });
+            const size_t original_bytes = parked.bytes();
+            const size_t peak = parked.allocation_peak(std::max(a_size,b_size));
+            parked.resize_for_overwrite(std::max(a_size,b_size));
+            check(parked.bytes() <= peak, "exchange growth stays within admitted capacity");
+            if (a_size <= b_size) check(parked.bytes() == original_bytes, "exchange allocates no new K/V capacity when B is long enough");
+            std::vector<uint8_t> active(std::max(a_size,b_size), 0);
+            for (size_t i=0;i<a_size;++i) active[i]=pattern_a(i);
+            std::vector<uint8_t> scratch(block);
+            bool written = false;
+            check(!conversation_buffer_exchange(parked,active.data(),a_size,b_size,nullptr,block,written) && !written,
+                  "missing scratch fails before a write");
+            check(conversation_buffer_exchange(parked,active.data(),a_size,b_size,scratch.data(),block,written) && written,
+                  "exchange succeeds with one scratch block");
+            parked.visit(0,1,[&](uint8_t* p,size_t,size_t) { check(p==original,"exchange reuses B's first allocation"); return true; });
+            for (size_t i=0;i<b_size;++i) if (active[i]!=pattern_b(i)) check(false,"active bytes equal B");
+            check(parked.visit(0,a_size,[&](const uint8_t* p,size_t n,size_t at) {
+                for (size_t i=0;i<n;++i) if (p[i]!=pattern_a(at+i)) return false;
+                return true;
+            }), "parked bytes equal A across block and segment boundaries");
+            written = false;
+            check(conversation_buffer_exchange(parked,active.data(),b_size,a_size,scratch.data(),block,written) && written,
+                  "reverse exchange succeeds");
+            for (size_t i=0;i<a_size;++i) if (active[i]!=pattern_a(i)) check(false,"active bytes return to A");
+            check(parked.visit(0,b_size,[&](const uint8_t* p,size_t n,size_t at) {
+                for (size_t i=0;i<n;++i) if (p[i]!=pattern_b(at+i)) return false;
+                return true;
+            }), "parked bytes return to B");
+        }
+    }
+    {
+        // The second chunk crosses a deliberately small internal segment, and
+        // later chunks start far beyond the five-byte scratch allocation.
+        constexpr size_t first = 7, total = 83, block = 5;
+        ConversationBuffer parked;
+        parked.resize_for_overwrite(first);
+        parked.resize_for_overwrite(total);
+        std::vector<uint8_t> active(total), expected_a(total), expected_b(total), scratch(block);
+        for (size_t i = 0; i < total; ++i) {
+            expected_a[i] = uint8_t((i * 17 + 31) % 251);
+            expected_b[i] = uint8_t((i * 29 + 87) % 251);
+        }
+        active = expected_a;
+        size_t spans = 0;
+        check(parked.visit(0, total, [&](uint8_t* p, size_t n, size_t at) {
+            ++spans;
+            std::memcpy(p, expected_b.data() + at, n);
+            return true;
+        }) && spans == 2, "small exchange crosses an internal segment");
+        bool written = false;
+        check(conversation_buffer_exchange(parked, active.data(), total, total, scratch.data(), block, written) && written,
+              "small scratch exchanges at least three chunks across a segment");
+        std::vector<uint8_t> actual(total);
+        check(active == expected_b && parked.read(actual.data(), 0, total) && actual == expected_a,
+              "small scratch keeps the offsets and contents of both images");
+        std::array<uint8_t, 3> boundary{};
+        check(parked.read(boundary.data(), first - 1, boundary.size()) &&
+              std::equal(boundary.begin(), boundary.end(), expected_a.begin() + first - 1),
+              "short read spans the internal segment boundary");
+        std::array<uint8_t, 3> tail{};
+        check(parked.read(tail.data(), total - tail.size(), tail.size()) &&
+              std::equal(tail.begin(), tail.end(), expected_a.end() - tail.size()),
+              "short read at a late segment offset uses a bounded destination");
+        written = false;
+        check(conversation_buffer_exchange(parked, active.data(), total, total, scratch.data(), block, written) && written &&
+              active == expected_a && parked.read(actual.data(), 0, total) && actual == expected_b,
+              "small scratch exchange round trip restores both images");
+    }
     {
         ConversationBuffer bytes;
         const size_t first = ConversationBuffer::segment_bytes + 17;
@@ -118,6 +477,17 @@ int main() {
         check(cache.retained_bytes() == 0 && cache.size() == 1 && cache.evictions() == 0,
               "pressure drops retained storage before evicting parked conversations");
     }
+    {
+        ConversationCache cache(4096, 1);
+        check(cache.put(image({1,2,3})), "park an unrelated conversation before exchange publication");
+        auto outgoing = image({4,5,6});
+        check(!cache.put_exchanged(std::move(outgoing)) && cache.size() == 1 && cache.evictions() == 0 &&
+              outgoing.live.ids == std::vector<int32_t>({4,5,6}),
+              "exchange publication refuses rather than evicting and keeps the outgoing image");
+        (void) cache.take(0);
+        check(cache.put_exchanged(std::move(outgoing)) && cache.size() == 1 && cache.evictions() == 0,
+              "exchange publication stores the image when it fits");
+    }
     const std::vector<int64_t> a = {1, 2, 3, 4}, b = {9, 8, 7, 6};
     {
         ConversationCache cache(1024, 2);
@@ -161,8 +531,13 @@ int main() {
         pinned.checkpoints.back().pinned = true;
         pinned.checkpoints.back().gdn.resize(64, 1);
         cache.put(std::move(pinned));
+        const size_t pinned_bytes = cache.bytes();
         cache.put(image({9, 8, 7}));
+        // #2253: what the RAM gate may count on: everything parked but the pinned conversation
+        check(cache.evictable_bytes() == cache.bytes() - pinned_bytes && cache.evictable_bytes() == image({9, 8, 7}).bytes(),
+              "#2253: evictable_bytes leaves out the conversation that holds a pinned prefix");
         check(cache.evict_oldest() && cache.size() == 1, "the oldest unpinned conversation went (the pinned one is older)");
+        check(cache.evictable_bytes() == 0, "#2253: only a pinned one is left: nothing may go");
         check(!cache.evict_oldest() && cache.size() == 1, "only a pinned one is left: nothing more can go");
         // #879: after non-finite logits every parked conversation goes, the pinned one too
         cache.put(image({4, 5, 6}));
@@ -191,7 +566,7 @@ int main() {
         check(cache.best(std::vector<int64_t>{1}, {}, true).tokens == 0, "short prompt cannot match");
         check(cache.best(std::vector<int64_t>{}, {}, true).tokens == 0, "empty prompt cannot match");
         cache.put(image({1, 2, 3}));
-        check(cache.best(a, {}, true).index == 1, "ties prefer most recently parked");
+        check(cache.best(a, {}, true).index == 0 && cache.size() == 1, "an equal snapshot replaces the older one (the newest serves)");
     }
     {
         auto s = image({1, 2, 3});
@@ -351,9 +726,11 @@ int main() {
             return std::pair<int64_t, int64_t>(a_found, b_found);
         };
         const auto baseline = replay(false, false);
-        check(baseline.first == 14 && baseline.second == 0, "baseline: A returns to its prompt-read state, B to nothing (as measured)");
+        // (measured before live-prefix supersession: B found nothing; the older parks of one conversation no longer
+        // fill the slots, so B's copy at 15 tokens survives to its third turn)
+        check(baseline.first == 14 && baseline.second == 15, "baseline: A returns to its prompt-read state, B to its last park");
         const auto parks_only = replay(true, false);
-        check(parks_only.first == 17 && parks_only.second == 0, "slot parks alone: A whole, B's copy evicted by a stale initial image");
+        check(parks_only.first == 17 && parks_only.second == 17, "slot parks alone: A whole, B whole (its stale initial image no longer evicts it)");
         const auto both = replay(true, true);
         check(both.first == 17 && both.second == 17, "slot parks + checkpoints back: both return whole");
     }
@@ -410,8 +787,9 @@ int main() {
         check(cache.parked_prefix_tokens({1, 2, 3, 4, 60, 70, 71}, {}, chain, true) == 5,
               "an appended tail keeps the reported depth at the parked one");
         SavedConversation no_cp = image({1, 2, 3, 9});
-        check(cache.put(std::move(no_cp)) && cache.parked_prefix_tokens({1, 2, 3, 9}, {}, {}, true) == 0,
-              "an entry without checkpoints is never reported");
+        check(cache.put(std::move(no_cp)) && cache.parked_prefix_tokens({1, 2, 3, 9}, {}, {}, true) == 4 &&
+              cache.parked_prefix_tokens({1, 2, 3, 8}, {}, {}, true) == 0,
+              "an entry without checkpoints is reported by its live length, only when the state extends it");
     }
     {
         // borrowing: a NEW conversation that starts with a checkpoint inside a parked one (a sibling subagent with
@@ -437,6 +815,8 @@ int main() {
         check(cache.find(sib.serial) != nullptr && cache.size() == 2 && cache.evictions() == 1 && !cache.guard_blocked(),
               "the slot limit evicts the other entry, not the guarded donor");
         check(cache.best(std::vector<int64_t>{7, 7, 7, 1}, {}, true).tokens == 0, "the other one went");
+        check(cache.evictable_bytes() == cache.bytes() - cache.find(sib.serial)->bytes(),
+              "#2253: evictable_bytes leaves out the guarded donor");
         SavedConversation rewritten = image({1, 2, 3, 4, 10, 11, 40});   // holds A's deepest checkpoint: supersedes A
         rewritten.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10, 11})};
         check(cache.put(std::move(rewritten)) && cache.find(sib.serial) != nullptr && cache.superseded() == 0,
@@ -475,29 +855,6 @@ int main() {
         check(!one_slot.put(image({9, 9, 9})) && one_slot.guard_blocked() && one_slot.size() == 1,
               "one slot: the guarded donor blocks, nothing evicted");
         one_slot.unguard();
-    }
-    {
-        // §191 guards nest: the borrow's donor guard stays in effect under an inner (park anchor) guard.
-        // The single-slot version let the inner guard clobber the outer one, and the park's eviction
-        // killed the donor mid-borrow (prod crash, exit 1: "restoring a borrowed conversation prefix: gone").
-        SavedConversation donor = image({1, 2, 3, 4});
-        SavedConversation anchor = image({5, 5, 5});
-        ConversationCache cache(1 << 20, 3);
-        check(cache.put(std::move(donor)) && cache.put(std::move(anchor)) && cache.put(image({6, 6, 6})),
-              "three entries parked");
-        const uint64_t ds = cache.best(std::vector<int64_t>{1, 2, 3, 4, 90}, {}, true).serial;
-        const uint64_t as = cache.best(std::vector<int64_t>{5, 5, 5, 90}, {}, true).serial;
-        check(ds != 0 && as != 0 && ds != as, "both entries addressed by serial");
-        cache.guard(ds);          // outer: the borrow's donor (generate.cpp 17670)
-        cache.guard(as);          // inner: the park anchor guard (generate.cpp 13134)
-        check(cache.put(image({7, 7, 7})) && cache.evictions() == 1 &&
-              cache.find(ds) != nullptr && cache.find(as) != nullptr,
-              "neither guard is an eviction candidate: the ordinary entry goes instead");
-        cache.unguard();          // the anchor guard ends (ParkAnchorGuard); the donor is still held
-        check(cache.put(image({8, 8, 8})) && cache.evictions() == 2 &&
-              cache.find(as) == nullptr && cache.find(ds) != nullptr,
-              "the inner unguard releases only the inner: the donor still survives");
-        cache.unguard();
     }
     {
         // pin=N beside a borrow: the guarded donor and a conversation holding a pinned shared prefix both stay; the
@@ -581,6 +938,7 @@ int main() {
             for (size_t k = 0; k < parts; ++k) {
                 ConversationCheckpoint p;
                 p.gdn.assign(128, uint8_t(salt + 10 + k));
+                p.dev_tag = uint64_t(salt) * 100 + k + 1;
                 c.stage_parts.push_back(std::move(p));
             }
             return c;
@@ -598,6 +956,8 @@ int main() {
         check(split.stage0[0].stage_parts.empty() && split.parts[1][1].ids == original[2].ids &&
               split.parts[1][1].used == original[2].used && split.parts[0][0].gdn == original[0].stage_parts[0].gdn,
               "split: every stage part carries its checkpoint's ids and LRU stamp");
+        check(split.parts[0][0].dev_tag == 301 && split.parts[1][1].dev_tag == 702,
+              "split: each stage part keeps the tag of its device copy");
         check(split.stage0[0].gdn.data() == gdn0 && split.parts[1][1].gdn.data() == part1,
               "split moves the running state (same buffers, no copy)");
         std::vector<ConversationCheckpoint> back;
@@ -608,7 +968,8 @@ int main() {
                    back[j].tails == original[j].tails && back[j].used == original[j].used &&
                    back[j].stage_parts.size() == original[j].stage_parts.size();
             for (size_t k = 0; same && k < back[j].stage_parts.size(); ++k)
-                same = back[j].stage_parts[k].gdn == original[j].stage_parts[k].gdn;
+                same = back[j].stage_parts[k].gdn == original[j].stage_parts[k].gdn &&
+                       back[j].stage_parts[k].dev_tag == original[j].stage_parts[k].dev_tag;
         }
         check(same, "merge(split(x)) == x, in the original order");
         check(back[0].gdn.data() == gdn0 && back[2].stage_parts[1].gdn.data() == part1, "merge moves them back too");
@@ -742,6 +1103,74 @@ int main() {
         p2.checkpoints.back().gdn.resize(64, 1);
         check(tiny.put(std::move(p2)), "a pinned one fits an empty cache");
         check(!tiny.put(image({7,8,9})) && tiny.size() == 1, "nothing else fits beside it: parking is refused, the pin stays");
+        // #5697: an image that cannot fit beside the pinned entry even with every other entry gone is refused BEFORE
+        // anything is evicted: the two ordinary conversations stay parked (before, both were evicted, then refused)
+        auto p3 = image({1,2,3});
+        p3.checkpoints.push_back(ConversationCheckpoint{});
+        p3.checkpoints.back().ids = {1,2};
+        p3.checkpoints.back().pinned = true;
+        p3.checkpoints.back().gdn.resize(64, 1);
+        ConversationCache keep(pinned_bytes + one * 2, 4);
+        check(keep.put(std::move(p3)) && keep.put(image({7,8,9})) && keep.put(image({4,5,6})) && keep.size() == 3,
+              "a pinned conversation and two ordinary ones are parked");
+        check(!keep.make_room(one * 2 + 1) && keep.size() == 3 && keep.evictions() == 0,
+              "a park too big for the room beside the pin is refused with nothing evicted");
+        check(keep.best(std::vector<int32_t>{7,8,9,1}, {}, true).tokens == 3 && keep.best(std::vector<int32_t>{4,5,6,1}, {}, true).tokens == 3,
+              "both ordinary conversations can still be restored");
+        check(keep.make_room(one * 2) && keep.size() == 1 && keep.evictions() == 2,
+              "a park that fits once both go evicts both (as before)");
+        ConversationCache slots(pinned_bytes * 4 + one * 4, 1);
+        auto p4 = image({1,2,3});
+        p4.checkpoints.push_back(ConversationCheckpoint{});
+        p4.checkpoints.back().ids = {1,2};
+        p4.checkpoints.back().pinned = true;
+        p4.checkpoints.back().gdn.resize(64, 1);
+        check(slots.put(std::move(p4)) && !slots.make_room(one) && slots.size() == 1 && slots.evictions() == 0,
+              "one slot, held by a pin: refused, nothing evicted");
+    }
+    {   // successive extensions of one conversation with every slot full: nothing is spilled; two conversations: the evicted one is
+        const size_t one = image({1,2,3}).bytes();
+        ConversationCache c(one * 8, 3);
+        std::vector<SavedConversation> sunk;
+        c.set_evict_sink([&](SavedConversation&& s) { sunk.push_back(std::move(s)); });
+        std::vector<int32_t> ids = {1,2,3};
+        for (int turn = 0; turn < 12; ++turn) {
+            ids.push_back(100 + turn);
+            { auto im = image({1}); im.live.ids = ids; check(c.put(std::move(im)), "an extension parks"); }
+        }
+        check(c.size() == 1 && sunk.empty() && c.evictions() == 0 && c.superseded() == 11,
+              "twelve turns of one conversation: one snapshot parked, nothing spilled");
+        ConversationCache d(one * 8, 2);
+        std::vector<SavedConversation> sunk2;
+        d.set_evict_sink([&](SavedConversation&& s) { sunk2.push_back(std::move(s)); });
+        check(d.put(image({1,2,3})) && d.put(image({4,5,6})) && d.put(image({7,8,9})) && sunk2.size() == 1 &&
+              sunk2[0].live.ids == std::vector<int32_t>({1,2,3}), "different conversations: the evicted one still spills");
+        check(d.put(image({4,5,6,7})) && d.size() == 2 && sunk2.size() == 1, "the extension replaces its own prefix, evicts no other");
+        check(d.parked_prefix_tokens(std::vector<int32_t>{7,8,9,1}, {}, {}, true) == 3, "park-gain sees the prefix entry");
+    }
+    {   // P2: an evicted conversation goes to the sink (the SSD tier), whole; superseded copies and clear() do not
+        const size_t one = image({1,2,3}).bytes();
+        ConversationCache c(one * 2, 4);
+        std::vector<SavedConversation> sunk;
+        c.set_evict_sink([&](SavedConversation&& s) { sunk.push_back(std::move(s)); });
+        check(c.put(image({1,2,3})) && c.put(image({4,5,6})), "two parked");
+        check(c.put(image({7,8,9})) && sunk.size() == 1 && sunk[0].live.ids == std::vector<int32_t>({1,2,3}) &&
+              sunk[0].live.gdn == std::vector<uint8_t>(64, 7), "the budget's eviction hands the oldest over whole");
+        check(c.evict_oldest() && sunk.size() == 2 && sunk[1].live.ids == std::vector<int32_t>({4,5,6}),
+              "the RAM gate's eviction too");
+        check(c.size() == 1 && c.evictions() == 2, "the cache keeps its own count as before");
+        auto chained = image({7,8,9,10});
+        chained.checkpoints.push_back(ConversationCheckpoint{});
+        chained.checkpoints.back().ids = {7,8,9};
+        std::vector<size_t> gone;
+        check(c.drop_superseded(chained.live.ids, chained.live.imgs, chained.checkpoints, true, &gone) == 1 && sunk.size() == 2 &&
+              gone == std::vector<size_t>({3}) && c.size() == 0,
+              "a parked entry whose live tokens the new snapshot extends is dropped, never handed to the sink");
+        c.put(image({11,12,13}));
+        const size_t before = sunk.size();
+        check(c.clear() > 0 && sunk.size() == before, "#879's clear() hands nothing over");
+        ConversationCache plain(one, 4);
+        check(plain.put(image({1,2,3})) && plain.put(image({4,5,6})) && plain.size() == 1, "without a sink: evicted as before");
     }
     {
         // #4420: a batch slot's chain holds one checkpoint (its admission's): parking it must not drop (#342) the main session's copy of the
@@ -834,6 +1263,40 @@ int main() {
             }
             check(refused > 0 && evicted_any > 0 && pool.shrinks > 0, "the workload refused, evicted and trimmed the pool at least once");
         }
+    }
+    {
+        // #2518: a slot carries every checkpoint that prefixes the prompt, not only the longest one.
+        auto chain = [](int32_t n) {
+            ConversationCheckpoint c;
+            c.ids.resize((size_t) n);
+            for (int32_t i = 0; i < n; ++i) c.ids[(size_t) i] = 100 + i;
+            c.gdn.assign(3, (uint8_t) n);        // distinguishable, so a copy is recognisable
+            return c;
+        };
+        std::vector<ConversationCheckpoint> checks{chain(4), chain(8), chain(12)};
+        std::vector<int32_t> live = chain(12).ids;
+        live.push_back(112);                     // the prompt goes on past the deepest checkpoint
+
+        std::vector<ConversationCheckpoint> kept = conversation_checkpoints_prefixing(checks, live, false);
+        check(kept.size() == 3, "#2518: every checkpoint that prefixes the prompt is carried, not only the longest");
+        check(kept[0].ids.size() == 4 && kept[1].ids.size() == 8 && kept[2].ids.size() == 12,
+              "#2518: the carried checkpoints keep the order and the lengths they had");
+        check(kept[2].gdn == checks[2].gdn && kept[2].gdn.data() != checks[2].gdn.data(),
+              "#2518: a carried checkpoint is a copy of the state, not a reference to it");
+
+        std::vector<int32_t> ends_at_eight = chain(8).ids;
+        std::vector<ConversationCheckpoint> shorter = conversation_checkpoints_prefixing(checks, ends_at_eight, false);
+        check(shorter.size() == 1 && shorter[0].ids.size() == 4,
+              "#2518: a checkpoint as long as the prompt is not a prefix of it");
+
+        ConversationCheckpoint diverging = chain(8);
+        diverging.ids[6] = -7;
+        std::vector<ConversationCheckpoint> mixed{chain(4), diverging};
+        check(conversation_checkpoints_prefixing(mixed, live, false).size() == 1,
+              "#2518: a checkpoint that diverges from the prompt is not carried");
+
+        check(conversation_checkpoints_prefixing(checks, live, true).empty(),
+              "#2518: an image prompt carries no checkpoints (its tokens do not match again)");
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

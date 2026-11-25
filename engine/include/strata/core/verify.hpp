@@ -262,6 +262,10 @@ public:
     bool commit_slot_prefixes(const int* keep, std::string& err);
     /// --batch-mtp: slot rotation makes many row layouts, so bound the captured batch graph pairs (LRU). 0 = unbounded.
     void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n; }
+    /// How many graphs every verifier of the process has instantiated so far (a window, a commit, a batch layout: each on
+    /// its first use, and again after an eviction).  A round timed across a change of this number held a capture, tens
+    /// of milliseconds that are not the round's cost: the pipelined slot groups' draft policy leaves such times out.
+    static uint64_t graphs_made() { return graphs_made_counter().load(std::memory_order_relaxed); }
 
     // ---- The stages of a layer split as a PIPELINE.  A batch window over the slot GROUP
     // [base, base + S) is launched on ONE stage with its commit right behind it on the stage's stream (a batch window
@@ -281,11 +285,6 @@ public:
     // after the verdict, replays from there.  Everything else the commit reads is per slot already.
     /// The saved buffers for `rows` hand-off rows (after init_slots).
     bool init_deferred_commit(int rows, std::string& err);
-
-    /// KV-GROW (window recycling): drop every captured batch-window graph - the slot-session pools baked into
-    /// them have changed (freed at detach, re-carved at admission). They re-capture on demand (capture_batch);
-    /// callers hold the device quiet (park_slot's device sync / a not-yet-running admission).
-    void drop_batch_graphs();
     bool deferred_commit_on() const { return dc_rows_ > 0; }
     /// The window over the slots `rows` (a slot's rows contiguous) at hand-off rows [hbase, hbase + S), its save right
     /// behind it, and no commit (batch_commit_rows, after the verdict).  The PLE history advances at the commit.
@@ -330,6 +329,10 @@ public:
     /// Waits for the last commit graph when commit() did not (an event recorded after it, not the whole device);
     /// false with `err` when it failed.  Free when nothing is pending.
     bool wait_commit(std::string& err);
+    /// #5188 (--prefill-head-alias): every captured window graph is destroyed, so the next window of each size captures
+    /// again and reads the buffers where they are now (the output head came back at another address).  Refuses (false)
+    /// while a prelaunched window is pending.  `dropped`: how many graphs were destroyed.
+    bool drop_window_graphs(int& dropped, std::string& err);
 
     // ---- PIPELINED WINDOWS (--pipeline-windows, a layer split on two GPUs).  One conversation's windows with the
     // stages overlapped: stage 0 runs window K+1 while stage 1 still runs window K.  The same window as `run`, driven
@@ -348,12 +351,12 @@ public:
     /// (its graphs are captured there).
     void set_always_publish(bool on) {
         always_publish_ = on;
-        if (on) device_plan_ = false;
+        if (on) { device_plan_ = false; device_hits_ = false; }
     }
     /// 0.1.43: the adaptive tier's overlap gate (see AdaptGate).  Refused (false) with the device-planned layers (E-6),
     /// which never ask the host.  The pointer must outlive the verifier's windows.
     bool set_adapt_gate(AdaptGate* g) {
-        if (g != nullptr && device_plan_) return false;
+        if (g != nullptr && (device_plan_ || device_hits_)) return false;
         adapt_gate_ = g;
         return true;
     }
@@ -432,6 +435,11 @@ public:
     /// It gets this verifier's stream; false (with the message in `err`) fails the launch.
     void set_pre_launch(std::function<bool(cudaStream_t cs, std::string& err)> f) { pre_launch_ = std::move(f); }
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
+    void set_no_pcie_share(bool on) { no_pcie_share_ = on; }
+    bool device_hits_active() const {
+        return device_hits_ && no_pcie_share_ && !ar_on() && !always_publish_ && remote_opt_ == nullptr &&
+               adapt_gate_ == nullptr && m_bal_ == nullptr;
+    }
 
     /// The PCIe count of each layer from measured costs (PcieModel) instead of a fixed share: the spin kernels stamp
     /// each step's GPU work (the plan's arrival, the PCIe part's start, the wait for the CPU's rows; GPU clock), the host
@@ -528,6 +536,10 @@ private:
     /// again when it is next used.
     bool instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const std::vector<int>& key, const char* what,
                               std::string& err, int keep_t = -1, unsigned long long flags = 0);
+    static std::atomic<uint64_t>& graphs_made_counter() {   // graphs_made(): one count for the process
+        static std::atomic<uint64_t> n{0};
+        return n;
+    }
     /// Free the graph of the largest window size other than `keep_t` (and the prelaunched one); `evicted`: there was one.
     bool evict_window_graph(int keep_t, bool& evicted, std::string& err);
     bool no_window_eviction_ = false;   ///< capture_all wants every size at once: it must not free one to capture another
@@ -592,6 +604,10 @@ private:
     uint32_t* h_plan_err_ = nullptr; uint32_t* m_plan_err_ = nullptr;   // set by resident_plan on a -1 (all-resident graph)
     const int32_t* h_res_ = nullptr;      ///< the host residency table (VerifyHits::h_res)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
+    bool device_hits_ = false;            ///< STRATA_VERIFY_DEVICE_HITS: partial-VRAM hit groups planned on the device
+    bool no_pcie_share_ = false;          ///< set_no_pcie_share: --pcie-frac 0 without dynamic PCIe staging
+    bool head_bitplane_used_ = false;     ///< captured graph ran vhead_bitplane_argmax directly into m_out_ (head_logits_ lazy)
+    void ensure_head_logits(int T);       ///< materialize full head_logits_ from head_mixed_ on demand when head_bitplane_used_
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
     unsigned* qcnt_ = nullptr;             ///< S26 STRATA_QFUSE: the HC read's q8_1 group counters (n_embd / 32)
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
@@ -628,7 +644,7 @@ private:
     unsigned long long* trace_h_ = nullptr;
     unsigned long long* trace_m_ = nullptr;
     size_t trace_n_ = 0;
-    static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second
+    static constexpr int kProfPer = 34;              // stamps per layer (32 left the hc-read second
                                       // half's up-stamp at slot 32 = the next layer's slot 0: D8)
     bool prof_on_ = false;
     unsigned long long* prof_ = nullptr;              // device: n_layers * kProfPer + 4 stamps
@@ -646,6 +662,8 @@ private:
     SessionState* ss_ = nullptr;
     VerifyHits hits_;
     const NativeHead* head_ = nullptr;
+    mutable bool split_logits_materialized_ = false;
+    void ensure_full_logits(int T, bool sync) const;
     int max_t_ = 0;
     float* ple_key_ = nullptr;   ///< STRATA_PLE_BATCH: the window rows' PLE key / value projections
     float* ple_val_ = nullptr;
@@ -701,6 +719,8 @@ private:
     cudaEvent_t tap_ev_ = nullptr;
     float* h_tap_ = nullptr;     float* m_tap_ = nullptr;       ///< the mapped copy of tap_dev_
     std::FILE* tap_file_ = nullptr;
+    bool tap_split_ = false;                      ///< STRATA_TAP_FILE on a layer split - this (first) stage gathers the chain's taps to the host
+    std::vector<float> tap_split_host_;           ///< [max_t][all taps][n_embd]
     void tap_write(int T, const int32_t* tokens, int64_t pos0);
     uint32_t* h_nf_ = nullptr;   uint32_t* m_nf_ = nullptr;     // #879: kVerifyMaxT * kNonfiniteBlocks flags
     int nf_row_ = -1;                     ///< nonfinite_row()
@@ -714,6 +734,13 @@ private:
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
+    // STRATA_MEGAKERNEL=1 (RDNA3/4 persistent GDN dense chain): device counter scratch + mapped stall word
+    unsigned* mk_counters_ = nullptr;
+    unsigned* h_mk_stall_ = nullptr;
+    unsigned* m_mk_stall_ = nullptr;
+    bool mk_in_graph_ = false;
+    bool megakernel_stall_take();
+    void megakernel_off();
     // set_pcie_balance: per step (layer x group, stride 2 groups) the GPU's clock as the plan arrives, as the PCIe
     // part starts and as it waits for the CPU rows (4 words a step); the pool's ms, its experts, the PCIe ones, and
     // whether the step had a plan

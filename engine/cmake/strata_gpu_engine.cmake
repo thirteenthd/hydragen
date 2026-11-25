@@ -18,7 +18,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
   # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
   # linker error ("unresolved external symbol cudaGraphInstantiate") names the function rather than the cause.
-  target_link_libraries(strata_core PUBLIC strata_plan strata_warnings ${_strata_gpu_runtime_target})
+  target_link_libraries(strata_core PUBLIC strata_plan strata_warnings ${_strata_gpu_runtime_target} ${CMAKE_DL_LIBS})
 
   add_executable(strata-device src/core/device_main.cpp)
   target_link_libraries(strata-device PRIVATE strata_core)
@@ -96,9 +96,28 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/dflash2.cu
                           src/kernels/cuda/iq_kernels.cu
+                          src/kernels/cuda/rdna_gr.cu
+                          src/kernels/cuda/rdna_mmvq.cu
+                          src/kernels/cuda/megakernel_gdn.cu
+                          src/kernels/cuda/vhead_bitplane.cu
+                          src/kernels/cuda/dense_i8_tc.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
+  if(STRATA_ENABLE_HIP)
+    target_sources(strata_kernels PRIVATE
+      src/kernels/cuda/nvfp4_decode_sm120_absent.cpp
+      src/kernels/hip/hip_unsloth_wmma.cu
+      src/kernels/hip/hip_unsloth_dp4a.cu)
+  endif()
+  if(STRATA_ISA_FLOOR STREQUAL "avx")
+    if(MSVC)
+      set_source_files_properties(src/kernels/ngram.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
+    else()
+      set_source_files_properties(src/kernels/ngram.cpp PROPERTIES
+                                  COMPILE_OPTIONS "-mavx;-mno-avx2;-mno-fma;-mno-f16c")
+    endif()
+  endif()
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
   # Exact gfx1100 prompt scorer (PR1825 method port): optional standalone test,
   # also available where the published source omits tests/.
@@ -160,6 +179,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(qsa_topk_active_parity PRIVATE strata_kernels CUDA::cudart)
     add_test(NAME qsa_topk_active_parity COMMAND qsa_topk_active_parity)
     set_tests_properties(qsa_topk_active_parity PROPERTIES SKIP_RETURN_CODE 77)
+    # the same cases through the one-read top-k (#2093, STRATA_TOPK_SAMPLE=1, Turing's default) on any CUDA card: the
+    # same ids, including the rows past 524,288 cells where its sampling stride doubles
+    add_test(NAME qsa_topk_active_parity_sample COMMAND qsa_topk_active_parity)
+    set_tests_properties(qsa_topk_active_parity_sample PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "STRATA_TOPK_SAMPLE=1")
     # STRATA_QSA_SLOTS: a batch window's scores, top-k and attention as one launch over rows of different slots
     # against one call per row, bitwise (synthetic, no model)
     add_executable(qsa_slots_parity src/kernels/qsa_slots_parity.cpp)
@@ -229,7 +252,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(pa_bench PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(pa_bench PRIVATE strata_kernels CUDA::cudart)
   endif()
-  # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/ggml)
+  # plan v0.3 P6: the GGUF block layouts and codebook grids for the i-quant formats (third_party/ggml/ggml-common.h forwards to include/strata/quant/strata-quant-common.h)
   target_include_directories(strata_kernels PRIVATE third_party/ggml)
   # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
   if(STRATA_ENABLE_CUDA)
@@ -288,8 +311,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
-    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp
-    src/core/conversation_park_disk.cpp)   # HydraGen fork: the disk tier was injected by mc3_patch.py; now registered in-tree
+    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
@@ -401,6 +423,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME device_free_error_test COMMAND device_free_error_test)
     set_tests_properties(device_free_error_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
                          ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1;HIP_VISIBLE_DEVICES=-1")
+    # #5636: an error an earlier unchecked call left pending is said and cleared before a graph capture (needs a device; skipped without)
+    add_executable(pending_cuda_error_test tests/core/pending_cuda_error_test.cpp)
+    target_link_libraries(pending_cuda_error_test PRIVATE strata_engine)
+    add_test(NAME pending_cuda_error_test COMMAND pending_cuda_error_test)
+    set_tests_properties(pending_cuda_error_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     # STRATA_MMQ_DIRECT: slot_guard / slot_room / slot_tail on the uniform and the sized cache, and the default
     # (no guard) sized layout unchanged
     add_executable(expert_cache_slot_guard_test tests/core/expert_cache_slot_guard_test.cpp)
@@ -421,6 +448,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME conversation_snapshot_test_ckpt_vram_slots COMMAND conversation_snapshot_test)
     set_tests_properties(conversation_snapshot_test_ckpt_vram_slots PROPERTIES
       ENVIRONMENT "STRATA_TEST_BIG_GDN=1;STRATA_CKPT_ASYNC=1;STRATA_CKPT_VRAM_SLOTS=3" SKIP_RETURN_CODE 77 TIMEOUT 300)
+    # #6075: two threads saving checkpoints through the one background-copy buffer, forced to overlap; alone and with
+    # recent states kept in VRAM
+    add_executable(conversation_ckpt_race_test src/core/conversation_ckpt_race_test.cpp)
+    target_link_libraries(conversation_ckpt_race_test PRIVATE strata_engine)
+    add_test(NAME conversation_ckpt_race_test COMMAND conversation_ckpt_race_test)
+    set_tests_properties(conversation_ckpt_race_test PROPERTIES
+      ENVIRONMENT "STRATA_CKPT_ASYNC=1" SKIP_RETURN_CODE 77 TIMEOUT 120)
+    add_test(NAME conversation_ckpt_race_test_vram_slots COMMAND conversation_ckpt_race_test)
+    set_tests_properties(conversation_ckpt_race_test_vram_slots PROPERTIES
+      ENVIRONMENT "STRATA_CKPT_ASYNC=1;STRATA_CKPT_VRAM_SLOTS=2" SKIP_RETURN_CODE 77 TIMEOUT 120)
     add_executable(conversation_validation_test src/core/conversation_validation_test.cpp)
     target_link_libraries(conversation_validation_test PRIVATE strata_engine)
     add_test(NAME conversation_validation_test COMMAND conversation_validation_test)
@@ -458,7 +495,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_compile_definitions(strata_prefill PRIVATE STRATA_HIPBLASLT_AVAILABLE=1)
     target_link_libraries(strata_prefill PRIVATE roc::hipblaslt)
 
-    add_executable(tune_hipblaslt tools/hip/tune_hipblaslt.cpp)
+    add_executable(tune_hipblaslt ../terminal/tools/hip/tune_hipblaslt.cpp)
     target_link_libraries(tune_hipblaslt PRIVATE hip::host roc::hipblas roc::hipblaslt)
   endif()
   if(STRATA_ENABLE_HIP AND STRATA_ROCBLAS_AVAILABLE)
@@ -466,7 +503,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_compile_definitions(strata_prefill PRIVATE STRATA_ROCBLAS_AVAILABLE=1)
     target_link_libraries(strata_prefill PRIVATE roc::rocblas)
 
-    add_executable(tune_rocblas tools/hip/tune_rocblas.cpp)
+    add_executable(tune_rocblas ../terminal/tools/hip/tune_rocblas.cpp)
     target_link_libraries(tune_rocblas PRIVATE hip::host roc::rocblas)
   endif()
 
@@ -510,10 +547,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
 
   add_executable(strata src/program/generate.cpp)
   strata_utf8_manifest(strata)
-  # HydraGen fork: the installed artifact is named hydragen, so a system that has
-  # upstream Strata side by side is never ambiguous in ps, PATH or task managers.
-  # The internal target name stays `strata` (upstream merges touch only this line).
-  set_target_properties(strata PROPERTIES OUTPUT_NAME "hydragen")
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
   if(WIN32 AND STRATA_ENABLE_HIP)
@@ -655,6 +688,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # the HC write-back kernel timed at the prompt path's shapes with an output checksum (not a ctest; STRATA_GRW_V picks a variant)
     add_executable(hip_prefill_gr_write_bench tests/hip/prefill_gr_write_bench.cpp)
     target_link_libraries(hip_prefill_gr_write_bench PRIVATE strata_prefill strata_hip_runtime)
+    # #6776: the fused write-back + norm against gr_write + gr_norm_rs, bitwise (R, rs, the BF16 / low / FP16 images); skips without a card
+    add_executable(hip_prefill_gr_write_norm_parity tests/hip/prefill_gr_write_norm_parity.cpp)
+    target_link_libraries(hip_prefill_gr_write_norm_parity PRIVATE strata_prefill strata_hip_runtime)
+    add_test(NAME hip_prefill_gr_write_norm_parity COMMAND hip_prefill_gr_write_norm_parity)
+    set_tests_properties(hip_prefill_gr_write_norm_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    list(APPEND _strata_hip_tests hip_prefill_gr_write_norm_parity)
     # S6: the AMD fast router against the portable kernel, bitwise
     add_executable(hip_router_fast tests/hip/router_fast.cpp)
     target_link_libraries(hip_router_fast PRIVATE strata_kernels strata_hip_runtime)
@@ -748,7 +787,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endforeach()
   if(NOT _iq_python STREQUAL "")
     add_test(NAME iq_parity_fixtures
-             COMMAND ${_iq_python} ${CMAKE_CURRENT_SOURCE_DIR}/tools/iq_fixture.py
+             COMMAND ${_iq_python} ${CMAKE_CURRENT_SOURCE_DIR}/../terminal/tools/iq_fixture.py
                      --out ${CMAKE_CURRENT_BINARY_DIR}/iq_fixture)
     # exit 3: numpy or the vendored gguf-py is missing (a trimmed third_party) - a skip, not a failure
     set_tests_properties(iq_parity_fixtures PROPERTIES FIXTURES_SETUP iq_fixture_data SKIP_RETURN_CODE 3)
@@ -891,6 +930,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(gr_upmix_parity PRIVATE strata_prefill )
     add_test(NAME gr_upmix_parity COMMAND gr_upmix_parity)
     set_tests_properties(gr_upmix_parity PROPERTIES SKIP_RETURN_CODE 77)
+    # #6776: the fused write-back + norm against gr_write + gr_norm_rs, bitwise (the HIP build has the same test)
+    set_source_files_properties(tests/hip/prefill_gr_write_norm_parity.cpp PROPERTIES LANGUAGE CUDA)
+    add_executable(gr_write_norm_parity tests/hip/prefill_gr_write_norm_parity.cpp)
+    target_link_libraries(gr_write_norm_parity PRIVATE strata_prefill )
+    add_test(NAME gr_write_norm_parity COMMAND gr_write_norm_parity)
+    set_tests_properties(gr_write_norm_parity PROPERTIES SKIP_RETURN_CODE 77)
     # the two kernels of the layer-major prompt path (STRATA_PREFILL_LAYER_MAJOR=1, #3976): moe_shared_init and
     # moe_scatter_add against a host reference, bitwise for the scatter (GPU, synthetic, no model)
     add_executable(lm_kernels_parity src/prefill/lm_kernels_parity.cu)
@@ -960,6 +1005,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(fused_gr_bench src/kernels/fused_gr_bench.cpp)
   target_include_directories(fused_gr_bench PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(fused_gr_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
+    # #6714 / #6713: the Q8_0 hyper-connection Tensor Core reads (sm_80+) on a real card; a trapping kernel or a wrong read fails the test
+    # (it also runs clean under compute-sanitizer --tool memcheck). 1 iteration, T = 1..8.
+    foreach(_mode "1;0" "2;0" "0;1" "0;2")
+      list(GET _mode 0 _tc)
+      list(GET _mode 1 _bf)
+      add_test(NAME fused_gr_q8_tc_${_tc}_bf16tc_${_bf} COMMAND fused_gr_bench 1 1 8)
+      set_tests_properties(fused_gr_q8_tc_${_tc}_bf16tc_${_bf} PROPERTIES
+        ENVIRONMENT "STRATA_HC_Q8_TC=${_tc};STRATA_HC_Q8_BF16TC=${_bf}" TIMEOUT 300)
+    endforeach()
+  endif()
   add_executable(router_chain_bench src/kernels/router_chain_bench.cpp)
   target_include_directories(router_chain_bench PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(router_chain_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
@@ -1058,6 +1114,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(route_resident_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME route_resident_parity COMMAND route_resident_parity)
   set_tests_properties(route_resident_parity PROPERTIES TIMEOUT 120)
+  # STRATA_ROUTE_PRIOR (#5655): degenerate router rows keep the router's top-10 whole, rankable rows match a serial
+  # reference (GPU, synthetic, no model)
+  add_executable(route_prior_parity src/kernels/route_prior_parity.cu)
+  target_include_directories(route_prior_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(route_prior_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME route_prior_parity COMMAND route_prior_parity)
+  set_tests_properties(route_prior_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+  # the gated combine (STRATA_LFUSE) rounds the shared expert row's product on its own, bitwise the scale-rows-then-add path (#5100; GPU, synthetic, no model)
+  add_executable(native_moe_gated_test tests/cuda/native_moe_gated_test.cu)
+  target_include_directories(native_moe_gated_test PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(native_moe_gated_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME native_moe_gated_test COMMAND native_moe_gated_test)
+  set_tests_properties(native_moe_gated_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
   add_executable(router_top10_parity src/kernels/router_top10_parity.cpp)
   target_include_directories(router_top10_parity PRIVATE ${_strata_gpu_include_directories})

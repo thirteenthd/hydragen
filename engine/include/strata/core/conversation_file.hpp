@@ -108,17 +108,24 @@ struct SessionInputs {
 };
 // The fingerprint's list: every role with its file, none merged (a path in two roles is two entries).
 std::vector<SessionModelFile> session_model_inputs(const SessionInputs& inputs);
+// The drafter's files, exactly as their loaders resolved them (mtp.cpp, metal window.cpp) - never a pack layout the
+// folder does not have.  `mtp` names a GGUF file: that GGUF.  It names a directory holding dense.bin or experts.bin:
+// those with dense.txt.  A directory without either is an rt directory (tools/mtp_rt.py): the Metal engine reads the
+// draft layer from the GGUF beside it - `mtp_gguf` if set (STRATA_METAL_MTP_GGUF), else <parent of mtp>/mtp-q2_0.gguf,
+// the same path window.cpp opens.  A pack folder without any weights contributes no entry: nothing is opened for it,
+// and a missing required file must not kill the fingerprint.  `draft_vocab` (--mtp-draft-vocab) when given; else
+// <mtp>/draft_vocab.bin only when it exists (the draft head's token subset).  `mtp` empty (a cleared drafter, e.g.
+// --draft dflash2 --draft-fallback none): no entry at all.
+std::vector<SessionModelFile> session_mtp_pack_files(const std::string& mtp, const std::string& draft_vocab = {},
+                                                     const std::string& mtp_gguf = {});
 
 // Why a session file operation failed, for the caller's answer (the server maps it to an HTTP status):
-// M-C5: `foreign` means the file permanently belongs to another model/configuration/geometry (or its
-// layer range does not fit this runtime): it will never read here, but its BYTES may be shared (park v2
-// chunking + b3a lineage) - a tier must quarantine it, never let its cleanup delete shared chunks.
-// `invalid` remains: not a session file, corrupt, over-limits, unlinked, nothing to save (400; nothing
-// changed)
+//   invalid   refused: not a session file, corrupt, another model or configuration, over this engine's limits, a
+//             link, nothing to save (400; nothing changed)
 //   storage   no room on the disk: the free-space preflight, or ENOSPC / EDQUOT / EFBIG (507)
 //   memory    the RAM preflight refused it, or an allocation failed (503)
 //   io        any other failure: permissions, read/write/flush/rename errors, a missing folder (500)
-enum class SessionError { none, invalid, storage, memory, io, foreign };
+enum class SessionError { none, invalid, storage, memory, io };
 const char* session_error_name(SessionError e);
 struct SessionStatus {
     SessionError error = SessionError::none;
@@ -231,25 +238,6 @@ uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);
 // What the RAM preflight is asked for a file of `file_bytes`: the parsed image (about the payload), the 16 MiB read
 // buffer, and the per-allocation overhead of its arrays (a page per 16 MiB segment plus the small vectors).
 uint64_t session_read_peak_bytes(uint64_t file_bytes);
-// M-C3b (the park-disk dedup tier): stream the v1 payload byte stream (put_payload's exact walk, host
-// buffers) as (offset, ptr, len) blocks WITHOUT a file, and feed blocks back through the SAME bounded
-// parser with the SAME payload-hash check the v1 trailer carries. Both refuse what session_file_read's
-// limits would refuse; neither writes anything: the tier decides per block where the bytes live.
-// S5b (BCS): structured payload walk for the v3 container. Byte order is exactly put_payload's;
-// the caller sees non-KV scalar spans (region-offset, ptr, len) and KV buffer segments with layer
-// ordinal, part (0 k, 1 v, 2 k_scale, 3 v_scale, 4 pooled) and the segment's offset inside its buffer.
-bool session_payload_bcs(const SavedConversation& image,
-                         const std::function<bool(uint64_t soff, const uint8_t* p, size_t n)>& on_scalar,
-                         const std::function<bool(size_t kv_idx, int part, uint64_t seg_off,
-                                                 const uint8_t* p, size_t n)>& on_kv_seg,
-                         uint64_t& payload_bytes, std::string& error);
-bool session_payload_blocks(const SavedConversation& image,
-                            const std::function<bool(uint64_t off, const uint8_t* p, size_t n)>& on_block,
-                            uint64_t& payload_bytes, std::string& error);
-bool session_payload_unblocks(uint64_t payload_bytes, uint64_t payload_hash,
-                              const std::function<bool(uint8_t* dst, size_t n)>& pull,
-                              SavedConversation& image, const SessionReadLimits& limits, std::string& error,
-                              SessionError* kind = nullptr);
 // Full validation (a regular file with one link, size, header, identity, bounded parse, payload hash) before `image`
 // is replaced.  The file is opened without following a symbolic link (or a reparse point) at its name, and the checks
 // are made on the opened handle.  On failure `image` is unchanged and `status->error` says what kind of failure.

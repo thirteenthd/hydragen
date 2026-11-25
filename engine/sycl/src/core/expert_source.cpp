@@ -4,6 +4,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/conversation_memory.hpp"   // #5519: zfs_arc_reclaimable_bytes (the shared reader)
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -16,6 +17,7 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/cpu/kq_avx1.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
+#include "strata/core/window_jobs.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -41,6 +43,8 @@
 #define NOMINMAX   // std::numeric_limits<T>::max() below
 #endif
 #include <windows.h>
+
+#include "strata/platform/commit.hpp"   // after windows.h: it keeps WIN32_LEAN_AND_MEAN (#5742)
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -239,15 +243,18 @@ bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current
 namespace detail {
 
 bool host_available_memory(HostMemory& m, const std::string& meminfo, const std::string& self_cgroup,
-                           const std::string& cgroup_root) {
+                           const std::string& cgroup_root, const std::string& zfs_arcstats) {
     m = HostMemory{};
 #if defined(_WIN32)
-    (void) meminfo; (void) self_cgroup; (void) cgroup_root;
+    (void) meminfo; (void) self_cgroup; (void) cgroup_root; (void) zfs_arcstats;
     MEMORYSTATUSEX status{};
     status.dwLength = sizeof(status);
     if (!GlobalMemoryStatusEx(&status)) return false;
     m.available = (uint64_t) status.ullAvailPhys;
-    m.commit = (uint64_t) status.ullAvailPageFile;
+    // #5742: with the room the page files may still grow by (as src/core/expert_source.cpp); the clamp of a RAM budget and
+    // the arena read this
+    m.commit = strata::platform::commit_available((uint64_t) status.ullAvailPageFile,
+                                                  strata::platform::commit_growth((uint64_t) status.ullTotalPhys));
     return m.available > 0;
 #elif defined(__linux__)
     // MemAvailable includes reclaimable page cache, unlike _SC_AVPHYS_PAGES.
@@ -262,6 +269,9 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
             value <= std::numeric_limits<uint64_t>::max() / 1024) bytes = value * 1024;
     }
     if (bytes == 0) return false;
+    // #5519: the ZFS ARC's share above its floor, which MemAvailable leaves out (the cgroup room below still bounds a container)
+    if (const uint64_t arc = strata::core::zfs_arc_reclaimable_bytes(zfs_arcstats); arc > 0)
+        bytes = bytes > std::numeric_limits<uint64_t>::max() - arc ? std::numeric_limits<uint64_t>::max() : bytes + arc;
     // Account for the tightest cgroup ancestor limit when its normal mount is visible.
     // This is a point-in-time guard, not a reservation against concurrent allocations.
     std::ifstream groups(self_cgroup);
@@ -327,7 +337,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     m.available = bytes;
     return true;
 #else
-    (void) meminfo; (void) self_cgroup; (void) cgroup_root;
+    (void) meminfo; (void) self_cgroup; (void) cgroup_root; (void) zfs_arcstats;
     const long pages = sysconf(_SC_AVPHYS_PAGES);
     const long page_bytes = sysconf(_SC_PAGESIZE);
     if (pages <= 0 || page_bytes <= 0 ||
@@ -358,9 +368,10 @@ void log_complement_memory(const char* stage, uint64_t requested) {
         return;
     }
     std::fprintf(stderr, "FileExpertSource: %s: requested %.2f GiB, available RAM %.2f GiB, available commit %.2f GiB "
-                         "(limit %.2f GiB), available virtual address space %.2f GiB\n",
+                         "(limit %.2f GiB; the page files may grow by %.2f GiB more), available virtual address space %.2f GiB\n",
                  stage, (double) requested / 1073741824.0, (double) status.ullAvailPhys / 1073741824.0,
                  (double) status.ullAvailPageFile / 1073741824.0, (double) status.ullTotalPageFile / 1073741824.0,
+                 (double) strata::platform::commit_growth((uint64_t) status.ullTotalPhys) / 1073741824.0,
                  (double) status.ullAvailVirtual / 1073741824.0);
 #else
     (void) stage;
@@ -2542,9 +2553,10 @@ namespace {
 // refused at run time rather than written past them.
 constexpr int64_t kMaxWindowEntries = 128;
 static_assert(strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
+static_assert(kMaxWindowEntries <= kWindowJobsMax, "WindowJobs remembers one expert per window entry");
 }  // namespace
 
-void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
+void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids_live, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;
     if (d.failed) return;
@@ -2561,6 +2573,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.fail_layer = d.layers;
         return;
     }
+    // `ids_live` is host memory the GPU writes (the verifier's h_ids_): when the GPU does not wait for this call it goes on
+    // to the next layer and rewrites it. Everything below reads this copy, taken once, so the kind[] / first_of[] tables,
+    // the plan and the jobs all see the same experts (the clean-up does not read `ids`: WindowJobs remembers what it opened).
+    int32_t ids_copy[kMaxWindowEntries];
+    for (int64_t i = 0; i < n_tok * k; ++i) ids_copy[i] = ids_live[i];
+    const int32_t* const ids = ids_copy;
     if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) MAXT);
     const ExpertLayout& lay = expert_layout();
     const bool native = lay.native;
@@ -2736,53 +2754,38 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
     }
     int njobs = 0;
-    for (int64_t t = 0; t < n_tok; ++t)
-        for (int64_t j = 0; j < k; ++j) {
-            const int64_t i = t * k + j;
-            const int64_t e = ids[i];
+    WindowJobs wjobs(d.job_of, d.jobs_multi, njobs);   // clears job_of on every way out of the call
+    const WindowFailure wf = build_window_jobs(
+        wjobs, ids, n_tok, k, d.n_expert, kind,
+        [&](int64_t i) {                 // CUDA0, PCIe, or a remote/peer result staged into this row below
             float* row = out + (size_t) i * H;
-            if (e < 0 || e >= d.n_expert) {
-                d.failed = true;
-                d.fail = "a routed expert id is out of range";
-                d.fail_layer = d.layers;
-                d.fail_expert = e;
-                return;
-            }
-            if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below
-                if (kind[i] == 0) ++d.cache_hits;
-                else ++d.offload_entries;                       // #588: PCIe or another GPU
-                if (kind[i] == 2 && d.peer != nullptr) ++d.peer_entries;
-                // multi-GPU: a direct peer launch is writing this row right now - zeroing it would race it;
-                // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU
-                if (!((kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()) ||
-                      (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1))))
-                    std::memset(row, 0, (size_t) H * sizeof(float));
-                continue;
-            }
-            ++d.cache_refused;
-            int16_t& jo = d.job_of[(size_t) e];
-            if (jo < 0) {
-                const uint8_t* b = d.src->blob(d.layers, e);
-                if (b == nullptr) {
-                    d.failed = true;
-                    d.fail = "the expert source could not produce a blob";
-                    d.fail_layer = d.layers;
-                    d.fail_expert = e;
-                    ++d.missing;
-                    return;
-                }
-                jo = (int16_t) njobs++;
-                ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
-                nj.blob = b;
-                nj.nt = 0;
-            }
-            ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
+            if (kind[i] == 0) ++d.cache_hits;
+            else ++d.offload_entries;                       // #588: PCIe or another GPU
+            if (kind[i] == 2 && d.peer != nullptr) ++d.peer_entries;
+            // multi-GPU: a direct peer launch is writing this row right now - zeroing it would race it;
+            // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU
+            if (!((kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()) ||
+                  (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1))))
+                std::memset(row, 0, (size_t) H * sizeof(float));
+        },
+        [&](int64_t) { ++d.cache_refused; },
+        [&](int64_t e) { return d.src->blob(d.layers, e); },
+        [&](ExpertJobMulti& jb, int64_t t, int64_t i) {
             jb.act[jb.nt] = &d.act_multi[(size_t) t];
             jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
-            jb.out[jb.nt] = row;
+            jb.out[jb.nt] = out + (size_t) i * H;
             ++jb.nt;
             ++d.multi_entries;
-        }
+        });
+    if (wf.status != WindowStatus::Ok) {
+        d.failed = true;
+        d.fail = wf.status == WindowStatus::IdOutOfRange ? "a routed expert id is out of range"
+                                                          : "the expert source could not produce a blob";
+        d.fail_layer = d.layers;
+        d.fail_expert = wf.expert;
+        if (wf.status == WindowStatus::NoBlob) ++d.missing;
+        return;
+    }
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
     if (njobs > 0) {
@@ -2813,10 +2816,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);
     d.ms_run += ms(c3, c4);
-    for (int64_t i = 0; i < n_tok * k; ++i) {
-        const int64_t e = ids[i];
-        if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
-    }
+    wjobs.release();
     d.multi_misses += njobs;
     ++d.layers;
     d.experts += n_tok * k;

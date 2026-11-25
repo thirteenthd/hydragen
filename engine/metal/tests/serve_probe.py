@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 REPO = Path(os.environ["STRATA_REPO"])
-sys.path.insert(0, str(REPO / "tools"))
+sys.path.insert(0, str(REPO.parent / "terminal" / "tools"))
 sys.path.insert(0, str(REPO))
 import strata_tokenizer as ST  # noqa: E402
 from serve.server import StrataEngine, child_env  # noqa: E402

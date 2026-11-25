@@ -629,9 +629,6 @@ private:
 struct Out {
     FileSink* f = nullptr;
     SessionHasher* hash = nullptr;
-    // M-C3b: a stream observer (the park-disk block view): sees every raw() payload span in order; a
-    // refusal stops the walk. Unset everywhere else (every existing path behaves exactly as before).
-    std::function<bool(const void* p, size_t c)> item;
     uint64_t n = 0;
     bool ok = true, overflow = false;
     void count(uint64_t c) {
@@ -640,9 +637,7 @@ struct Out {
     }
     void raw(const void* p, size_t c) {
         count(c);
-        if (!ok || !c) return;
-        if (item && !(ok = item(p, c))) return;
-        if (!f) return;
+        if (!f || !ok || !c) return;
         if (hash) hash->update(p, c);
         ok = f->write(p, c);
     }
@@ -721,15 +716,10 @@ struct In {
     const SessionReadLimits& limits;
     SessionError kind = SessionError::invalid;
     size_t kv_layer = 0;
-    // M-C3b: when set, payload bytes come from this feed instead of a FileSource (block assembly).
-    std::function<bool(uint8_t* dst, size_t n)> pull;
     bool fail(const std::string& m) { if (error.empty()) error = "session file: " + m; return false; }
     bool raw(void* p, size_t c) {
         if (c > left) return fail("payload ends early");
-        if (c && !(pull ? pull(static_cast<uint8_t*>(p), c) : f->read(p, c))) {
-            kind = pull ? SessionError::io : f->kind();
-            return fail(pull ? "block feed stopped" : "read error: " + f->error());
-        }
+        if (c && !f->read(p, c)) { kind = f->kind(); return fail("read error: " + f->error()); }
         hash.update(p, c);
         left -= c;
         return true;
@@ -775,21 +765,13 @@ bool get_checkpoint(In& in, ConversationCheckpoint& c) {
 bool get_payload(In& in, SavedConversation& s) {
     for (auto& g : s.geometry) if (!in.i64(g)) return false;
     // checked before any state array is read: a file of another geometry allocates nothing
-    if (in.limits.geometry && *in.limits.geometry != s.geometry) {
-        in.kind = SessionError::foreign;   // M-C5: permanent identity fact, not corruption
-        for (size_t gi = 0; gi < s.geometry.size(); ++gi)
-            if ((*in.limits.geometry)[gi] != s.geometry[gi])
-                std::fprintf(stderr, "GEOMDIFF[%zu] file=%lld runtime=%lld\n", gi,
-                             (long long)s.geometry[gi], (long long)(*in.limits.geometry)[gi]);
+    if (in.limits.geometry && *in.limits.geometry != s.geometry)
         return in.fail("saved with another model geometry than this runtime's");
-    }
     uint64_t cvec = 0;
     if (!in.i64(s.layer_lo) || !in.i64(s.layer_hi) || !in.u64(cvec)) return false;
     if (in.limits.layer_range &&
-        (in.limits.layer_range->first != s.layer_lo || in.limits.layer_range->second != s.layer_hi)) {
-        in.kind = SessionError::foreign;
+        (in.limits.layer_range->first != s.layer_lo || in.limits.layer_range->second != s.layer_hi))
         return in.fail("saved with another layer range than this runtime's");
-    }
     if (cvec > 1) return in.fail("invalid cvec flag");
     s.cvec = cvec == 1;
     if (!get_checkpoint(in, s.live)) return false;
@@ -921,7 +903,6 @@ const char* session_error_name(SessionError e) {
     switch (e) {
         case SessionError::none: return "none";
         case SessionError::invalid: return "invalid";
-        case SessionError::foreign: return "foreign";
         case SessionError::storage: return "storage";
         case SessionError::memory: return "memory";
         case SessionError::io: return "io";
@@ -953,9 +934,66 @@ std::vector<SessionModelFile> session_model_inputs(const SessionInputs& in) {
     for (size_t i = 0; i < in.native_head.size(); ++i) f.push_back({"native head " + std::to_string(i), in.native_head[i]});
     if (!in.embedding.empty()) f.push_back({"embedding", in.embedding});
     if (!in.ple.empty()) f.push_back({"ple", in.ple});
-    if (!in.mtp.empty()) f.push_back({"mtp", in.mtp});
+    // the drafter's files come from session_mtp_pack_files below, resolved like the loaders resolve them;
+    // nothing is listed here (a directory without dense.bin is an rt directory, not a missing pack file)
     if (!in.pack.empty()) f.push_back({"pack native_experts.txt", in.pack + "/native_experts.txt", true});
     for (const auto& [role, path] : in.experts) f.push_back({role, path});
+    return f;
+}
+
+std::vector<SessionModelFile> session_mtp_pack_files(const std::string& mtp, const std::string& draft_vocab,
+                                                     const std::string& mtp_gguf) {
+    std::vector<SessionModelFile> f;
+    if (mtp.empty()) return f;   // no drafter loaded (--draft-fallback none clears --mtp): nothing to hash
+    std::error_code ec;
+    if (!draft_vocab.empty()) f.push_back({"mtp draft_vocab", draft_vocab});   // --mtp-draft-vocab FILE, always the given file
+    if (std::filesystem::is_regular_file(mtp, ec)) {   // --mtp names the drafter's GGUF itself: that is the whole drafter.
+        f.insert(f.begin(), {"mtp gguf", mtp});
+        // its draft-head subset sits in the rt folder beside it (window.cpp reads <gguf dir>/rt/draft_vocab.bin)
+        if (draft_vocab.empty()) {
+            const std::string beside = (std::filesystem::path(mtp).parent_path() / "rt" / "draft_vocab.bin").string();
+            if (std::filesystem::is_regular_file(beside, ec)) f.push_back({"mtp draft_vocab.bin", beside});
+        }
+        return f;
+    }
+    // a directory.  The CUDA/HIP loader (mtp.cpp) reads dense.txt + dense.bin + experts.bin from it; when those are
+    // absent it is an rt directory (tools/mtp_rt.py, draft_vocab.bin only) and the Metal engine (window.cpp) opens the
+    // GGUF beside it instead - STRATA_METAL_MTP_GGUF, else <parent>/mtp-q2_0.gguf.  Hash what is opened, nothing else.
+    const bool pack_dir = std::filesystem::is_regular_file(mtp + "/dense.bin", ec) ||
+                          std::filesystem::is_regular_file(mtp + "/experts.bin", ec);
+    if (pack_dir) {
+        f.push_back({"mtp dense.txt", mtp + "/dense.txt"});
+        if (std::filesystem::is_regular_file(mtp + "/dense.bin", ec)) f.push_back({"mtp dense.bin", mtp + "/dense.bin"});
+        if (std::filesystem::is_regular_file(mtp + "/experts.bin", ec)) f.push_back({"mtp experts.bin", mtp + "/experts.bin"});
+        // the pack folder's own subset, when it has one
+        if (draft_vocab.empty() && std::filesystem::is_regular_file(mtp + "/draft_vocab.bin", ec))
+            f.push_back({"mtp draft_vocab.bin", mtp + "/draft_vocab.bin"});
+        return f;
+    }
+    if (mtp_gguf.empty() && !std::filesystem::is_regular_file(mtp + "/draft_vocab.bin", ec))
+        return f;   // neither a pack folder nor an rt folder: nothing is opened, and a name that resolves to no
+                    // drafter must not kill the fingerprint either
+    std::string gguf = mtp_gguf;
+    if (gguf.empty()) {   // the same path window.cpp resolves: strip trailing slashes, cut at the last '/'
+        std::string d = mtp;
+        while (!d.empty() && d.back() == '/') d.pop_back();
+        const size_t s = d.rfind('/');
+#if defined(_WIN32)
+        const size_t w = d.rfind('\\');
+        gguf = (w == std::string::npos ? std::string(".") : d.substr(0, w)) + "\\mtp-q2_0.gguf";
+        if (s != std::string::npos && (w == std::string::npos || s > w))
+            gguf = d.substr(0, s) + "/mtp-q2_0.gguf";
+#else
+        gguf = (s == std::string::npos ? std::string(".") : d.substr(0, s)) + "/mtp-q2_0.gguf";
+#endif
+    }
+    f.push_back({"mtp gguf", gguf});
+    // an rt directory: window.cpp reads the draft head's subset from <gguf dir>/rt/draft_vocab.bin beside the
+    // GGUF it opened (its own default when that is absent hashes as nothing); a --mtp-draft-vocab FILE above wins.
+    if (draft_vocab.empty()) {
+        const std::string beside = (std::filesystem::path(gguf).parent_path() / "rt" / "draft_vocab.bin").string();
+        if (std::filesystem::is_regular_file(beside, ec)) f.push_back({"mtp draft_vocab.bin", beside});
+    }
     return f;
 }
 
@@ -1225,8 +1263,8 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
     if (version != kVersion) { error = "session file: unsupported version " + std::to_string(version); return false; }
     if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
-    if (model != id.model) { st.error = SessionError::foreign; error = "session file: saved with another model (model fingerprint differs)"; return false; }
-    if (config != id.config) { st.error = SessionError::foreign; error = "session file: saved with another engine configuration (config fingerprint differs)"; return false; }
+    if (model != id.model) { error = "session file: saved with another model (model fingerprint differs)"; return false; }
+    if (config != id.config) { error = "session file: saved with another engine configuration (config fingerprint differs)"; return false; }
     if (payload > size || size - kHeader - kTrailer != payload) {
         error = "session file: size " + std::to_string(size) + " does not match the header (" +
                 std::to_string(kHeader + payload + kTrailer) + ")";
@@ -1270,104 +1308,6 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
     }
     if (status) *status = st;
     return ok;
-}
-
-
-// ---- M-C3b: the block view and block assembly for the park-disk dedup tier.
-bool session_payload_blocks(const SavedConversation& image,
-                            const std::function<bool(uint64_t off, const uint8_t* p, size_t n)>& on_block,
-                            uint64_t& payload_bytes, std::string& error) {
-    Out o;
-    uint64_t off = 0;
-    bool refused = false;
-    o.item = [&](const void* p, size_t c) -> bool {
-        if (!on_block(off, static_cast<const uint8_t*>(p), c)) { refused = true; return false; }
-        off += c;
-        return true;
-    };
-    put_payload(o, image);                       // the host-buffer walk: every span is memory we own
-    if (refused) { if (error.empty()) error = "session blocks: the block sink refused"; return false; }
-    if (!o.ok) { if (error.empty()) error = "session blocks: the payload walk failed"; return false; }
-    payload_bytes = o.n;
-    return true;
-}
-
-bool session_payload_bcs(const SavedConversation& image,
-                         const std::function<bool(uint64_t soff, const uint8_t* p, size_t n)>& on_scalar,
-                         const std::function<bool(size_t kv_idx, int part, uint64_t seg_off,
-                                                 const uint8_t* p, size_t n)>& on_kv_seg,
-                         uint64_t& payload_bytes, std::string& error) {
-    // mirrors put_payload's byte order exactly; scalars and KV segments never interleave inside one
-    // buffer, but the scalar stream does interleave with the per-buffer size prefixes and the KV
-    // headers: callers must treat region offsets as the full stream offsets.
-    uint64_t off = 0;
-    bool refused = false;
-    const auto item = [&](const void* p, size_t c) {
-        if (!refused && c) on_scalar(off, static_cast<const uint8_t*>(p), c);
-        off += c;
-    };
-    const auto i64 = [&](int64_t v) { item(&v, 8); };
-    const auto u64 = [&](uint64_t v) { item(&v, 8); };
-    const auto chk = [&](const ConversationCheckpoint& c) {
-        const auto vec = [&](const auto& v) {
-            const uint64_t n = v.size();
-            u64(n);
-            if (n) item(v.data(), n * sizeof(typename std::remove_reference_t<decltype(v)>::value_type));
-        };
-        vec(c.ids);
-        u64(c.imgs.size());
-        for (const auto& k : c.imgs) { i64(k.start); u64(k.hash); }
-        vec(c.gdn); vec(c.ple); vec(c.tails); vec(c.dead); vec(c.block_pos);
-        u64(c.used);
-    };
-    for (int64_t g : image.geometry) i64(g);
-    i64(image.layer_lo); i64(image.layer_hi);
-    const uint64_t cvec = image.cvec ? 1 : 0;
-    item(&cvec, 8);
-    chk(image.live);
-    u64(image.checkpoints.size());
-    for (const auto& c : image.checkpoints) chk(c);
-    u64(image.kv.size());
-    for (size_t li = 0; li < image.kv.size() && !refused; ++li) {
-        const ConversationKv& k = image.kv[li];
-        for (int64_t v : {int64_t(k.format), k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim}) i64(v);
-        const ConversationBuffer* bufs[5] = { &k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled };
-        for (int part = 0; part < 5; ++part) {
-            const ConversationBuffer& b = *bufs[part];
-            const uint64_t n = b.size();
-            item(&n, 8);
-            if (!n) continue;
-            const bool ok = b.visit(0, (size_t)n,
-                                    [&](const uint8_t* p, size_t c, size_t so) {
-                                        if (refused) return false;
-                                        off += c;   // KV body bytes count toward the payload: the writer charges its
-                                                    // table from the sink bytes, so the header must count them too.
-                                        on_kv_seg(li, part, (uint64_t)so, p, c);
-                                        return true;
-                                    });
-            if (!ok) { refused = true; break; }
-        }
-    }
-    if (refused) { if (error.empty()) error = "session bcs: the sink refused"; return false; }
-    payload_bytes = off;
-    return true;
-}
-
-bool session_payload_unblocks(uint64_t payload_bytes, uint64_t payload_hash,
-                              const std::function<bool(uint8_t* dst, size_t n)>& pull,
-                              SavedConversation& image, const SessionReadLimits& limits, std::string& error,
-                              SessionError* kind) {
-    SavedConversation parsed;
-    In in{nullptr, SessionHasher(0), payload_bytes, error, limits};
-    in.pull = pull;
-    if (!get_payload(in, parsed)) { if (kind) *kind = in.kind; return false; }
-    if (in.left) { error = "session blocks: payload has " + std::to_string(in.left) + " unparsed bytes";
-                   if (kind) *kind = SessionError::invalid; return false; }
-    if (in.hash.digest() != payload_hash) { error = "session blocks: payload checksum mismatch";
-                                           if (kind) *kind = SessionError::invalid; return false; }
-    image = std::move(parsed);
-    if (kind) *kind = SessionError::none;
-    return true;
 }
 
 } // namespace strata::core

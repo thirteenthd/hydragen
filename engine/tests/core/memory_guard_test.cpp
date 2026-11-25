@@ -53,7 +53,9 @@ struct Fixture {
     }
     void self(const std::string& text) { put("self_cgroup", text + "\n"); }
     MemoryProbePaths paths() const {
-        return {(dir / "meminfo").string(), (dir / "self_cgroup").string(), (dir / "cgroup").string(), (dir / "status").string()};
+        // (#5519: the ZFS arcstats file is the fixture's too - absent unless a test writes it - never the real one)
+        return {(dir / "meminfo").string(), (dir / "self_cgroup").string(), (dir / "cgroup").string(), (dir / "status").string(),
+                (dir / "arcstats").string()};
     }
     void rss_file(uint64_t bytes) { put("status", "Name:\tstrata\nRssFile:\t" + std::to_string(bytes / 1024) + " kB\n"); }
     std::optional<HostMemoryReading> sample(uint64_t explicit_limit = 0) const { return sample_host_memory(paths(), explicit_limit); }
@@ -474,6 +476,43 @@ int main() {
         a = arena_cgroup_room(48 * GiB, 16 * GiB, "", host, false);
         check(a.applies && a.credit == 0 && a.room == 32 * GiB, "no memory.stat text: no credit");
     }
+    // CG1-RAM: the arena figure under a cgroup v1 limit (the rented RTX 5090 box's counters, 2026-11-19 19:01:37 UTC: Docker on a v1 host,
+    // limit 183530160128, usage_in_bytes 180769730560 = limit - 2.57 GiB with 99.9 GB of that clean page cache)
+    {
+        const uint64_t limit = 183530160128ull, usage = 180769730560ull;
+        const std::string stat = "cache 102233292800\nrss 78127566848\nshmem 2349006848\nmapped_file 19106279424\ndirty 12288\nwriteback 0\n"
+                                 "inactive_anon 47178797056\nactive_anon 33297645568\ninactive_file 84365942784\nactive_file 15518371840\n"
+                                 "unevictable 0\nhierarchical_memory_limit 183530160128\ntotal_cache 102233292800\ntotal_rss 78127566848\n"
+                                 "total_shmem 2349006848\ntotal_mapped_file 19106279424\ntotal_dirty 12288\ntotal_writeback 0\n"
+                                 "total_inactive_anon 47178797056\ntotal_active_anon 33297645568\ntotal_inactive_file 84365942784\n"
+                                 "total_active_file 15518371840\ntotal_unevictable 0\n";
+        ArenaCgroupRoom a = arena_cgroup_room_v1(limit, usage, stat, false);
+        check(a.applies && a.credit == 97016643584ull && a.room == 99777073152ull,
+              "v1: total_inactive_file + total_active_file - dirty - writeback, less min(half, limit / 64), is room");
+        check(a.room > 90 * GiB && a.room > limit - usage, "v1: the box's 2.57 GiB was the whole page cache counted as used");
+        // the v2 names are not v1's: a v1 memory.stat is read by its total_* keys only (the group's own inactive_file is the group alone)
+        a = arena_cgroup_room_v1(limit, usage, "inactive_file 100000000000\nactive_file 0\ndirty 0\nwriteback 0\n", false);
+        check(a.credit == 0 && a.room == limit - usage, "v1: keys without total_ are not read");
+        a = arena_cgroup_room_v1(limit, usage, stat, true);
+        check(a.credit == 84365930496ull - 2867658752ull && a.room == 84258701312ull, "v1: STRATA_MEM_CREDIT_INACTIVE=1: inactive only");
+        // shmem is in total_cache and not on the file lists; mlocked pages are on neither: nothing credited
+        a = arena_cgroup_room_v1(16 * GiB, 15 * GiB, "total_cache " + std::to_string(4 * GiB) + "\ntotal_shmem " + std::to_string(4 * GiB) +
+                                 "\ntotal_inactive_file 0\ntotal_active_file 0\ntotal_unevictable " + std::to_string(2 * GiB) +
+                                 "\ntotal_dirty 0\ntotal_writeback 0\n", false);
+        check(a.applies && a.credit == 0 && a.room == 1 * GiB, "v1: shmem and locked pages stay charged");
+        // dirty and writeback pages stay charged; the credit never exceeds the usage (a racy read)
+        a = arena_cgroup_room_v1(32 * GiB, 20 * GiB, "total_inactive_file " + std::to_string(10 * GiB) + "\ntotal_active_file " +
+                                 std::to_string(10 * GiB) + "\ntotal_dirty " + std::to_string(6 * GiB) + "\ntotal_writeback " +
+                                 std::to_string(2 * GiB) + "\n", false);
+        check(a.credit == 12 * GiB - 32 * GiB / 64 && a.room == 32 * GiB - (20 * GiB - a.credit), "v1: dirty and writeback pages are not credited");
+        a = arena_cgroup_room_v1(32 * GiB, 4 * GiB, "total_inactive_file " + std::to_string(9 * GiB) + "\ntotal_active_file 0\n", false);
+        check(a.credit == 4 * GiB - 32 * GiB / 64 && a.room == 32 * GiB - 32 * GiB / 64, "v1: the credit is bounded by the usage");
+        // no memory.stat, or one without total_inactive_file: the room is limit - usage (the earlier figure)
+        a = arena_cgroup_room_v1(32 * GiB, 10 * GiB, "", false);
+        check(a.applies && a.credit == 0 && a.room == 22 * GiB, "v1: no memory.stat: limit - usage");
+        a = arena_cgroup_room_v1(8 * GiB, 9 * GiB, "total_inactive_file 0\ntotal_active_file 0\n", false);
+        check(a.room == 0, "v1: usage over the limit: 0");
+    }
     // the limit on a parent level, credited from that level's own memory.stat; memory.high below memory.max
     {
         Fixture f;
@@ -518,6 +557,35 @@ int main() {
         check(std::string(memory_source_name(MemorySource::flag)) == "flag" &&
                   std::string(memory_source_name(MemorySource::cgroup)) == "cgroup" &&
                   std::string(memory_source_name(MemorySource::meminfo)) == "meminfo", "source names");
+    }
+    // #5519: the ZFS ARC above its floor is available RAM (MemAvailable leaves it out)
+    {
+        const auto arcstats = [](uint64_t size, uint64_t c_min) {
+            return "13 1 0x01 147 39984 5170330404 49152938520393\nname                            type data\n"
+                   "hits                            4    123456\nc_min                           4    " + std::to_string(c_min) +
+                   "\nc_max                           4    135179472896\nsize                            4    " + std::to_string(size) + "\n";
+        };
+        check(zfs_arc_reclaimable_from_text(arcstats(60 * GiB, 4 * GiB)) == 56 * GiB, "ARC 60 GiB, floor 4: 56 GiB comes back");
+        check(zfs_arc_reclaimable_from_text(arcstats(3 * GiB, 4 * GiB)) == 0, "an ARC at or under its floor gives nothing");
+        check(zfs_arc_reclaimable_from_text("name type data\nsize 4 1000\n") == 0, "no c_min line: no credit");
+        check(zfs_arc_reclaimable_from_text("size 4 12x\nc_min 4 1\n") == 0, "a malformed number: no credit");
+        check(zfs_arc_reclaimable_from_text("") == 0, "empty: none");
+        // the reporter's TrueNAS host: MemAvailable 52 GB of 128 with ~60 GB of ARC
+        Fixture f;
+        f.meminfo(128 * GiB, 52 * GiB);
+        f.self("0::/");
+        f.put("cgroup/memory.max", "max\n"); f.put("cgroup/memory.current", 70 * GiB);
+        const auto before = f.sample();
+        check(before && before->available == 52 * GiB, "without arcstats (no ZFS): MemAvailable as before");
+        f.put("arcstats", arcstats(60 * GiB, 4 * GiB));
+        const auto with = f.sample();
+        check(with && with->available == 108 * GiB, "with ZFS: MemAvailable + the ARC above its floor (52 + 56)");
+        // a container's own limit still bounds it: the ARC is the host's
+        f.self("0::/c");
+        f.put("cgroup/c/memory.max", 40 * GiB); f.put("cgroup/c/memory.current", 30 * GiB);
+        f.put("cgroup/c/memory.stat", "anon 30000000000\nfile 0\ninactive_file 0\nactive_file 0\n");
+        const auto boxed = f.sample();
+        check(boxed && boxed->available <= 10 * GiB, "under a container's 40 GiB limit: the limit's room, not the host's ARC");
     }
     std::printf("memory_guard_test: %d checks passed\n", checks);
     return 0;

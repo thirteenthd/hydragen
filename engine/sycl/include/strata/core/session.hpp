@@ -86,6 +86,9 @@ struct SessionState {
     /// `session_capture`/`session_loop`/`session_token` need no new parameter to reach it.  A `PleRun` whose
     /// `ready()` is false is skipped, which is what every caller had before LEDGER L123.
     PleRun ple;
+
+    // Set by the engine for its selected unsplit, unbatched BMG queue before sizing the prompt loan.
+    bool bmg_window_device = false;
 };
 
 /// Bytes for a whole session at `max_cells` of context.  Every layer's state is sized at once, because P2.T10
@@ -412,6 +415,11 @@ struct TokenGraph {
     double ms_wait = 0;              ///< host waiting for rings (the GPU is running)
     double ms_pool = 0;              ///< host inside the pool
     int64_t flushes = 0;             ///< cudaStreamQuery calls made because a ring was slow to appear
+    /// #5160: the token's wait record (strata/core/window_wait.hpp), 4 words of mapped host memory, written by the graph's
+    /// doorbell waits when one runs out; armed before every launch.  A written record fails the token.
+    uint32_t* wrec = nullptr;
+    uint32_t wepoch = 0;
+    int64_t waits_expired = 0;
 };
 
 /// Plan v0.3 P4: the VRAM expert tier inside the token graph.  Residency is STATIC during a token (a

@@ -5,11 +5,17 @@
 #include "mtl_rt.h"
 #include "resource_path.h"
 
+#include <sys/sysctl.h>
+#include <time.h>
+
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <mutex>
 #include <sstream>
+#include <thread>
 
 namespace mtl {
 
@@ -35,12 +41,94 @@ struct Context::Impl {
     std::vector<id<MTLLibrary>> libs;
     id<MTLSharedEvent> ev = nil;   // run_graph_seg's handshake timeline
     uint64_t ev_v = 0;
+    // #6078, the GPU keep-alive.  After about a second with no command buffer, macOS lets go of the process's GPU allocations, and the
+    // next command buffer waits before it starts (M5 Ultra: 0.9-1.1 s between commit and GPUStartTime; M5 Max, Q2_0, a 21-token
+    // follow-up: prompt 155 ms after a gap of 1 s or less, 440 ms after 2-4 s): an agent's turn after a tool call paid it in its
+    // conversation park and its prompt read.  While no command buffer was committed for keepalive_ms, and for at most keepalive_win_s
+    // after the last one, a one-thread kernel that names every buffer of the context (useResource) goes to the main queue every
+    // keepalive_ms.  A residency set alone (requestResidency) did not hold the allocations, nor did a keep-alive that names no buffer
+    // (#6078's own trials).  The cost: the allocations stay wired during that window, as during work; so it ends keepalive_win_s
+    // after the last command buffer, and it pauses while macOS reports memory pressure (kern.memorystatus_vm_pressure_level above
+    // normal), so wired memory is given back when the Mac needs it.  STRATA_METAL_KEEPALIVE_MS (default 250, 0 = off) and
+    // STRATA_METAL_KEEPALIVE_WINDOW_S (default 120) set it.
+    std::atomic<double> last_commit{0.0};
+    std::atomic<bool> ka_stop{false};
+    std::thread ka;
+    std::mutex all_mu;
+    NSMutableArray<id<MTLBuffer>>* all = [NSMutableArray new];
+    static double up_s() { return (double) clock_gettime_nsec_np(CLOCK_UPTIME_RAW) * 1e-9; }
+    void touch() { last_commit.store(up_s(), std::memory_order_relaxed); }
+    void track(id<MTLBuffer> b) {
+        if (b == nil) return;
+        std::lock_guard<std::mutex> lk(all_mu);
+        [all addObject:b];
+    }
+    void untrack(id<MTLBuffer> b) {
+        if (b == nil) return;
+        std::lock_guard<std::mutex> lk(all_mu);
+        [all removeObjectIdenticalTo:b];
+    }
+    static bool under_pressure() {
+        int lvl = 0;
+        size_t len = sizeof lvl;
+        return sysctlbyname("kern.memorystatus_vm_pressure_level", &lvl, &len, nullptr, 0) == 0 && lvl > 1;
+    }
+    void start_keepalive() {
+        const char* e = std::getenv("STRATA_METAL_KEEPALIVE_MS");
+        const double ms = e && *e ? std::atof(e) : 250.0;
+        if (!(ms > 0)) return;
+        const char* w = std::getenv("STRATA_METAL_KEEPALIVE_WINDOW_S");
+        const double win = w && *w ? std::atof(w) : 120.0;
+        if (!(win > 0)) return;
+        NSError* err = nil;
+        id<MTLLibrary> l = [dev newLibraryWithSource:@"kernel void strata_keepalive(device uint* b [[buffer(0)]]) { b[0] += 1u; }"
+                                             options:nil error:&err];
+        id<MTLFunction> f = l ? [l newFunctionWithName:@"strata_keepalive"] : nil;
+        id<MTLComputePipelineState> p = f ? [dev newComputePipelineStateWithFunction:f error:&err] : nil;
+        id<MTLBuffer> one = [dev newBufferWithLength:256 options:MTLResourceStorageModeShared];
+        if (p == nil || one == nil) {
+            std::fprintf(stderr, "mtl: the GPU keep-alive kernel did not build; keep-alive off\n");
+            return;
+        }
+        id<MTLCommandQueue> qq = q;
+        ka = std::thread([this, ms, win, p, one, qq] {
+            while (!ka_stop.load()) {
+                std::this_thread::sleep_for(std::chrono::microseconds((long long) (ms * 1000)));
+                if (ka_stop.load()) break;
+                const double idle = up_s() - last_commit.load(std::memory_order_relaxed);
+                if (idle * 1000.0 < ms || idle > win || under_pressure()) continue;
+                @autoreleasepool {
+                    // a retained command buffer: a buffer freed while it is in flight stays alive until it completes
+                    id<MTLCommandBuffer> cb = [qq commandBuffer];
+                    id<MTLComputeCommandEncoder> en = [cb computeCommandEncoder];
+                    [en setComputePipelineState:p];
+                    [en setBuffer:one offset:0 atIndex:0];
+                    {
+                        std::lock_guard<std::mutex> lk(all_mu);
+                        for (id<MTLBuffer> x in all) [en useResource:x usage:MTLResourceUsageRead];
+                    }
+                    [en dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                    [en endEncoding];
+                    [cb commit];   // (not a real command buffer: last_commit is not moved)
+                    [cb waitUntilCompleted];
+                }
+            }
+        });
+        std::fprintf(stderr, "mtl: GPU keep-alive every %.0f ms for %.0f s after the last command buffer (#6078; "
+                     "STRATA_METAL_KEEPALIVE_MS=0 turns it off)\n", ms, win);
+    }
 };
 
 static inline id<MTLBuffer> B(const Buffer& b) { return (__bridge id<MTLBuffer>)b.handle; }
 // the MTLBuffer and offset that bind byte `off` of b (a chunked buffer: the chunk the offset selects)
 static inline id<MTLBuffer> BO(const Buffer& b, size_t off, size_t& o) {
     if (!b.chunks) { o = off + b.bias; return B(b); }   // (bias: a view onto part of a bigger allocation; 0 otherwise)
+    if (b.starts) {
+        size_t k = b.starts->size() - 1;
+        while (k > 0 && (*b.starts)[k] > off) --k;
+        o = off - (*b.starts)[k];
+        return (__bridge id<MTLBuffer>)(*b.chunks)[k];
+    }
     const size_t k = std::min(off / b.stride, b.chunks->size() - 1);
     o = off - k * b.stride;
     return (__bridge id<MTLBuffer>)(*b.chunks)[k];
@@ -55,12 +143,18 @@ Context::Context() : impl_(new Impl) {
         std::exit(2);
     }
     impl_->q = [impl_->dev newCommandQueue];
+    impl_->touch();
+    impl_->start_keepalive();
     // env, then <exe dir>/metal/ (a component package), then the compiled-in source-tree path
     ggml_common_path = strata_metal::resource2("STRATA_GGML_COMMON", "strata-quant-common.h", "ggml-common.h", STRATA_GGML_COMMON_DEFAULT);
     kernel_dir = strata_metal::resource("STRATA_METAL_KERNELS", "kernels", STRATA_METAL_KERNELS_DEFAULT);
 }
 
-Context::~Context() { delete impl_; }
+Context::~Context() {
+    impl_->ka_stop.store(true);
+    if (impl_->ka.joinable()) impl_->ka.join();
+    delete impl_;
+}
 
 std::string Context::device_name() const { return [[impl_->dev name] UTF8String]; }
 bool Context::has_family_apple(int n) const {
@@ -203,16 +297,23 @@ void require_fit(const Pipeline& p, uint32_t threads, const char* where) {
 }
 
 Buffer Context::alloc(size_t bytes) {
-    id<MTLBuffer> b = [impl_->dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-    if (!b) {
-        std::fprintf(stderr, "mtl: alloc %zu failed\n", bytes);
-        std::exit(4);
-    }
-    std::memset([b contents], 0, bytes);
-    allocated_ += bytes;
+    // Metal returns the new buffer with one more reference parked in the calling thread's autorelease pool.  The engine's host
+    // threads have no pool (only Context::run opens one), so that reference was never given back: every buffer made here lived for
+    // the rest of the process, free() or not (a 16 KB job array per expert matvec, ~90K a request: +1.3 GB and a slower queue every
+    // call, 16 -> 3 tok/s after a few requests on a big Mac).
     Buffer r;
-    r.handle = (__bridge_retained void*)b;
-    r.ptr = [b contents];
+    @autoreleasepool {
+        id<MTLBuffer> b = [impl_->dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        if (!b) {
+            std::fprintf(stderr, "mtl: alloc %zu failed\n", bytes);
+            std::exit(4);
+        }
+        std::memset([b contents], 0, bytes);
+        impl_->track(b);
+        r.handle = (__bridge_retained void*)b;
+        r.ptr = [b contents];
+    }
+    allocated_ += bytes;
     r.bytes = bytes;
     return r;
 }
@@ -231,13 +332,16 @@ Buffer Context::wrap(void* p, size_t bytes, size_t max_span) {
     r.stride = maxlen - span;
     for (size_t base = 0; base < bytes; base += r.stride) {
         const size_t len = std::min(maxlen, (bytes - base + pg - 1) / pg * pg);
-        id<MTLBuffer> b = [impl_->dev newBufferWithBytesNoCopy:(uint8_t*) p + base length:len
-                                                        options:MTLResourceStorageModeShared deallocator:nil];
-        if (!b) {
-            std::fprintf(stderr, "mtl: wrap chunk %zu+%zu failed\n", base, len);
-            std::exit(4);
+        @autoreleasepool {   // as in alloc()
+            id<MTLBuffer> b = [impl_->dev newBufferWithBytesNoCopy:(uint8_t*) p + base length:len
+                                                            options:MTLResourceStorageModeShared deallocator:nil];
+            if (!b) {
+                std::fprintf(stderr, "mtl: wrap chunk %zu+%zu failed\n", base, len);
+                std::exit(4);
+            }
+            impl_->track(b);
+            r.chunks->push_back((__bridge_retained void*)b);
         }
-        r.chunks->push_back((__bridge_retained void*)b);
         if (base + len >= bytes) break;
     }
     allocated_ += bytes;
@@ -249,15 +353,45 @@ Buffer Context::wrap(void* p, size_t bytes, size_t max_span) {
     return r;
 }
 
+Buffer Context::wrap_ranges(void* p, const std::vector<std::pair<size_t, size_t>>& ranges) {
+    Buffer r;
+    r.chunks = std::make_shared<std::vector<void*>>();
+    r.starts = std::make_shared<std::vector<size_t>>();
+    size_t total = 0;
+    for (const auto& rg : ranges) {
+        @autoreleasepool {   // as in alloc()
+            id<MTLBuffer> b = [impl_->dev newBufferWithBytesNoCopy:(uint8_t*) p + rg.first length:rg.second - rg.first
+                                                            options:MTLResourceStorageModeShared deallocator:nil];
+            if (!b) {
+                std::fprintf(stderr, "mtl: wrap range %zu+%zu failed\n", rg.first, rg.second - rg.first);
+                std::exit(4);
+            }
+            impl_->track(b);   // (the #6078 keep-alive names it like every other buffer of the context)
+            r.chunks->push_back((__bridge_retained void*)b);
+        }
+        r.starts->push_back(rg.first);
+        total += rg.second - rg.first;
+    }
+    allocated_ += total;
+    r.handle = (*r.chunks)[0];
+    r.ptr = p;
+    r.bytes = ranges.back().second;
+    std::fprintf(stderr, "mtl: wrapped %.2f GB as %zu separate ranges (of %.2f GB)\n", total / 1e9, ranges.size(), r.bytes / 1e9);
+    return r;
+}
+
 Buffer Context::wrap(void* p, size_t bytes) {
-    id<MTLBuffer> b = [impl_->dev newBufferWithBytesNoCopy:p length:bytes options:MTLResourceStorageModeShared deallocator:nil];
-    if (!b) {
-        std::fprintf(stderr, "mtl: wrap %zu failed\n", bytes);
-        std::exit(4);
+    Buffer r;
+    @autoreleasepool {   // (see alloc: the engine's host threads have no pool of their own)
+        id<MTLBuffer> b = [impl_->dev newBufferWithBytesNoCopy:p length:bytes options:MTLResourceStorageModeShared deallocator:nil];
+        if (!b) {
+            std::fprintf(stderr, "mtl: wrap %zu failed\n", bytes);
+            std::exit(4);
+        }
+        impl_->track(b);
+        r.handle = (__bridge_retained void*)b;
     }
     allocated_ += bytes;
-    Buffer r;
-    r.handle = (__bridge_retained void*)b;
     r.ptr = p;
     r.bytes = bytes;
     return r;
@@ -265,12 +399,13 @@ Buffer Context::wrap(void* p, size_t bytes) {
 
 void Context::free(Buffer& b) {
     if (b.chunks) {
-        for (void* h : *b.chunks) { id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
+        for (void* h : *b.chunks) { id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; impl_->untrack(x); x = nil; }
         b = Buffer{};
         return;
     }
     if (b.handle) {
         id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)b.handle;
+        if (!b.bias) impl_->untrack(x);   // (a view onto part of an allocation is not the allocation's own entry)
         x = nil;
     }
     b = Buffer{};
@@ -311,6 +446,7 @@ double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, 
             }
         [enc endEncoding];
         [cb commit];
+        impl_->touch();
         [cb waitUntilCompleted];
         if (cb.status != MTLCommandBufferStatusCompleted) {
             std::fprintf(stderr, "mtl: command buffer failed: %s\n", [[cb.error localizedDescription] UTF8String]);
@@ -334,6 +470,7 @@ double Context::run_graph(const std::vector<Dispatch>& ds, size_t count) {
         }
         [enc endEncoding];
         [cb commit];
+        impl_->touch();
         if (spin) {
             const auto t0 = std::chrono::steady_clock::now();
             while (cb.status < MTLCommandBufferStatusCompleted &&
@@ -359,6 +496,7 @@ void* Context::run_graph_async(const std::vector<Dispatch>& ds) {
         }
         [enc endEncoding];
         [cb commit];
+        impl_->touch();
         return (__bridge_retained void*) cb;
     }
 }
@@ -399,6 +537,7 @@ double Context::run_graph_seg(const std::vector<Dispatch>& ds, const std::vector
             }
         }
         [cb commit];
+        impl_->touch();
         for (size_t s = 0; s < cuts.size(); ++s) {
             const uint64_t want = base + 2 * s + 1;
             while (ev.signaledValue < want) {
@@ -427,6 +566,7 @@ double Context::run_wall(const std::vector<Dispatch>& ds, int reps, double* gpu_
             for (const auto& d : ds) encode(enc, d);
             [enc endEncoding];
             [cb commit];
+            impl_->touch();
             [cb waitUntilCompleted];
             gpu += cb.GPUEndTime - cb.GPUStartTime;
         }
@@ -482,6 +622,7 @@ double Context::run_icb(const std::vector<Dispatch>& ds, int reps, bool barrier_
         }
         [enc endEncoding];
         [cb commit];
+        impl_->touch();
         [cb waitUntilCompleted];
         if (cb.status != MTLCommandBufferStatusCompleted) {
             std::fprintf(stderr, "mtl: icb command buffer failed: %s\n", [[cb.error localizedDescription] UTF8String]);

@@ -17,21 +17,7 @@ size_t conversation_kv_bytes(const QsaState& state, const ModelGeometry& g, int6
 // Equal token IDs alone do not establish that its K/V bytes are unchanged.
 bool conversation_kv_save(ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                           int64_t upto, bool include_index, std::string& error,
-                          int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr,
-                          const ConversationKv* anchor = nullptr, int64_t anchor_tokens = 0);
-
-// M-C3b2a: a disk-restored image re-joins the RAM tier's CoW: where a parked donor shares the leading
-// `tokens` (the caller matched token prefixes), each part's byte-identical aligned prefix becomes VIEWS
-// of the donor's buffers (verify-then-view, whole pages and complete indexer rows only, strict prefix).
-// Returns false when nothing could be shared (geometry mismatch / byte divergence); partial success
-// keeps sharing the parts that verified. `reused_bytes` counts adopted view bytes.
-// M-C3b3b: same verify-then-view rule as the token-prefix form, but the keep lengths come from the DISK
-// table's view entries (per layer, per part), not from token alignment: a spilled child's viewed regions
-// are exactly the donor segments it borrowed at spill time.
-bool conversation_kv_share_views(SavedConversation& img, const SavedConversation& donor,
-                                 const std::vector<std::array<size_t, 5>>& keep, size_t* reused_bytes);
-bool conversation_kv_share_prefix(SavedConversation& img, const SavedConversation& donor,
-                                  int64_t tokens, size_t* reused_bytes);
+                          int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr);
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                                    int64_t upto, bool include_index, size_t& bytes, std::string& error);
 // No CUDA calls or destination writes. Used for whole-session prevalidation.
@@ -68,6 +54,9 @@ bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, i
 // sizes at that many tokens - so session_file_read refuses an oversized or foreign file before it allocates.
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
+                                      std::string& error);
+bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
+                                      const QsaState* draft, uint64_t max_tokens, uint64_t max_checkpoints,
                                       std::string& error);
 
 struct ConversationStateSizes {
@@ -153,12 +142,62 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& session,
                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& session,
+                                   const ModelGeometry& g, const QsaState* draft, std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
 /// #2409: true when a restore (or a copy) on CUDA device `device` from the calling thread creates no copy stream: this
 /// thread has one for the card or a finished thread left one in the pool. A restore writes into buffers that exist
 /// already; a new stream is the one thing it can allocate (see program/conv_cache.hpp restore_fits).
 bool conversation_copy_stream_ready(int device);
+// Prepared only for an exclusive, host-authoritative whole-session take.
+// The incoming image remains untouched until all ranges and allocations pass.
+struct ConversationKvSwapLayer {
+    const QsaState* state = nullptr;
+    ConversationKv* image = nullptr;
+    std::array<uint8_t*, 4> active{};
+    std::array<size_t, 5> active_bytes{}, incoming_bytes{};
+    int format = 0;
+    int64_t cells = 0, pooled_rows = 0, page_size = 0;
+    ConversationBuffer pooled;
+};
+struct ConversationSwapPlan {
+    std::vector<ConversationKvSwapLayer> layers;
+    size_t image_bytes = 0, held_bytes = 0, additional_bytes = 0;
+    // Conservative bytes not necessarily reflected in the final RAM sample.
+    size_t final_additional_bytes = 0;
+};
+// The two estimates count shared incoming segments only once, including their
+// actual capacity and the temporary directory needed for any growth.
+bool conversation_snapshot_swap_prepare(ConversationSwapPlan& plan, SavedConversation& incoming,
+                                        const ConversationView& active, const SessionState& session,
+                                        const ModelGeometry& g, const QsaState* draft, size_t block_bytes,
+                                        std::string& error);
+enum class ConversationSwap { unavailable, swapped, transfer_failed };
+// The ready callback checks plan.final_additional_bytes against the latest RAM
+// sample, as well as the image and held sizes against the cache budget.
+// unavailable leaves the incoming image readable and permits the original
+// park/restore path. transfer_failed must end the request/process, never retry.
+ConversationSwap conversation_snapshot_swap(ConversationSwapPlan& plan, SavedConversation& incoming,
+                                            SavedConversation& outgoing, const ConversationView& active,
+                                            SessionState& session, const ModelGeometry& g, size_t block_bytes,
+                                            const std::function<bool(size_t, size_t)>& ready, std::string& error);
+
+// Internal K/V half of the whole-session operation; the state half owns the
+// allocation, synchronization, rollback and running-state restore.
+bool conversation_kv_swap_prepare(ConversationSwapPlan& plan, SavedConversation& incoming,
+                                  const SessionState& session, const ModelGeometry& g,
+                                  const QsaState* draft, int64_t active_tokens, std::string& error);
+bool conversation_kv_swap_reserve(ConversationSwapPlan& plan, uint8_t* scratch, size_t block_bytes,
+                                  bool& transfer_failed, std::string& error);
+void conversation_kv_swap_rollback(ConversationSwapPlan& plan);
+bool conversation_kv_swap_exchange(ConversationSwapPlan& plan, const ModelGeometry& g,
+                                   int64_t incoming_tokens, uint8_t* scratch, size_t block_bytes,
+                                   bool& written, std::string& error);
+void conversation_kv_swap_publish(ConversationSwapPlan& plan, SavedConversation& incoming,
+                                 SavedConversation& outgoing, const ModelGeometry& g);
+
 enum class ConversationRestore { restored, invalid, transfer_failed };
 // Invalid images are rejected before any CUDA call/write. Transfer failure may
 // leave partial state: caller MUST NOT continue inference from that session.
@@ -189,8 +228,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 const ModelGeometry& g, const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
                                 std::vector<ConversationCheckpoint>* storage = nullptr,
-                                std::vector<ConversationCheckpoint>* moved = nullptr,
-                                const SavedConversation* anchor = nullptr, int64_t anchor_tokens = 0);
+                                std::vector<ConversationCheckpoint>* moved = nullptr);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
