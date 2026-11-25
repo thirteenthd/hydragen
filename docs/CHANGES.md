@@ -2486,3 +2486,47 @@ non-topical commit to decompose: 7 files, **+740/−32**, bundling five experime
 Live ms01 state at capture: a stale `p2d1_arms.sh` wrapper alive 9,364 s after its
 battery finished (not killed), and 10 GiB `MemAvailable` against a 16 GiB
 conversation cache. counter 190.
+
+## §238 — Phase 0 closes: patch stack, touchpoint audit, layout inventory merged — the collision map is narrower than planned (2026-11-25)
+
+P0.2/P0.4/P0.5 merged into `main` as `c69acfd` (3 files, **+233/−78**): new
+`docs/PATCH_STACK.md` and `docs/LAYOUT_MIGRATION_0221.md`, and `docs/UPSTREAM_DELTA.md`
+rewritten for the `0.1.60 → v0.2.21` audit — the superseded v0.2.13-era text stays
+readable at `4bf3603:docs/UPSTREAM_DELTA.md`. Every load-bearing number was
+re-measured against the objects rather than trusted from the prose, and all matched.
+
+Fork overlay against upstream `38f63bc5`: 7,344 upstream files vs 7,332 in our
+`engine/` → **7,269 byte-identical, 52 modified, 11 fork-only, 23 dropped** (all 23
+under `.github/`, from `ebea5fe`). Upstream churn column verified line-for-line:
+`generate.cpp` **+3,206/−518**, `serve/server.py` **+2,125/−2,864**, `prefill.cpp`
++953/−210, `verify.cpp` +874/−151, `expert_source.cpp` +601/−84,
+`conversation_snapshot.cpp` +477/−0, `qsa_select.cu` +129/−18.
+
+The finding that re-shapes Phase 1's risk map: the files carrying our biggest fork
+deltas are the ones upstream barely touched. `layer.cpp` upstream churn is **+9/−0**
+against our **+845/−14**; `layer.hpp` +8/−0 against +79/−1; and `session.cpp`,
+`session.hpp`, `qsa.cu`, `qsa.hpp` are **byte-identical** across 1,748 upstream
+commits (`eb91c380` / `4d633205` / `a635e81e` / `8eb89e2c`). Replay conflict is not
+spread across the tree — it concentrates in `generate.cpp` (94 fork hunks landing
+into +3,206 upstream lines) and in `terminal/serve/server.py` (+284/−74 landing into
+a +2,125/−2,864 rewrite).
+
+Corrections and narrowings: `4c39aa5` engine-only is **+727/−31 across 5 files** —
+§237's +740/−32 counted the two docs files bundled with it. `v0.2.21` subtree counts
+confirmed at 8,456 total (engine 2,898, docs 2,547, terminal 1,522, app 1,282, tools
+165, `.github` 33, root 9). Two knobs narrow instead of replaying:
+`STRATA_ADMIT_SHORT_FIRST` already exists upstream
+(`v0.2.21:terminal/serve/server.py:450,454,456,1808,1809,1827`), so #656b's fork
+delta reduces to the UNREAD-token ranking; upstream `verify.cpp` has **zero** hits
+for `max_cells == 0` and `drop_batch_graphs()`, so both fork hunks stay fork-owned.
+Two dead lines caught by the inventory: `run_parkv2_cuda_build.bat:7` still launches
+`build\cuda-win\strata.exe` (L0 fix to `hydragen.exe`), and `mc3_patch.py` is one of
+the 11 fork-only files — dead since §181 moved source registration in-tree, pruned at
+L0.
+
+Phase 0 is complete: P0.0–P0.7 each have an artifact on `main`
+(`control-pre-0221.md`, `PHASE1_GATES.md`, `PATCH_STACK.md`, `UPSTREAM_DELTA.md`,
+`LAYOUT_MIGRATION_0221.md`). Nothing was built, run, or measured; ms01 untouched.
+Open before the first Phase 1 arm: the ms01 hygiene debt (stale `p2d1_arms.sh`
+wrapper, 10 GiB `MemAvailable` against a 16 GiB conversation cache), and the §235
+tail-slot pin fix, which remains unwritten and hard-gates Phase 4. counter 191.
