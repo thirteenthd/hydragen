@@ -9341,7 +9341,21 @@ int main(int argc, char** argv) {
         strata::core::AutoCacheSlots auto_slots = strata::core::auto_cache_slots(
             (int64_t) free_b, reserve, blob, min_slots, late_mib);
         post_cache_late_b = auto_slots.late_priced ? (late_mib << 20) : 0;
-        post_cache_extra_b = (prefill_mib << 20) + mtp_bind + post_cache_late_b;
+        // HydraGen 2C: the deferred-slot reserve CAN be priced where the cache is actually sized, not only in
+        // `reserve`: both the heterogeneous sized-slots loop and the post-write shrink work from
+        // post_cache_extra_b, and with cow_reserve missing from it the auto cache grows into the memory the batch
+        // slots attach with (3,711 slots and ~650 MiB free at load, then "slot N session unavailable (memory
+        // limit)").  HG_COW_RESERVE_MODE: 0 (default) keeps the uncounted sizing, 1 prices the whole reserve,
+        // 2 prices half of it.  The default is the measured winner on the 12 GiB card, not the obvious fix: at
+        // --batch 4 mode 1 does clear all 10 attach refusals and opens 3.98-row batch windows, but it costs 730
+        // expert slots (3,711 -> 2,981), 8% of solo prefill and 10% of solo decode; at --batch 8 it costs 1,721
+        // slots (3,711 -> 1,990), 26% of solo prefill and 22% of solo decode, and N=8 falls to 6.8 tok/s per
+        // stream against 12.6 uncounted.  The refusals it removes are not failures - every request still
+        // completes - they are the admission control refusing to attach a working set the card cannot hold.
+        static const uint64_t cow_reserve_mode = hg_env_u64("HG_COW_RESERVE_MODE").value_or(0);
+        const int64_t cow_priced = cow_reserve_mode == 0 ? 0
+                                 : cow_reserve_mode == 2 ? cow_reserve / 2 : cow_reserve;
+        post_cache_extra_b = (prefill_mib << 20) + mtp_bind + post_cache_late_b + cow_priced;
         int64_t slots = auto_slots.slots;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
 #if defined(STRATA_GPU_METAL)
@@ -9382,6 +9396,11 @@ int main(int argc, char** argv) {
         if (cow_deferred > 0 && g_cow_cache_fund)
             std::fprintf(stderr, "strata generate: cow: reservation collateral: %lld MiB of deferred windows is NOT "
                                  "held out of the cache: it is collateralized via Stage C.5\n", (long long) (cow_win >> 20));
+        if (cow_deferred > 0)
+            std::fprintf(stderr, "strata generate: cow: reserve pricing: %lld of %lld MiB counted into the cache's own "
+                                 "bound (sized slots and the post-write shrink), HG_COW_RESERVE_MODE=%llu\n",
+                         (long long) (cow_priced >> 20), (long long) (cow_reserve >> 20),
+                         (unsigned long long) cow_reserve_mode);
 #if defined(STRATA_USE_HIP) && !defined(_WIN32)
         // An APU's "VRAM" is system RAM: the device-free figure above counts the whole GPU-addressable pool and does not
         // subtract ordinary CPU allocations (the host expert arena), so a cache sized from it alone can ask the OOM killer
