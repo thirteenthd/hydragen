@@ -709,6 +709,120 @@ class ConvCacheLog:
         return dict(self.state)
 
 
+class ParkDiskLog:
+    """M-C3a: the parked conversations' disk tier ("STRATA_PARK_DISK"), as the engine's log tells it: the
+    "park disk: ON / spilled / restored / drop / skip / refuse" lines it writes to stderr, which is the log.
+    The engine owns the tier; the serve side only counts what its lines report."""
+    ON = re.compile(r"park disk: ON (\S+) \(index (\d+) files, ([\d.]+) GiB, (\d+) refused"
+                    r"(?:, \d+ quarantined)?, rebuilt in "
+                    r"\d+ ms; budget (?:(\d+) MiB|free-space only), keep-free (\d+) MiB\)")
+    OFF = re.compile(r"park disk: DISABLED")
+    SPILL = re.compile(r"park disk: spilled (\d+) tokens, ([\d.]+) MiB in (\d+) ms "
+                       r"\((\d+) entries, ([\d.]+) GiB on disk\)")
+    READ = re.compile(r"park disk: restored (\d+) tokens, ([\d.]+) MiB read in (\d+) ms "
+                      r"\((\d+) entries, ([\d.]+) GiB on disk\)")
+    DROP = re.compile(r"park disk: drop \S+ \(([\d.]+) MiB, (\d+) entries, ([\d.]+) GiB on disk\)")
+    SKIP = re.compile(r"park disk: skip spill")
+    REFUSE = re.compile(r"park disk: (?:index )?refuse ")
+    FAIL = re.compile(r"park disk: spill failed")
+    V2 = re.compile(r"park disk: v2 dedup tier active \(store (\d+) chunks, ([\d.]+) GiB\)")
+    DEDUP = re.compile(r"park disk: dedup: ([\d.]+) GiB skipped as existing chunks \(store (\d+) chunks, ([\d.]+) GiB\)")
+    SWEPT = re.compile(r"park disk: swept (\d+) orphan chunk file")
+    READ_MAX = 1 << 20
+
+    def __init__(self):
+        self.key, self.pos = None, 0
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        self.state = {"enabled": False, "dir": None, "entries": 0, "bytes": 0, "budget_mib": None,
+                      "min_free_mib": None, "refused": 0, "spills": 0, "restores": 0, "drops": 0,
+                      "skips": 0, "refuses": 0, "fails": 0, "last_event": None, "last_tokens": None,
+                      "v2": False, "chunks": 0, "chunk_bytes": 0, "saved_mib": 0, "swept": 0,
+                      "last_mib": None, "last_ms": None, "last_at": None}
+
+    def poll(self, path, start) -> dict:
+        with self.lock:
+            return self._poll(path, start)
+
+    def _poll(self, path, start) -> dict:
+        if not path or start is None:
+            return dict(self.state)
+        if self.key != (path, start):                   # another start of the engine: the tier rescans
+            self.key, self.pos = (path, start), start
+            self.reset()
+        try:
+            size = os.path.getsize(path)
+            if size < self.pos:
+                self.pos = 0
+            if size - self.pos > self.READ_MAX:
+                self.pos = size - self.READ_MAX
+            with open(path, "rb") as f:
+                f.seek(self.pos)
+                data = f.read(size - self.pos)
+        except OSError:
+            return dict(self.state)
+        end = data.rfind(b"\n") + 1
+        self.pos += end
+        now = time.time()
+        for line in data[:end].decode("utf-8", "replace").splitlines():
+            if "park disk:" not in line:
+                continue
+            st = self.state
+            m = self.ON.search(line)
+            if m:
+                st["enabled"], st["dir"] = True, m.group(1)
+                st["entries"], st["bytes"] = int(m.group(2)), round(float(m.group(3)) * (1 << 30))
+                st["refused"], st["budget_mib"] = int(m.group(4)), int(m.group(5)) if m.group(5) else None
+                st["min_free_mib"] = int(m.group(6))
+                continue
+            if self.OFF.search(line):
+                st["enabled"] = False
+                continue
+            m = self.V2.search(line)
+            if m:
+                st["v2"] = True
+                st["chunks"], st["chunk_bytes"] = int(m.group(1)), round(float(m.group(2)) * (1 << 30))
+                continue
+            m = self.DEDUP.search(line)
+            if m:
+                st["saved_mib"] += float(m.group(1))
+                st["chunks"], st["chunk_bytes"] = int(m.group(2)), round(float(m.group(3)) * (1 << 30))
+                continue
+            m = self.SWEPT.search(line)
+            if m:
+                st["swept"] += int(m.group(1))
+                continue
+            m = self.SPILL.search(line)
+            if m:
+                st["spills"] += 1
+                st["entries"], st["bytes"] = int(m.group(4)), round(float(m.group(5)) * (1 << 30))
+                st["last_event"], st["last_tokens"] = "spilled", int(m.group(1))
+                st["last_mib"], st["last_ms"], st["last_at"] = float(m.group(2)), int(m.group(3)), now
+                continue
+            m = self.READ.search(line)
+            if m:
+                st["restores"] += 1
+                st["entries"], st["bytes"] = int(m.group(4)), round(float(m.group(5)) * (1 << 30))
+                st["last_event"], st["last_tokens"] = "restored", int(m.group(1))
+                st["last_mib"], st["last_ms"], st["last_at"] = float(m.group(2)), int(m.group(3)), now
+                continue
+            m = self.DROP.search(line)
+            if m:
+                st["drops"] += 1
+                st["entries"], st["bytes"] = int(m.group(2)), round(float(m.group(3)) * (1 << 30))
+                continue
+            if self.SKIP.search(line):
+                st["skips"] += 1
+            elif self.REFUSE.search(line):
+                st["refuses"] += 1
+            elif self.FAIL.search(line):
+                st["fails"] += 1
+        return dict(self.state)
+
+
+
 EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
 
 
@@ -992,6 +1106,7 @@ class StrataEngine:
         self.slot_gs = gs if groups > 1 and groups_run > 1 and not self.info.get("slot_read") else 0
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
+        self.slot_t_free = [0.0] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
         # given back; slot_releasing: slots handed to the background BDONE wait.  A busy slot in neither has no owner
         # (its flag leaked) and would keep every later request waiting for a slot that nothing will free.
@@ -1717,7 +1832,7 @@ class StrataEngine:
         except EngineDied:
             pass
         q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
-        releasing, claims = self.slot_releasing, self.slot_claims
+        releasing, claims, t_free = self.slot_releasing, self.slot_claims, self.slot_t_free
         if self.gen != born:     # #5657: a restart came in since the check above (its number moves before its objects
             return               # do): these sets may be the NEW engine's, whose request holds this slot number now
         with self.slot_cv:
@@ -1759,6 +1874,7 @@ class StrataEngine:
             held[slot] = tail[:-1] if stream and tail else []
             with self.slot_cv:
                 busy[slot] = False
+                t_free[slot] = time.time()
                 releasing.discard(slot)
                 self.slot_cv.notify_all()
         threading.Thread(target=wait, daemon=True).start()
@@ -1799,6 +1915,7 @@ class StrataEngine:
                 first = self._orphan_seen.setdefault(b, now)
                 if now - first >= self.ORPHAN_SLOT_S:
                     self.slot_busy[b] = False
+                    self.slot_t_free[b] = time.time()
                     self._orphan_seen.pop(b, None)
                     freed.append(b)
             else:
@@ -1889,6 +2006,7 @@ class StrataEngine:
         cancel._strata_preslot = None
         with self.slot_cv:
             self.slot_busy[slot] = False
+            self.slot_t_free[slot] = time.time()
             self.slot_claims.discard(slot)
             self.slot_cv.notify_all()
 
@@ -2214,6 +2332,7 @@ class StrataEngine:
                     elif reserved is not None:              # it did not give way: the slot is free again
                         with self.slot_cv:
                             self.slot_busy[reserved] = False
+                            self.slot_t_free[reserved] = time.time()
                             self.slot_claims.discard(reserved)
                             self.slot_cv.notify_all()
                         reserved = None
@@ -2361,8 +2480,7 @@ class StrataEngine:
                             with self.slot_cv:
                                 self.slot_claims.discard(slot)
                                 self.slot_busy[slot] = False
-                                if hasattr(self, "slot_t_free"):
-                                    self.slot_t_free[slot] = time.time()
+                                self.slot_t_free[slot] = time.time()
                                 self.__dict__.setdefault("_mem_backoff", {})[slot] = time.monotonic() + self.SLOT_MEM_BACKOFF_S
                                 others_busy = any(self.slot_busy)
                                 self.slot_cv.notify_all()
@@ -2462,6 +2580,7 @@ class StrataEngine:
                             self.slot_used[slot] = time.time()
                             with self.slot_cv:
                                 self.slot_busy[slot] = False
+                                self.slot_t_free[slot] = time.time()
                                 self.slot_claims.discard(slot)
                                 self.slot_cv.notify_all()
                             slot, gen0 = None, None
@@ -2528,8 +2647,8 @@ class StrataEngine:
                     self.admitting = max(0, self.admitting - 1)
             # #4451 / #5657: capture this generation's slot tables before checking self.gen == born, after the drains and
             # waits above (a restart advances self.gen before replacing these objects for the new engine's requests)
-            busy, claims, held, used, live_slots = (
-                self.slot_busy, self.slot_claims, self.slot_held, self.slot_used, self.slot_live,
+            busy, claims, held, used, live_slots, t_free = (
+                self.slot_busy, self.slot_claims, self.slot_held, self.slot_used, self.slot_live, self.slot_t_free,
             )
             same = self.gen == born
             if solo_leg is not None and same and solo_leg[2] == self.gen and slot != 0 and len(held):
@@ -2542,6 +2661,7 @@ class StrataEngine:
             if reserved is not None and same and reserved < len(busy):
                 with self.slot_cv:
                     busy[reserved] = False
+                    t_free[reserved] = time.time()
                     claims.discard(reserved)
                     self.slot_cv.notify_all()
             if slot is not None and same and not handed and slot < len(busy):
@@ -2552,6 +2672,7 @@ class StrataEngine:
                     held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
                     with self.slot_cv:
                         busy[slot] = False
+                        t_free[slot] = time.time()
                         claims.discard(slot)
                         self.slot_cv.notify_all()
                 elif phase == "slot":
@@ -2561,6 +2682,7 @@ class StrataEngine:
                 else:
                     with self.slot_cv:
                         busy[slot] = False
+                        t_free[slot] = time.time()
                         claims.discard(slot)
                         self.slot_cv.notify_all()
 
@@ -2692,7 +2814,8 @@ class StrataEngine:
         for b in range(self.batch):
             r = self.slot_live[b]
             if r is None:
-                view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b])})
+                view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b]),
+                             "idle_s": round(now - self.slot_t_free[b], 1) if self.slot_t_free[b] else None})
                 continue
             ft = r.get("first_token")
             view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
@@ -4311,6 +4434,7 @@ class Service:
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
+        self.pd_log = ParkDiskLog()
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
@@ -5425,8 +5549,10 @@ class Service:
             engine["vision_note"] = self.vision.cpu_note
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        disk = self.pd_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+                "park_disk": disk,
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
@@ -7717,6 +7843,7 @@ def make_handler(svc: Service):
                 body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
                 if not path:
                     # the chat's svg/html preview is a sandboxed frame; this keeps it from navigating away to a web page
                     # (a link or <meta refresh> inside a model's html), which no sandbox flag does (serve/web/preview.js)
@@ -7816,7 +7943,10 @@ def make_handler(svc: Service):
                         # --batch: one entry per slot (the same view /metrics has), not one for the whole engine
                         n_ctx = svc.reported_ctx()
                         slots = [{"id": s["slot"], "n_ctx": n_ctx, "is_processing": s["state"] != "idle",
-                                  "n_prompt_tokens": int(s.get("prompt_tokens") or s.get("held_tokens") or 0)}
+                                  "n_prompt_tokens": int(s.get("prompt_tokens") or s.get("held_tokens") or 0),
+                                  "state": s["state"],
+                                  "held_tokens": int(s.get("held_tokens") or 0),
+                                  "idle_s": s.get("idle_s")}
                                  for s in svc.engine.slots_view()]
                     else:
                         slots = [{"id": 0, "n_ctx": svc.reported_ctx(), "is_processing": busy,
@@ -9461,7 +9591,20 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     if a.engine == "strata" and not (tpath / "vocab.json").exists():
         _ensure_shape_tokenizer(cfg, tpath)
     if a.engine == "strata" and not (tpath / "vocab.json").exists():
-        ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
+        _fix = ""
+        if tpath.name == "tokenizer" and len(tpath.parents) >= 3:
+            _pack_dir = tpath.parent
+            if os.name == "nt":
+                _fix = ("  the tokenizer is exported when the pack is built: run  cmd /c engine\\SETUP.bat"
+                        " --model <QUANT> --data-dir " + str(tpath.parents[2]) + "  (resumable; re-runs are cheap)."
+                        "  If the pack is already complete, export just the tokenizer:"
+                        "  .venv\\Scripts\\python.exe engine\\tools\\strata_tokenizer.py --gguf <model shard-1 .gguf> --out " + str(_pack_dir))
+            else:
+                _fix = ("  the tokenizer is exported when the pack is built: run  ./engine/SETUP.sh"
+                        " --model <QUANT> --data-dir " + str(tpath.parents[2]) + "  (resumable; re-runs are cheap)."
+                        "  If the pack is already complete, export just the tokenizer:"
+                        "  .venv/bin/python engine/tools/strata_tokenizer.py --gguf <model shard-1 .gguf> --out " + str(_pack_dir))
+        ap.error("the model's tokenizer is missing (" + str(tpath / "vocab.json") + ");" + _fix)
     if (tpath / "vocab.json").exists():
         import strata_tokenizer as ST
         vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Strata</title>
+<title>HydraGen</title>
 <link rel="icon" href="web/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="web/tokens.css">
 <link rel="stylesheet" href="web/components.css">
@@ -19,7 +19,7 @@
 </head>
 <body>
 <header class="st-header">
-  <a class="st-header__brand" href="https://github.com/Niko1221/Strata" target="_blank" rel="noopener noreferrer" title="Strata on GitHub" data-i18n-title="header.github">Strata</a>
+  <a class="st-header__brand" href="https://github.com/Niko1221/Strata" target="_blank" rel="noopener noreferrer" title="Strata on GitHub" data-i18n-title="header.github">HydraGen</a>
   <nav class="st-tabs" role="tablist" aria-label="Views" data-i18n-label="tab.views">
     <button class="st-tab" role="tab" id="tab-btn-chat" aria-controls="view-chat" aria-selected="true" data-tab="chat">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg><span data-i18n="tab.chat">Chat</span></button>
@@ -121,20 +121,19 @@
   <!-- ============================ Monitor ============================ -->
   <section class="view view--monitor" id="view-monitor" role="tabpanel" aria-labelledby="tab-btn-monitor" hidden>
     <div class="monitor">
-      <div class="st-card state-card">
-        <div class="state-card__head">
-          <span class="card-title">Model state</span>
-          <span class="badges" id="state-badges">
-            <span class="st-badge" data-s="idle">Idle</span>
-            <span class="st-badge" data-s="unloaded">Unloaded</span>
-            <span class="st-badge st-badge--reading" data-s="reading">Reading</span>
-            <span class="st-badge st-badge--generating" data-s="generating">Generating</span>
-            <span class="st-badge st-badge--queued" data-s="queued">Queued</span>
-            <span class="st-badge st-badge--error" data-s="error">Error</span>
-          </span>
+      <div class="st-card slots-dashboard-card" id="slots-dashboard-card">
+        <div class="slots-dashboard__head">
+          <div class="slots-dashboard__title-wrap">
+            <span class="card-title"><svg class="st-icon st-icon--sm" aria-hidden="true"><use href="web/sprite.svg#i-layers"/></svg>Concurrency States</span>
+          </div>
+          <div class="slots-dashboard__badges" id="slots-dashboard-badges">
+            <span class="st-badge" id="slots-state-badge">Idle</span>
+            <span class="st-badge" id="slots-active-badge">0 / 2 Active</span>
+          </div>
         </div>
-        <div class="state-card__row"><span id="state-label">Waiting for a request</span><span class="muted" id="state-detail"></span></div>
-        <div class="st-progress" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
+        <div class="slots-bars-grid" id="slots-bars-grid">
+          <!-- populated by app.js: one tile per batch slot + Queue sub-card -->
+        </div>
       </div>
 
       <div class="metrics" id="metrics">
@@ -186,8 +185,9 @@
         </div>
       </div>
 
+      <div class="cache-pair">
       <div class="st-card cc-card" id="cc-card">
-        <div class="req-head"><span class="card-title">Conversation cache</span><span class="muted small" id="cc-sum"></span></div>
+        <div class="req-head"><span class="card-title">Conversation cache (RAM)</span><span class="muted small" id="cc-sum"></span></div>
         <div class="cc-bars" id="cc-bars" hidden>
           <div><div class="bar-row"><span>Parked conversations</span><span class="muted" id="cc-slots-text">&ndash;</span></div>
             <div class="st-progress"><div class="st-progress__bar" id="cc-slots-bar" style="width:0%"></div></div></div>
@@ -196,6 +196,17 @@
         </div>
         <dl class="facts" id="cc-facts"></dl>
         <p class="muted small cc-note" id="cc-note"></p>
+      </div>
+
+      <div class="st-card cc-card" id="pd-card" hidden>
+        <div class="req-head"><span class="card-title">Park disk tier</span><span class="muted small" id="pd-sum"></span></div>
+        <div class="cc-bars" id="pd-bars" hidden>
+          <div style="grid-column:1/-1"><div class="bar-row"><span>Parked images (disk)</span><span class="muted" id="pd-mem-text">&ndash;</span></div>
+            <div class="st-progress"><div class="st-progress__bar" id="pd-mem-bar" style="width:0%"></div></div></div>
+        </div>
+        <dl class="facts" id="pd-facts"></dl>
+        <p class="muted small cc-note" id="pd-note"></p>
+      </div>
       </div>
 
       <div class="st-card mcp-card" id="mcp-card" hidden>
