@@ -1172,6 +1172,48 @@ int main() {
         ConversationCache plain(one, 4);
         check(plain.put(image({1,2,3})) && plain.put(image({4,5,6})) && plain.size() == 1, "without a sink: evicted as before");
     }
+    {   // HydraGen 2B: with a disk tier under the cache (spill_hook), the eviction make_room() had to do reaches that
+        // tier too.  It used to reach only sink_ (upstream's SSD folder): with both wired, every budget eviction went
+        // there and the park-disk store never saw a byte (its metrics stayed entries 0, spills 0, chunks 0).  The
+        // donor cascade comes with the eviction, which the sink path could not carry.
+        const size_t one = image({1,2,3}).bytes();
+        ConversationCache c(one * 2, 4);
+        std::vector<SavedConversation> sunk, spilled;
+        std::vector<int64_t> slots;
+        c.set_evict_sink([&](SavedConversation&& s) { sunk.push_back(std::move(s)); });
+        c.spill_hook = [&](SavedConversation&& s, int64_t slot) {
+            spilled.push_back(std::move(s)); slots.push_back(slot); return true; };
+        check(c.put(image({1,2,3})) && c.put(image({4,5,6})), "two parked");
+        check(c.put(image({7,8,9})) && spilled.size() == 1 && sunk.empty() &&
+              spilled[0].live.ids == std::vector<int32_t>({1,2,3}) && slots[0] > 0,
+              "the budget's eviction goes to the disk tier, not the sink, with its slot serial");
+        check(c.evict_oldest() && spilled.size() == 2 && sunk.empty() &&
+              spilled[1].live.ids == std::vector<int32_t>({4,5,6}), "the RAM gate's eviction reaches it the same way");
+        check(c.size() == 1 && c.evictions() == 2, "the cache keeps its own count as before");
+        // an anchored child's eviction takes its donor with it (the chain the child's disk file names), donor first
+        ConversationCache v(one * 4, 4);
+        check(v.put(image({1,2,9})), "a conversation another park is anchored on");
+        const uint64_t donor = v.best(std::vector<int32_t>{1,2,9,7}, {}, true).serial;
+        check(donor > 0, "the donor's serial is readable");
+        ConversationCache w(one * 2 + 8, 4);
+        std::vector<SavedConversation> wsp;
+        std::vector<int64_t> wslots;
+        w.spill_hook = [&](SavedConversation&& s, int64_t slot) {
+            wsp.push_back(std::move(s)); wslots.push_back(slot); return true; };
+        auto child = image({1,2,3});
+        child.view_donor = (int64_t) donor;
+        check(w.put(image({1,2,9})) && w.put(std::move(child)) && w.size() == 2, "the child is parked with its donor");
+        check(w.make_room(one) && wsp.size() == 2 && wsp[0].live.ids == std::vector<int32_t>({1,2,9}) &&
+              wsp[1].live.ids == std::vector<int32_t>({1,2,3}) && wslots[0] == (int64_t) donor && w.size() == 0,
+              "the child's budget eviction takes its donor with it, both to the disk tier, donor first");
+        // with no disk tier the sink path is untouched
+        ConversationCache nosink(one * 2, 4);
+        std::vector<SavedConversation> psunk;
+        nosink.set_evict_sink([&](SavedConversation&& s) { psunk.push_back(std::move(s)); });
+        check(nosink.put(image({1,2,3})) && nosink.put(image({4,5,6})) && nosink.put(image({7,8,9})) &&
+              psunk.size() == 1 && psunk[0].live.ids == std::vector<int32_t>({1,2,3}),
+              "no disk tier: the sink keeps the eviction, as before");
+    }
     {
         // #4420: a batch slot's chain holds one checkpoint (its admission's): parking it must not drop (#342) the main session's copy of the
         // same conversation that also holds the root a sibling borrows from (an agent's system prompt and tools) - supersedes_richer()

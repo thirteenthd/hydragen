@@ -768,6 +768,12 @@ private:
         // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].pinned() || is_view_donor(i) || is_guarded(serials_[i])) continue;
+            // HydraGen 2B: an eviction make_room() had to do is an eviction like any other, and with a disk tier
+            // under the cache it has to reach that tier.  evict_slot() carries the view-donor cascade and the slot
+            // serial the tier's lineage needs; sink_ alone (upstream's SSD folder) is the older path and stays only
+            // where no tier is wired.  The budget loop only needs the bytes back, and the cascade can only free
+            // more of them, so the invariants (bytes_ per erased entry, one evictions_ per erase) hold as before.
+            if (spill_hook) return evict_slot(i, 0);
             bytes_ -= entries_[i].bytes();
             SavedConversation victim = sink_ ? std::move(entries_[i]) : SavedConversation{};
             erase(i);

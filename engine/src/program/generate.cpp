@@ -14182,7 +14182,20 @@ int main(int argc, char** argv) {
         strata::core::ConversationSpill spill;
         std::optional<strata::core::SessionFileIdentity> spill_id;
         strata::core::SpillCost spill_cost;   // only conversations whose re-read costs more than the disk round trip go there
-        if (conversations.enabled() && stages.empty() && o.conversation_spill_mib != 0) {
+        // HydraGen 2B: with STRATA_PARK_DISK set the park-disk tier owns the SSD path (identity-bound files, chunk
+        // dedup, the lineage the CoW anchors read).  Upstream's conversation-spill folder switched itself on whenever
+        // --pack sat under <data>/packs/, even with STRATA_PARK_DISK set: the RAM evictions then went to
+        // conversation-spill/ through set_evict_sink and the park-disk store never saw a byte (its metrics stayed
+        // entries 0, spills 0, chunks 0 while the spill folder grew to gigabytes).  One SSD tier per engine: the park
+        // disk wins, unless the operator names the other folder explicitly with --conversation-spill-dir.
+        const char* park_disk_dir_env = hg_getenv("STRATA_PARK_DISK");
+        const bool park_owns_ssd = park_disk_dir_env != nullptr && park_disk_dir_env[0] != '\0' &&
+                                   o.conversation_spill_dir.empty();
+        if (conversations.enabled() && stages.empty() && o.conversation_spill_mib != 0 && park_owns_ssd)
+            std::fprintf(stderr, "strata serve: conversation cache: the SSD tier is STRATA_PARK_DISK (%s): the "
+                                  "conversation-spill folder stays off (--conversation-spill-dir DIR names it "
+                                  "explicitly instead)\n", park_disk_dir_env);
+        else if (conversations.enabled() && stages.empty() && o.conversation_spill_mib != 0) {
             std::filesystem::path root;
             if (!o.conversation_spill_dir.empty()) {
                 root = o.conversation_spill_dir;
