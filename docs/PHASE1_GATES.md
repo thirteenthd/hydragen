@@ -149,16 +149,22 @@ the corruption path are the same path.
 ### G6 — tree integrity across the layout move
 
 ```
-git ls-files engine | wc -l      # 7,332 at control-pre-0221
-git ls-files | wc -l             # 7,403
+git ls-files engine | wc -l      # 7,332 at control-pre-0221 (654b078) — unchanged at tip
+git ls-files | wc -l             # per-commit, not one number:
+                                 #   7,403 at 654b078 (the tag)
+                                 #   7,405 at 4bf3603 (P0.1 docs)
+                                 #   7,407 at dd201f7 (P0.2/P0.5 docs)
 ```
+Compare against the tag's own counts, which are the moving target for the layout
+move: `v0.2.21` = **8,456** total — `engine/` 2,898, `docs/` 2,547, `terminal/`
+1,522, `app/` 1,282, `tools/` 165, `.github/` 33, root 9.
 Pass: after any checkout of the 0.2.16 layout, the per-subtree counts match
 upstream's own `git ls-files` for the same subtree **before** any diff is trusted.
 Root `.gitignore` anchors to `/models/` and the two dead negations are deleted;
 `engine/docs/` (upstream docs, incl. `MODELS.md`, `HOW_IT_WORKS.md`,
 `benchmarks/`) never lands at root `docs/` — two exact-name collisions verified
-against our own `docs/`. §207/§208 swallowed 156 source files twice; this gate is
-what stops a third time.
+against our own `docs/`. §207/§208 swallowed 201 files in two incidents (45
+`mtmd/models/` + 156 `src/models/`); this gate is what stops a third time.
 
 ### G7 — row-cap arms (decision 3)
 
