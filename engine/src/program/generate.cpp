@@ -5661,8 +5661,7 @@ int main(int argc, char** argv) {
         // Cap it; --pcie-frac sets the share outright and never passes here, STRATA_PCIE_FRAC_BATCH_MAX=0 keeps
         // the uncapped start, any other value caps there.  See strata::pcie_batch_frac_cap for the measurement.
         {
-            const char* bmax = std::getenv("STRATA_PCIE_FRAC_BATCH_MAX");
-            const double bcap = bmax ? std::atof(bmax) : 0.25;
+            const double bcap = strata::pcie_batch_frac_cap_max();
             const double uncapped = o.pcie_frac;
             const double capped = strata::pcie_batch_frac_cap(o.pcie_frac, o.batch, bcap);
             if (capped != uncapped) {
@@ -15205,6 +15204,21 @@ int main(int argc, char** argv) {
                 o.pcie_frac = f0;
             }
         }
+        // Phase 3 Track 3C: that start lands HIGH on a weak CPU (4 workers 0.50), and a batched stage never
+        // gets PcieAuto's refinement (gated on o.batch == 0 below), so the batched cap is applied to it as
+        // well - otherwise this assignment silently undoes the cap set at the start-up default.  --pcie-frac
+        // leaves pcie_frac_auto false and never passes here, so an explicit share still wins outright.
+        if (o.pcie_frac_auto) {
+            const double uncapped = o.pcie_frac;
+            const double capped = strata::pcie_batch_frac_cap_default(o.pcie_frac, o.batch);
+            if (capped != uncapped) {
+                o.pcie_frac = capped;
+                std::fprintf(stderr, "strata serve: batched stage (--batch %d): PCIe share start %.2f -> %.2f "
+                                     "(batched cap after the pool-size start; --pcie-frac overrides, "
+                                     "STRATA_PCIE_FRAC_BATCH_MAX=0 keeps %.2f)\n",
+                             o.batch, uncapped, capped, uncapped);
+            }
+        }
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
         const bool all_experts_resident = !host_res.empty() &&
             std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
@@ -17044,6 +17058,11 @@ int main(int argc, char** argv) {
             // fed).  Kept when the request ends (`cached`), so the next turn of that conversation continues from it
             // instead of reading its history again (see `slot_source` in the request path).
             std::vector<int32_t> ids;
+            // P3-3A: the prefix-affinity key of this slot's header, and the ids length it was hashed at.
+            // Retaken when the slot is re-admitted (every reset is a `BSlot{}`, which clears both), when its
+            // conversation got shorter, and while its header is still under the hash depth.
+            int64_t aff_key = 0;
+            int aff_key_len = -1;
             int64_t reply0 = 0;            ///< the index in `ids` where its penalty window starts (the last prompt token; 0 with STRATA_PENALTY_PROMPT=1)
             int pen_n = 0;                 ///< its request's penalty window (penalty_last_n) when it has a repeat / frequency / presence penalty, else 0
             bool cached = false;           ///< idle, and its sessions still hold `ids`
@@ -17602,24 +17621,22 @@ int main(int argc, char** argv) {
                 // P3-3A: prefix affinity.  Fan-out siblings (one header, different tails) share
                 // their routed experts and their KV prefix, so they belong in the same cohort
                 // window rather than spread across rotations.  The key hashes the slot's first
-                // tokens; it is stable once the header passes the hash depth, so it is cached per
-                // slot and retaken only when the slot is re-admitted (ids shrink) or its header is
-                // still growing.
-                static std::vector<int64_t> gov_aff_key;
-                static std::vector<int> gov_aff_len;
+                // tokens; the key lives on the slot (BSlot::aff_key), so a re-admission - every reset is a
+                // `BSlot{}` - cannot leave the previous conversation's hash behind.  A length heuristic alone
+                // can: a slot that finished a SHORTER conversation and came back with a longer prompt
+                // (n >= the length it was hashed at) would keep the old key.
                 std::vector<int64_t> gov_aff;
                 if (decode_gov.affinity_enabled() && !runnable_slots.empty()) {
-                    if (gov_aff_key.size() < bs.size()) { gov_aff_key.resize(bs.size(), 0); gov_aff_len.resize(bs.size(), -1); }
                     gov_aff.assign(runnable_slots.size(), 0);
                     for (size_t i = 0; i < runnable_slots.size(); ++i) {
                         const size_t s = (size_t) runnable_slots[i];
                         const int n = (int) bs[s].ids.size();
-                        if (gov_aff_len[s] < 0 || n < gov_aff_len[s] ||
-                            (gov_aff_len[s] < strata::program::kPrefixAffinityDepth && n != gov_aff_len[s])) {
-                            gov_aff_key[s] = strata::program::prefix_affinity_key(bs[s].ids);
-                            gov_aff_len[s] = n;
+                        if (bs[s].aff_key_len < 0 || n < bs[s].aff_key_len ||
+                            bs[s].aff_key_len < strata::program::kPrefixAffinityDepth) {
+                            bs[s].aff_key = strata::program::prefix_affinity_key(bs[s].ids);
+                            bs[s].aff_key_len = n;
                         }
-                        gov_aff[i] = gov_aff_key[s];
+                        gov_aff[i] = bs[s].aff_key;
                     }
                 }
                 gov_cohort = decode_gov.select_cohort(runnable_slots, gov_slot_cap, gov_now_ms, gov_aff);

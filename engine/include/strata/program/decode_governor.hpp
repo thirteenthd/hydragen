@@ -263,6 +263,16 @@ public:
             }
             if (pick < 0) pick = waiting.front();
             if (cfg_.affinity) {
+                // A chosen slot leaves the queue. Its wait must not survive this rotation: a slot
+                // that once reached affinity_max_wait would otherwise stay aged out forever, and
+                // the aging rule is checked before prefix affinity, so every later fill — including
+                // after it finished its turn and rejoined the pool — would go back to it.
+                for (size_t i = 0; i < waited_.size(); ++i) {
+                    if (waited_[i].first == pick) {
+                        waited_.erase(waited_.begin() + (long) i);
+                        break;
+                    }
+                }
                 // Only the slots actually stepped over age: a cold-start fill takes the circular
                 // front and passes nobody, so it must not put the whole pool behind a queue.
                 for (size_t i = 0; i < waiting.size(); ++i) {

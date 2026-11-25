@@ -401,6 +401,50 @@ int main() {
         CHECK(gov.affinity_deferrals() == 0);
     }
 
+    // 10d. P3-3A review fix: an aged-out slot that gets admitted must not stay aged out forever.
+    //      The aging rule is checked before prefix affinity, so a stale wait entry would win every
+    //      later fill — including after the slot left the cohort and rejoined the pool.
+    {
+        DecodeGovernorConfig cfg;
+        cfg.enabled = true;
+        cfg.min_stream_tps = 0.0;
+        cfg.hit_floor_pct = 86.0;
+        cfg.initial_width = 3;
+        cfg.max_width = 3;
+        cfg.eval_every = 4;
+        cfg.cohort_quantum_ms = 0.0;
+        cfg.grace_windows = 0;
+        cfg.affinity = true;
+        cfg.affinity_max_wait = 1;
+        DecodeGovernor gov(cfg);
+
+        const std::vector<int> r5 = {0, 1, 2, 3, 4};
+        // slots 0 and 2 are one fan-out family; 1, 3 and 4 are unrelated
+        const std::vector<int64_t> key = {7, 9, 7, 9, 9};
+
+        CHECK((gov.select_cohort(r5, 3, 0.0, key) == std::vector<int>{0, 1, 2}));
+        // Slot 1 was stepped over once (so it aged out), then admitted by the aging rule. Right
+        // after admission its wait is back to zero; 3 and 4 are still queued.
+        CHECK(gov.waited_for(1) == 0);
+        CHECK(gov.waited_for(3) == 1);
+        CHECK(gov.waited_for(4) == 1);
+
+        // Degraded windows shrink the width; each trim drops the highest cohort ID (2, then 1).
+        for (int i = 0; i < 4; ++i) gov.observe_window(25.0, gov.target_width(), gov.target_width(), 50.0, 5);
+        CHECK((gov.select_cohort(r5, 3, 10.0, key) == std::vector<int>{0, 1}));
+        for (int i = 0; i < 4; ++i) gov.observe_window(25.0, gov.target_width(), gov.target_width(), 50.0, 5);
+        CHECK((gov.select_cohort(r5, 3, 20.0, key) == std::vector<int>{0}));
+
+        // Slots 3 and 4 finished; healthy windows widen again. The free seat goes back to the
+        // prefix sibling (2), not to the stale queue entry (1).
+        for (int i = 0; i < 4; ++i) gov.observe_window(25.0, gov.target_width(), gov.target_width(), 95.0, 3);
+        const std::vector<int> r3 = {0, 1, 2};
+        const std::vector<int64_t> key3 = {7, 9, 7};
+        CHECK((gov.select_cohort(r3, 3, 30.0, key3) == std::vector<int>{0, 2}));
+        CHECK(gov.affinity_picks() == 2);
+        CHECK(gov.waited_for(1) == 0);
+    }
+
     // 11. P3-3A prefix_affinity_key: same header -> same key whatever the tail; different header ->
     //     different key; too short to mean anything -> 0 (no packing).
     {

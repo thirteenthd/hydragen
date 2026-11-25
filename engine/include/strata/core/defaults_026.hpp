@@ -52,4 +52,18 @@ inline double pcie_batch_frac_cap(double frac, int batch, double cap) {
     return frac > cap ? cap : frac;
 }
 
+/// The cap's value: STRATA_PCIE_FRAC_BATCH_MAX, else 0.25 (the measurement above).
+inline double pcie_batch_frac_cap_max() {
+    const char* bmax = std::getenv("STRATA_PCIE_FRAC_BATCH_MAX");
+    return bmax ? std::atof(bmax) : 0.25;
+}
+
+/// The cap with its env value, for a caller that only has the share to fix.  The start share is set
+/// twice - once from the link probe, once from the worker-pool size (generate.cpp's BW-MEASURE start,
+/// which lands HIGH on a weak CPU: 4 workers 0.50) - so both sites ask here rather than trusting the
+/// first one.  An explicit --pcie-frac clears pcie_frac_auto and reaches neither.
+inline double pcie_batch_frac_cap_default(double frac, int batch) {
+    return pcie_batch_frac_cap(frac, batch, pcie_batch_frac_cap_max());
+}
+
 }  // namespace strata
