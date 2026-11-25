@@ -1298,5 +1298,28 @@ int main() {
         check(conversation_checkpoints_prefixing(checks, live, true).empty(),
               "#2518: an image prompt carries no checkpoints (its tokens do not match again)");
     }
+    {
+        // §191 guards nest: the borrow's donor guard stays in effect under an inner (park anchor) guard.
+        // The single-slot version let the inner guard clobber the outer one, and the park's eviction
+        // killed the donor mid-borrow (prod crash, exit 1: "restoring a borrowed conversation prefix: gone").
+        SavedConversation donor = image({1, 2, 3, 4});
+        SavedConversation anchor = image({5, 5, 5});
+        ConversationCache cache(1 << 20, 3);
+        check(cache.put(std::move(donor)) && cache.put(std::move(anchor)) && cache.put(image({6, 6, 6})),
+              "three entries parked");
+        const uint64_t ds = cache.best(std::vector<int64_t>{1, 2, 3, 4, 90}, {}, true).serial;
+        const uint64_t as = cache.best(std::vector<int64_t>{5, 5, 5, 90}, {}, true).serial;
+        check(ds != 0 && as != 0 && ds != as, "both entries addressed by serial");
+        cache.guard(ds);          // outer: the borrow's donor (generate.cpp 17670)
+        cache.guard(as);          // inner: the park anchor guard (generate.cpp 13134)
+        check(cache.put(image({7, 7, 7})) && cache.evictions() == 1 &&
+              cache.find(ds) != nullptr && cache.find(as) != nullptr,
+              "neither guard is an eviction candidate: the ordinary entry goes instead");
+        cache.unguard();          // the anchor guard ends (ParkAnchorGuard); the donor is still held
+        check(cache.put(image({8, 8, 8})) && cache.evictions() == 2 &&
+              cache.find(as) == nullptr && cache.find(ds) != nullptr,
+              "the inner unguard releases only the inner: the donor still survives");
+        cache.unguard();
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

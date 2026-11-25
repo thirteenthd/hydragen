@@ -417,7 +417,8 @@ size_t conversation_kv_bytes(const QsaState& st, const ModelGeometry& g, int64_t
 
 bool conversation_kv_save(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error,
-                          int64_t unchanged_tokens, size_t* reused_bytes) {
+                          int64_t unchanged_tokens, size_t* reused_bytes,
+                          const ConversationKv* anchor, int64_t anchor_tokens) {
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error)) return false;
@@ -436,6 +437,30 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     const auto src = pools(st);
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<ConversationBuffer*,5> dst = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+    // M-C2: the donor image's prefix bytes this session was RESTORED from (byte-identical to its own
+    // through whole pages and complete indexer rows below anchor_tokens). Geometry mismatch: no anchor.
+    std::array<const ConversationBuffer*,5> anchor_part{};
+    std::array<size_t,5> anchor_keep{};
+    if (anchor != nullptr && anchor_tokens > 0) {
+        if (anchor->format != l.format || anchor->cells < l.cells || anchor->heads != g.n_head_kv ||
+            anchor->head_dim != g.head_dim || anchor->page_size != l.page_size || anchor->idx_dim != g.idx_key_dim)
+            anchor = nullptr;
+        else {
+            const int64_t at = std::min<int64_t>(anchor_tokens, upto);
+            const int64_t ac = (at / l.page_size) * l.page_size;
+            const int64_t arows = at / strata::kernels::qsa_real_shapes().idx_block;
+            anchor_part = {&anchor->k, &anchor->v, &anchor->k_scale, &anchor->v_scale, &anchor->pooled};
+            for (size_t i = 0; i < 5; ++i)
+                anchor_keep[i] = i == 4 ? (index ? size_t(arows) * g.idx_key_dim * sizeof(float) : 0)
+                                        : (l.cells ? (sizes[i] / size_t(l.cells)) * size_t(ac) : 0);
+            for (size_t i = 0; i < 5; ++i)
+                if (anchor_keep[i] > anchor_part[i]->size()) {
+                    anchor = nullptr;
+                    for (auto& x : anchor_keep) x = 0;
+                    break;
+                }
+        }
+    }
     // STRATA_PARK_VRAM_MIB: this layer's parts go into the park's slot under a fresh tag (0: no slot this park)
     image.dev_tag = park_async().slot != nullptr ? vram_kv().next_tag++ : 0;
     const bool fast_host = park_host_memcpy_on() && st.kv_mode != 0;
@@ -443,9 +468,36 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     for (size_t i = 0; i < dst.size(); ++i) {
         // Recopy the partial page and the indexer's moving spare row. Completed
         // pages/rows strictly before the first rewritten token remain identical.
-        const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
-                                  : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
+        size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
+                             : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
+        const size_t anc = anchor ? anchor_keep[i] : 0;
+        if (anc > keep && src[i] && !on_device(src[i]) && dst[i]->adopt_shared(*anchor_part[i], anc,
+                                                         static_cast<const uint8_t*>(src[i]))) {
+            // (device-resident pools - the indexer pooled part, kv_mode 0 - are verified by copying, not memcmp)
+            // M-C2: verified identical - view the donor's bytes; copy only past the views
+            dst[i]->resize_for_overwrite(sizes[i]);   // appends owned segments past the views
+            if (!dst[i]->visit(anc, sizes[i] - anc, [&](uint8_t* p, size_t n, size_t at2) {
+                    return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at2 : nullptr, n, error);
+                })) return false;
+            if (reused_bytes) *reused_bytes += anc;
+            continue;
+        }
+        // M-D2: this part's buffer may be the conversation's own previous park image, which can still
+        // hold CoW view segments from its last park's anchor (or the adopt above was refused and left
+        // the buffer untouched). A write landing on a borrowed segment aborts visit() with NO error
+        // string, which surfaced as the b8-elastic battery's exit-code-1 park deaths with an empty
+        // `ERR`. Drop this part's reuse when the rewrite range hits a view: copy it whole, fresh.
+        if (dst[i]->has_borrowed(keep, sizes[i] - keep)) {
+            static const bool said = [] {
+                std::fprintf(stderr, "strata: conversation park: the reused K/V part holds CoW views under "
+                                     "this park's rewrite range; copying the part fresh\n");
+                return true;
+            }();
+            (void) said;
+            *dst[i] = ConversationBuffer{};
+            keep = 0;
+        }
         if (fast_host && i < 4) {
             if (sizes[i] > keep && src[i] == nullptr) { error = "conversation snapshot: missing state buffer"; return false; }
             const bool trace = park_trace_on();
@@ -1247,6 +1299,73 @@ void conversation_park_join_for(const SavedConversation& image) {
     if (park_trace() && park_vram_budget() != 0)
         std::fprintf(stderr, "strata parktrace: kv restore: %zu of %zu layers from the slot\n", hits, image.kv.size());
     if (hits < image.kv.size()) conversation_park_join();
+}
+
+// M-C3b2a: restore-side donor adoption. Mirror of the park-side anchor rule: aligned whole pages for
+// k/v/scales (cells-scaled byte ratios) and complete indexer rows for the pooled part; strict prefix.
+bool conversation_kv_share_views(SavedConversation& img, const SavedConversation& donor,
+                                 const std::vector<std::array<size_t, 5>>& keep, size_t* reused_bytes) {
+    if (img.kv.empty() || img.kv.size() != donor.kv.size() || keep.size() != img.kv.size()) return false;
+    size_t reused = 0;
+    for (size_t li = 0; li < img.kv.size(); ++li) {
+        auto& l = img.kv[li]; const auto& d = donor.kv[li];
+        if (l.format != d.format || l.cells != d.cells || l.heads != d.heads ||
+            l.head_dim != d.head_dim || l.page_size != d.page_size || l.idx_dim != d.idx_dim) continue;
+        std::array<ConversationBuffer*, 5> dst = {&l.k, &l.v, &l.k_scale, &l.v_scale, &l.pooled};
+        std::array<const ConversationBuffer*, 5> src = {&d.k, &d.v, &d.k_scale, &d.v_scale, &d.pooled};
+        for (int i = 0; i < 5; ++i) {
+            const size_t full = dst[i]->size();
+            const size_t keepn = keep[li][i];
+            if (!keepn || keepn >= full || src[i]->size() < keepn) continue;
+            if (!dst[i]->prefix_equal(*src[i], keepn)) continue;   // bytes differ: the copy stays (should not happen:
+                                                                   // the bytes were borrowed from THIS donor's lineage)
+            std::vector<uint8_t> tail(full - keepn);
+            if (!dst[i]->visit(keepn, full - keepn, [&](uint8_t* p, size_t n, size_t at) -> bool {
+                    std::memcpy(tail.data() + (at - keepn), p, n); return true; })) continue;
+            if (!dst[i]->adopt_shared(*src[i], keepn)) continue;
+            dst[i]->resize_for_overwrite(full);   // appends owned segments past the views
+            if (!dst[i]->visit(keepn, full - keepn, [&](uint8_t* p, size_t n, size_t at) -> bool {
+                    std::memcpy(p, tail.data() + (at - keepn), n); return true; })) return false;
+            reused += keepn;
+        }
+    }
+    if (reused_bytes) *reused_bytes = reused;
+    return reused > 0;
+}
+
+bool conversation_kv_share_prefix(SavedConversation& img, const SavedConversation& donor,
+                                  int64_t tokens, size_t* reused_bytes) {
+    if (tokens <= 0 || img.kv.empty() || img.kv.size() != donor.kv.size()) return false;
+    const auto& qs = strata::kernels::qsa_real_shapes();
+    size_t reused = 0;
+    for (size_t li = 0; li < img.kv.size(); ++li) {
+        auto& l = img.kv[li]; const auto& d = donor.kv[li];
+        if (l.format != d.format || l.cells != d.cells || l.heads != d.heads ||
+            l.head_dim != d.head_dim || l.page_size != d.page_size || l.idx_dim != d.idx_dim ||
+            tokens >= l.cells) continue;                       // strict proper prefix only
+        const int64_t ac = (tokens / l.page_size) * l.page_size;
+        const int64_t arows = tokens / qs.idx_block;
+        std::array<ConversationBuffer*, 5> dst = {&l.k, &l.v, &l.k_scale, &l.v_scale, &l.pooled};
+        std::array<const ConversationBuffer*, 5> src = {&d.k, &d.v, &d.k_scale, &d.v_scale, &d.pooled};
+        std::array<size_t, 5> keep = {};
+        for (int i = 0; i < 4; ++i) keep[i] = l.cells ? (dst[i]->size() / size_t(l.cells)) * size_t(ac) : 0;
+        keep[4] = size_t(arows) * size_t(l.idx_dim) * 4;
+        for (int i = 0; i < 5; ++i) {
+            const size_t full = dst[i]->size();
+            if (!keep[i] || keep[i] >= full || src[i]->size() < keep[i]) continue;
+            if (!dst[i]->prefix_equal(*src[i], keep[i])) continue;      // bytes differ (different prefill geometry): copy
+            std::vector<uint8_t> tail(full - keep[i]);
+            if (!dst[i]->visit(keep[i], full - keep[i], [&](uint8_t* p, size_t n, size_t at) -> bool {
+                    std::memcpy(tail.data() + (at - keep[i]), p, n); return true; })) continue;
+            if (!dst[i]->adopt_shared(*src[i], keep[i])) continue;      // verified just above
+            dst[i]->resize_for_overwrite(full);   // appends owned segments past the views
+            if (!dst[i]->visit(keep[i], full - keep[i], [&](uint8_t* p, size_t n, size_t at) -> bool {
+                    std::memcpy(p, tail.data() + (at - keep[i]), n); return true; })) return false;
+            reused += keep[i];
+        }
+    }
+    if (reused_bytes) *reused_bytes = reused;
+    return reused > 0;
 }
 
 } // namespace strata::core

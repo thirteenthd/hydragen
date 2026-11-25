@@ -565,7 +565,8 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse, size_t* reused_bytes,
                                 std::vector<ConversationCheckpoint>* storage,
-                                std::vector<ConversationCheckpoint>* moved) {
+                                std::vector<ConversationCheckpoint>* moved,
+                                const SavedConversation* anchor, int64_t anchor_tokens) {
     static const bool ptr = std::getenv("STRATA_PARK_TRACE") != nullptr;
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
@@ -640,8 +641,9 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     const long kf0 = ptr ? conversation_trace::thread_minflt() : 0;
     for (size_t j = 0; j < layers; ++j) {
         const auto k0 = now();
+        const ConversationKv* anc = (anchor && j < anchor->kv.size()) ? &anchor->kv[j] : nullptr;
         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
-                                  unchanged, reused_bytes)) return false;
+                                  unchanged, reused_bytes, anc, anchor ? anchor_tokens : 0)) return false;
         const double kt = ms(k0, now());
         kv_sum += kt; kv_max = std::max(kv_max, kt);
     }
@@ -676,8 +678,10 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     }
     // The draft's final cell may not have been computed when the output cap was
     // reached. Refresh that page even when the main prefix continued unchanged.
+    const ConversationKv* draft_anc = (anchor && anchor->kv.size() == layers + 1) ? &anchor->kv.back() : nullptr;
     if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error,
-                                       std::max<int64_t>(0, unchanged - 1), reused_bytes)) return false;
+                                       std::max<int64_t>(0, unchanged - 1), reused_bytes,
+                                       draft_anc, anchor ? anchor_tokens : 0)) return false;
     abandon.on = false;
     if (staged && !conversation_park_async_launch(error)) return false;
     if (staged) {
@@ -935,8 +939,10 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 }
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& ss,
                                 const ModelGeometry& g, const QsaState& draft, std::string& error,
-                                ConversationKvReuse reuse, size_t* reused_bytes) {
-    return conversation_snapshot_save(image, view, ss, g, &draft, error, std::move(reuse), reused_bytes);
+                                ConversationKvReuse reuse, size_t* reused_bytes,
+                                const SavedConversation* anchor, int64_t anchor_tokens) {
+    return conversation_snapshot_save(image, view, ss, g, &draft, error, std::move(reuse), reused_bytes,
+                                      nullptr, nullptr, anchor, anchor_tokens);
 }
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss, const ModelGeometry& g,
                                     const QsaState& draft, std::string& error) {

@@ -5472,6 +5472,16 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (!d.usage.empty())
         for (int64_t i = 0; i < n_tok * k; ++i)
             if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
+    // S5d: per-slot hit recording for the park manifest. The ids are token-major (`k` entries per
+    // token); the batch loop points hist_ptrs at each live slot's saturating-u8 count array for the
+    // window's tokens, and clears it for every other window, so a mismatch is a window the loop did
+    // not build and simply records nothing. Counts are advisory: they ride the manifest outside the
+    // hashes; nothing in a restore depends on them being exact.
+    if (d.hist_ptrs != nullptr && n_tok <= d.hist_n)
+        for (int64_t i = 0; i < n_tok * k; ++i)
+            if (uint8_t* hp = d.hist_ptrs[(size_t) (i / k)])
+                if (ids[i] >= 0 && ids[i] < d.n_expert)
+                    if (uint8_t& c = hp[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]]; c < 255) ++c;
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;

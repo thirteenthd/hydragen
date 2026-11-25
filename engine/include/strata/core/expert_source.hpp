@@ -659,6 +659,12 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;
+    // S5d: per-slot expert-hit recording for the park manifest (see `hist_encode` in the park disk
+    // header). The batch serve loop points `hist_ptrs` at one flat saturating-u8 count array
+    // ([layer*n_expert + expert]) per token of a window it built (null: that token records nothing),
+    // `hist_n` its length; the pool dispatch records only while the window's token count agrees.
+    uint8_t* const* hist_ptrs = nullptr;
+    int64_t hist_n = 0;
     /// The adaptive tier's evictions reach the device's table before the next window, not when the round's copies
     /// land: until then doorbell_publish_res can skip a layer's activation while the pool computes an evicted expert
     /// from the one published before.  The driver sets it where the tier does not wait for its copies

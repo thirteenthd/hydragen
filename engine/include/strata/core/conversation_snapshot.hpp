@@ -17,7 +17,21 @@ size_t conversation_kv_bytes(const QsaState& state, const ModelGeometry& g, int6
 // Equal token IDs alone do not establish that its K/V bytes are unchanged.
 bool conversation_kv_save(ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                           int64_t upto, bool include_index, std::string& error,
-                          int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr);
+                          int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr,
+                          const ConversationKv* anchor = nullptr, int64_t anchor_tokens = 0);
+
+// M-C3b2a: a disk-restored image re-joins the RAM tier's CoW: where a parked donor shares the leading
+// `tokens` (the caller matched token prefixes), each part's byte-identical aligned prefix becomes VIEWS
+// of the donor's buffers (verify-then-view, whole pages and complete indexer rows only, strict prefix).
+// Returns false when nothing could be shared (geometry mismatch / byte divergence); partial success
+// keeps sharing the parts that verified. `reused_bytes` counts adopted view bytes.
+// M-C3b3b: same verify-then-view rule as the token-prefix form, but the keep lengths come from the DISK
+// table's view entries (per layer, per part), not from token alignment: a spilled child's viewed regions
+// are exactly the donor segments it borrowed at spill time.
+bool conversation_kv_share_views(SavedConversation& img, const SavedConversation& donor,
+                                 const std::vector<std::array<size_t, 5>>& keep, size_t* reused_bytes);
+bool conversation_kv_share_prefix(SavedConversation& img, const SavedConversation& donor,
+                                  int64_t tokens, size_t* reused_bytes);
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                                    int64_t upto, bool include_index, size_t& bytes, std::string& error);
 // No CUDA calls or destination writes. Used for whole-session prevalidation.
@@ -135,7 +149,8 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
                                 const SessionState& session, const ModelGeometry& g,
                                 const QsaState& draft, std::string& error,
-                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
+                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
+                                const SavedConversation* anchor = nullptr, int64_t anchor_tokens = 0);
 // Disk save without capturing the K/V on the host: `meta` gets everything but the K/V (running state copied,
 // checkpoints as given by the view), `sources` one streamed source per QSA layer then the draft.  Caller has
 // synchronized and must not run the session until the file is written.
@@ -228,7 +243,8 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 const ModelGeometry& g, const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
                                 std::vector<ConversationCheckpoint>* storage = nullptr,
-                                std::vector<ConversationCheckpoint>* moved = nullptr);
+                                std::vector<ConversationCheckpoint>* moved = nullptr,
+                                const SavedConversation* anchor = nullptr, int64_t anchor_tokens = 0);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,

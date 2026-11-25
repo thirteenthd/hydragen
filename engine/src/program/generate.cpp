@@ -1,4 +1,5 @@
 #include "strata/core/logit_bias.hpp"
+#include <strata/core/hg_env.hpp>
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
 // THE DRIVER, and the first program in this project that answers a question.  Everything below it is a
@@ -55,6 +56,7 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
+#include "strata/core/conversation_park_disk.hpp"
 #include "strata/core/conversation_spill.hpp"
 #include "strata/core/park_pool_policy.hpp"
 #include "strata/core/auto_cache.hpp"
@@ -3663,6 +3665,29 @@ namespace {
 // in_shared stop flag live below where the E-9 on_chunk lambda needs the flag, so a file-scope atomic carries it.
 std::atomic<bool> g_prompt_stop_req{false};
 }
+
+namespace {   // S5d serve state: the park block and the solo token loop are sibling scopes inside
+              // engine_main, so the histogram arrays live at file scope. Advisory only: one serve
+              // process serves one model; nothing correctness rides on these.
+std::vector<uint8_t>* s5d_cur = nullptr;   // the count array of the slot most recently taken over
+std::vector<uint8_t> live_hist;            // the live conversation's own hits (solo windows record here)
+std::vector<uint8_t*> hps((size_t) strata::kernels::kVerifyMaxT, nullptr);   // window rows -> live_hist
+uint8_t* hps_hist = nullptr;               // the array hps points at; re-filled when that changes
+const bool pd_hist_on = [] { const char* v = hg_getenv("STRATA_PARK_HIST"); return v == nullptr || v[0] != '0'; }();
+// S5d: point this window's rows at the live conversation's own counts. Called after every
+// per-window reset; wherever the batch loop points per row it overwrites this, which is
+// exactly right: a batch window's rows belong to different conversations.
+void s5d_point(strata::core::ExpertDispatch& d, int64_t n_layers) {
+    if (!pd_hist_on || n_layers <= 0 || d.n_expert <= 0) return;
+    if (live_hist.empty()) live_hist.assign((size_t) n_layers * (size_t) d.n_expert, 0);
+    if (uint8_t* hd = live_hist.data(); hd != hps_hist) {
+        std::fill(hps.begin(), hps.end(), hd);   // every row of a single-conversation window is its conversation
+        hps_hist = hd;
+    }
+    d.hist_ptrs = hps.data();
+    d.hist_n = (int64_t) hps.size();
+}
+}   // S5d serve state
 
 #if defined(STRATA_USE_HIP) && defined(_WIN32)
 static int engine_main(int argc, char** argv) {   // main() is at the end of this file (#3431)
@@ -14185,6 +14210,33 @@ int main(int argc, char** argv) {
             }
             return n + spill.clear();
         };
+        // M-C3a: an optional disk tier under the parked cache (STRATA_PARK_DISK=DIR). LRU eviction spills the
+        // victim to an identity-bound STRSES file; an admission whose whole usable prefix lives on disk reads it
+        // back and restores it through the normal conversation-snapshot path. Read limits (and the RAM preflight
+        // inside them) are this engine's, exactly as the /slots disk-session path builds them below.
+        strata::core::ParkDisk park_disk;
+        if (const auto pd_opt = strata::core::ParkDisk::from_env()) {
+            park_disk.init(*pd_opt,
+                [&](strata::core::SessionFileIdentity& id, std::string& e) { return session_identity(id, e, [] {}); },
+                [&](strata::core::SessionReadLimits& lim, std::string& e) {
+                    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                    lim.admit = [floor](uint64_t need, std::string& why) {
+                        const auto mem = strata::core::sample_host_memory();
+                        const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+                        if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                        why = "not enough free RAM to read the parked image back (" + std::to_string(need >> 20) +
+                              " MiB plus a floor of " + std::to_string((long long) (floor >> 20)) + " MiB)";
+                        return false;
+                    };
+                    return strata::core::conversation_session_read_limits(
+                        lim, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                        (uint64_t) std::max(o.prompt_cache, 1), e);
+                });
+            if (park_disk.enabled() && conversations.enabled())
+                conversations.spill_hook = [&](strata::core::SavedConversation&& img, int64_t slot_serial) {
+                    park_disk.spill(std::move(img), slot_serial);
+                };
+        }
         // What a park captures: the main session's conversation (park_current) or an idle batch slot's (park_slot:
         // the reply it decoded, before an admission overwrites it).  One budget / admission / snapshot path for both.
         struct ParkSource {
@@ -14198,6 +14250,7 @@ int main(int argc, char** argv) {
             const strata::core::QsaState* draft_last;     ///< ... with the last stage's image (a split: the drafter's GPU)
             bool with_reuse;                              ///< the retained K/V describes this source (the main session's)
             std::string what;                             ///< the log's words after the token count ("", " from slot 1")
+            const std::vector<uint8_t>* counts = nullptr; ///< S5d: the slot's expert-hit counts (null: no manifest section)
         };
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
@@ -14315,6 +14368,36 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: conversation cache: retained K/V reused for %lld of its %lld tokens "
                                      "(the rest is not this conversation's)\n", (long long) reuse.unchanged_tokens,
                              (long long) retained_n);
+            // M-C2 host-tier CoW: the longest parked conversation this prompt starts with (proper prefix:
+            // never itself) anchors the park; its image's K/V bytes become views, not a second copy.
+            static const bool park_cow = [] {
+                const char* v = hg_getenv("STRATA_PARK_COW");
+                return v != nullptr && v[0] == '1';
+            }();
+            const strata::core::SavedConversation* anchor_img = nullptr;
+            int64_t anchor_tokens = 0;
+            uint64_t anchor_serial = 0;   // the donor's identity, to survive a cache change under it
+            if (park_cow && src.with_reuse && !src.ids.empty()) {
+                const auto m = conversations.common_best(src.ids, src.imgs, src.cvec);
+                if (m.tokens > 0 && m.tokens < (int64_t) src.ids.size()) {
+                    const strata::core::SavedConversation* d = conversations.find(m.serial);
+                    if (d != nullptr && !d->kv.empty() && (int64_t) d->live.ids.size() >= m.tokens) {
+                        anchor_img = d;
+                        anchor_tokens = m.tokens;
+                        anchor_serial = m.serial;
+                    }
+                }
+                std::fprintf(stderr, "strata serve: conversation cache: park COW anchor %s for %lld of %lld tokens\n",
+                             anchor_img != nullptr ? "mounted" : "none",
+                             (long long) anchor_tokens, (long long) src.ids.size());
+            }
+            // M-C10c: hold the mount with the cache's own guard until this park is in. Guards nest (§191).
+            struct ParkAnchorGuard {
+                strata::core::ConversationCache& c; bool on;
+                ~ParkAnchorGuard() { if (on) c.unguard(); }
+            };
+            ParkAnchorGuard anchor_guard_at_end{conversations, anchor_img != nullptr};
+            if (anchor_img != nullptr) conversations.guard(anchor_serial);
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
             stage_reuse.resize(n_st);
             reuse.stages.clear();
@@ -14442,6 +14525,17 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor)\n",
                                  evicted, evicted == 1 ? "" : "s", additional >> 20,
                                  (long long) o.conversation_cache_min_free_mib);
+                if (anchor_serial != 0) {
+                    anchor_img = conversations.find(anchor_serial);
+                    if (anchor_img != nullptr && (anchor_img->kv.empty() ||
+                            (int64_t) anchor_img->live.ids.size() < anchor_tokens))
+                        anchor_img = nullptr;
+                    if (anchor_img == nullptr) {
+                        anchor_tokens = 0;
+                        std::fprintf(stderr, "strata serve: conversation cache: park COW anchor lost: the "
+                                             "donor left the cache while admitting this park\n");
+                    }
+                }
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
                 // STRATA_CKPT_POOL: the running state and the checkpoint copies go into dropped checkpoints' vectors
@@ -14466,9 +14560,13 @@ int main(int argc, char** argv) {
                 }
                 const bool saved = strata::core::conversation_snapshot_save(image, view, src.session, g, draft0, err,
                         std::move(reuse), &reused_bytes, storage.empty() ? nullptr : &storage,
-                        moved.empty() ? nullptr : &moved);
+                        moved.empty() ? nullptr : &moved, anchor_img, anchor_tokens);
                 for (ConvCheckpoint& c : storage) ckpt_pool.give(std::move(c));
-                if (!saved) return false;
+                if (!saved) {
+                    if (err.empty()) err = "conversation park: the K/V save aborted without a message";
+                    return false;
+                }
+                if (anchor_img != nullptr) image.view_donor = (int64_t) anchor_serial;   // M-C3b3: name the park donor for lineage spills
                 pool_topup();   // what the park took (and what moved out) is allocated again, in the background
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
@@ -14496,6 +14594,16 @@ int main(int argc, char** argv) {
                                  (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
                     return true;
                 }
+                // S5d: the slot's expert-hit counts ride the park as the manifest's advisory section
+                if (src.counts != nullptr) {
+                    std::vector<uint8_t> hb;
+                    if (strata::core::hist_encode(*src.counts, g.n_expert, hb)) {
+                        image.s5d_hist = std::move(hb);
+                        std::fprintf(stderr, "strata serve: park hist: %zu expert cells, %zu bytes (of %zu counts)%s\n",
+                                     image.s5d_hist.size() > 14 ? (image.s5d_hist.size() - 14) / 3 : 0,
+                                     image.s5d_hist.size(), src.counts->size(), src.what.empty() ? "" : src.what.c_str());
+                    }
+                }
                 const size_t snapshot_bytes = image.bytes();
                 const bool stored = conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens%s in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
@@ -14522,6 +14630,10 @@ int main(int argc, char** argv) {
             ParkSource src{live, live_imgs, checks, cvec_cached, ss, {},
                            (n_st > 0 && !mtp_first) || !use_mtp ? nullptr : &mtp.kv_state(),
                            use_mtp && !mtp_first && n_st > 0 ? &mtp.kv_state() : nullptr, true, ""};
+            if (pd_hist_on) {
+                if (!live_hist.empty()) src.counts = &live_hist;
+                else if (s5d_cur != nullptr && !s5d_cur->empty()) src.counts = s5d_cur;
+            }
             for (auto& st : stages) src.stage_sessions.push_back(&st->ss);
             return park_source(src, held);
         };
@@ -16367,7 +16479,7 @@ int main(int argc, char** argv) {
                     bool no_vram = false;
                     if (!ver.prepare(t, no_vram, werr)) { if (no_vram) continue; wok = false; break; }   // CUDA / HIP: the graph now (a size that finds no VRAM is left to the runtime rule); Metal: nothing to do
                     const Clock::time_point t0 = Clock::now();
-                    drive.d.layers = 0;
+                    drive.d.layers = 0; drive.d.hist_ptrs = nullptr; drive.d.hist_n = 0; s5d_point(drive.d, g.n_layers);
                     drive.d.experts = 0;
                     drive.d.failed = false;
                     wok = ver.run(t, wtok.data(), 0, win_pool_fn, win_pool_user, wout.data(), werr) && !drive.d.failed;
@@ -16388,7 +16500,7 @@ int main(int argc, char** argv) {
                     strata::core::session_zero(ss, g, nullptr, main_cs);
                     cudaStreamSynchronize(main_stream);
                 }
-                drive.d.layers = 0;
+                drive.d.layers = 0; drive.d.hist_ptrs = nullptr; drive.d.hist_n = 0; s5d_point(drive.d, g.n_layers);
                 drive.d.experts = 0;
                 drive.d.failed = false;
             }
@@ -16798,6 +16910,7 @@ int main(int argc, char** argv) {
             bool rd_ck_due = false;        ///< its read is at rd_ck: the checkpoint is taken once nothing is in flight
             Clock::time_point rd_t0;
             double rd_ms = 0.0;
+            std::vector<uint8_t> exp_hist;   // S5d: saturating u8 expert-hit counts ([layer*n_expert + expert])
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
         // STRATA_BATCH_DF2_DEFER=0: every round drafts for every slot, spare rows or not (the first measurement's behaviour, for the A/B)
@@ -17094,6 +17207,7 @@ int main(int argc, char** argv) {
                            (n_st > 0 && !mtp_first) || !batch_mtp || batch_df2 ? nullptr : &slot_mtp[(size_t) b]->kv_state(),
                            batch_mtp && !batch_df2 && !mtp_first && n_st > 0 ? &slot_mtp[(size_t) b]->kv_state() : nullptr, false,
                            " from slot " + std::to_string(b)};
+            src.counts = sl.exp_hist.empty() ? nullptr : &sl.exp_hist;   // S5d: the park carries the slot's expert hits
             for (size_t k = 1; k < bslot_ss.size(); ++k) src.stage_sessions.push_back(bslot_ss[k][(size_t) b].get());
             try {
                 if (park_source(src, 0)) return;
@@ -17200,9 +17314,19 @@ int main(int argc, char** argv) {
             if (S == 0) return true;
             const bool was_busy = strata::core::progress().busy.load();
             strata::core::progress().busy.store(true);
-            drive.d.layers = 0;
+            drive.d.layers = 0; drive.d.hist_ptrs = nullptr; drive.d.hist_n = 0;
             drive.d.experts = 0;
             drive.d.failed = false;
+            if (pd_hist_on) {
+                static std::vector<uint8_t*> hp((size_t) strata::kernels::kVerifyMaxT, nullptr);
+                for (int t = 0; t < S; ++t) {
+                    BSlot& q = bs[(size_t) rows[t]];
+                    if (q.exp_hist.empty()) q.exp_hist.assign((size_t) g.n_layers * (size_t) drive.d.n_expert, 0);
+                    hp[(size_t) t] = q.exp_hist.data();
+                }
+                drive.d.hist_ptrs = hp.data();
+                drive.d.hist_n = S;
+            }
             apply_pending(false);
             // --adapt-async: the round in flight moves on a step when its job and copies are done (or a due round starts).
             // Never between a prompt's chunks (its loan of cache slots and its chunks read the tables); a request drains
@@ -19517,6 +19641,10 @@ int main(int argc, char** argv) {
             // The SSD tier (P2): a spilled conversation that gives this prompt a longer start than the session, a batch slot and
             // every RAM entry is read back (the session RESTORE's limits and RAM check); one that does not read back is dropped
             // and the RAM tier's choice stands.  Never borrowed from (it comes back whole).
+            static const bool deep_resume = hg_getenv("STRATA_RESUME_DEEPEST") != nullptr;
+            decltype(park_disk.best(ids, req_imgs, want_cvec)) disk_best;
+            if (deep_resume && park_disk.enabled())
+                disk_best = park_disk.best(ids, req_imgs, want_cvec);
             bool from_ssd = false;
             strata::core::ConversationCache::Match taken = parked;   // the match whose image is restored: RAM's, or the SSD tier's
             // 2c: a conversation the background writer still holds is still in RAM: when it serves this prompt best it is taken
@@ -19596,10 +19724,120 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            bool borrow = !from_ssd && stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
+            const int64_t ram_or_slot = std::max(resume, slot_tokens);
+            const bool disk_wins = !from_ssd && deep_resume && disk_best.tokens > parked.tokens &&
+                                   disk_best.tokens > ram_or_slot;   // M-C9
+            bool borrow = !from_ssd && stages.empty() && parked.tokens > ram_or_slot && !disk_wins &&
                           conversations.borrows(parked);
-            if (!from_ssd && parked.tokens > std::max(resume, slot_tokens) && !borrow)
+            if (!from_ssd && parked.tokens > ram_or_slot && !borrow && !disk_wins)
                 incoming.emplace(conversations.take(parked.index));
+            bool from_disk = false;
+            const int64_t disk_gate = deep_resume ? std::max(ram_or_slot, parked.tokens) : ram_or_slot;
+            if (!incoming && !borrow && !from_ssd && (deep_resume || parked.tokens <= ram_or_slot) && park_disk.enabled()) {
+                const auto d = deep_resume ? disk_best : park_disk.best(ids, req_imgs, want_cvec);
+                if (d.tokens > disk_gate) {
+                    std::string derr;
+                    static const bool pd_delta = [] {
+                        const char* v = hg_getenv("STRATA_PARK_DELTA");
+                        return !(v && v[0] == '0');
+                    }();
+                    std::vector<const strata::core::SavedConversation*> dn_list;
+                    bool dn_guarded = false;
+                    if (pd_delta) {
+                        const auto m2 = conversations.common_best(ids, req_imgs, want_cvec);
+                        if (m2.tokens > 0 && m2.tokens < (int64_t) ids.size())
+                            if (const auto* dn2 = conversations.find(m2.serial)) {
+                                conversations.guard(m2.serial);
+                                dn_guarded = true;
+                                dn_list.push_back(dn2);
+                            }
+                    }
+                    auto img = park_disk.load(d, derr, dn_list.empty() ? nullptr : &dn_list);
+                    if (dn_guarded) conversations.unguard();
+                    if (img) {
+                        static const bool pd_cow = [] {
+                            const char* v = hg_getenv("STRATA_PARK_COW");
+                            return v != nullptr && v[0] == '1';
+                        }();
+                        if (pd_cow) {
+                            const auto m = conversations.common_best(ids, req_imgs, want_cvec);
+                            if (m.tokens > 0 && m.tokens < (int64_t) ids.size()) {
+                                if (const auto* dn = conversations.find(m.serial)) {
+                                    size_t reused = 0;
+                                    if (strata::core::conversation_kv_share_prefix(*img, *dn, m.tokens, &reused) && reused)
+                                        std::fprintf(stderr, "strata serve: park disk: donor-adopted %.1f MiB of the "
+                                                     "restored image as views (%lld shared tokens)\n",
+                                                     (double) reused / 1048576.0, (long long) m.tokens);
+                                }
+                            }
+                        }
+                        static const bool pd_prewarm = [] {
+                            const char* v = hg_getenv("STRATA_PARK_PREWARM");
+                            return v == nullptr || v[0] != '0';
+                        }();
+                        if (pd_prewarm && drive.d.cache != nullptr && drive.d.src != nullptr && !img->s5d_hist.empty()) {
+                            static const int64_t prewarm_mib = [] {
+                                const char* v = hg_getenv("STRATA_PARK_PREWARM_MIB");
+                                return v == nullptr ? (int64_t) 256 : std::max((int64_t) 0, (int64_t) std::atoll(v));
+                            }();
+                            std::vector<uint8_t> cnt;
+                            if (strata::core::hist_decode(img->s5d_hist, g.n_layers, g.n_expert, cnt)) {
+                                std::vector<std::pair<uint8_t, uint16_t>> hot;
+                                for (size_t i2 = 0; i2 < cnt.size(); ++i2)
+                                    if (cnt[i2]) hot.emplace_back(cnt[i2], (uint16_t) i2);
+                                std::sort(hot.begin(), hot.end(),
+                                          [](const std::pair<uint8_t, uint16_t>& a, const std::pair<uint8_t, uint16_t>& b)
+                                          { return a.first != b.first ? a.first > b.first : a.second < b.second; });
+                                std::vector<int64_t> per_layer((size_t) g.n_layers, 0);
+                                const auto& xpl = strata::kernels::cpu::expert_layout();
+                                const cudaStream_t cs = (cudaStream_t) drive.d.cache_stream;
+                                int64_t staged = 0, refused = 0, boosted = 0; double mib = 0.0;
+                                static const bool pd_boost = [] {
+                                    const char* v = hg_getenv("STRATA_PARK_PREWARM_BOOST");
+                                    return v == nullptr || v[0] != '0';
+                                }();
+                                bool stop_prewarm = false;
+                                for (const auto& hc : hot) {
+                                    if (staged >= 512 || mib >= (double) prewarm_mib) break;
+                                    const int64_t l2 = (int64_t) hc.second / g.n_expert, e2 = (int64_t) hc.second % g.n_expert;
+                                    if (l2 < 0 || l2 >= g.n_layers || per_layer[(size_t) l2] >= 32) continue;
+                                    if (drive.d.cache->slot_of(l2, e2) != strata::core::kNotResident) continue;
+                                    const int32_t cand = drive.d.cache->admit(l2, e2);
+                                    if (cand == strata::core::kNotResident) { ++refused; continue; }
+                                    const uint8_t* bb = drive.d.src->blob(l2, e2);
+                                    std::string ferr;
+                                    if (bb == nullptr ||
+                                            !drive.d.cache->fill_slot(cand, bb, cs, ferr, xpl.blob_bytes(l2))) {
+                                        stop_prewarm = true;
+                                        break;
+                                    }
+                                    drive.d.src->note_async_read(bb, cs);
+                                    ++staged;
+                                    per_layer[(size_t) l2]++;
+                                    mib += (double) xpl.blob_bytes(l2) / (1024.0 * 1024.0);
+                                }
+                                if (pd_boost && !drive.d.usage.empty())
+                                    for (const auto& hc : hot) {
+                                        if (boosted >= 512) break;
+                                        float& uu = drive.d.usage[(size_t) hc.second];
+                                        const float want = 64.0f + (float) hc.first;
+                                        if (uu < want) { uu = want; ++boosted; }
+                                    }
+                                if (staged || refused || boosted || stop_prewarm)
+                                    std::fprintf(stderr, "strata serve: park prewarm: %lld experts staged (%.1f MiB), "
+                                                 "%lld refused (no slot free), %lld usage-boosted%s\n",
+                                                 (long long) staged, mib, (long long) refused,
+                                                 (long long) boosted,
+                                                 stop_prewarm ? " (stopped by a fill failure)" : "");
+                            }
+                        }
+                        incoming.emplace(std::move(*img));
+                        from_disk = true;
+                    } else if (!derr.empty())
+                        std::fprintf(stderr, "strata serve: park disk: load refused (%s); rereading the prompt\n",
+                                     derr.c_str());
+                }
+            }
             if (incoming || borrow) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
@@ -19660,7 +19898,10 @@ int main(int argc, char** argv) {
                                  (long long) strata::program::conv_cache::kRestoreFirstUseMib);
                     auto retry = std::move(*incoming);
                     incoming.reset();
-                    if (!conversations.put(std::move(retry)))
+                    if (from_disk)
+                        std::fprintf(stderr, "strata serve: conversation cache: disk image not restored; the file "
+                                             "stays for a later turn\n");
+                    else if (!conversations.put(std::move(retry)))
                         std::fprintf(stderr, "strata serve: conversation cache: could not return the skipped snapshot\n");
                     err.clear();
                 }
@@ -19757,7 +19998,7 @@ int main(int argc, char** argv) {
             // A retained K/V matching the live prefix stays for park_current;
             // unrelated retained K/V does not block an ordinary RAM-tier exchange.
             const size_t swap_block_bytes = strata::core::conversation_cache_swap_block_bytes(o.conversation_cache_swap_block_mib);
-            if (swap_block_bytes != 0 && incoming && !from_ssd && taken.live &&
+            if (swap_block_bytes != 0 && incoming && !from_ssd && !from_disk && taken.live &&
                 taken.tokens == (int64_t) incoming->live.ids.size() &&
                 !borrow && !keep_branch && !reply_replaced && park_worth && live_ok && !live.empty() &&
                 conversations.wants((int64_t) live.size()) && !conversations.has_reuse_for(live) &&
@@ -20033,6 +20274,30 @@ int main(int argc, char** argv) {
                 cvec_cached = incoming->cvec;
                 resume = taken.tokens;   // (parked.tokens unless the image came from the SSD tier)
                 from_live = taken.live;
+                if (deep_resume && from_disk) {
+                    // The disk image's own chain is the only one its restored K/V backs: mount strictly
+                    // at its depths (a RAM match's depth may sit between two of them, and the live
+                    // label belongs to a copy that was never taken).
+                    resume = 0;
+                    from_live = false;
+                }
+                if (deep_resume && !from_live) {
+                    int64_t best_d = resume;
+                    for (ConvCheckpoint& k : checks) {
+                        const int64_t L = (int64_t) k.ids.size();
+                        if (L <= best_d || L > (int64_t) ids.size()) continue;
+                        if (!req_imgs.empty() || !k.imgs.empty()) continue;
+                        bool same = true;
+                        for (int64_t i = 0; i < L; ++i)
+                            if ((int32_t) ids[(size_t) i] != k.ids[(size_t) i]) { same = false; break; }
+                        if (same) best_d = L;
+                    }
+                    if (best_d > resume) {
+                        std::fprintf(stderr, "strata serve: M-C9: resume deepened %lld -> %lld (%zd checkpoints scanned)\n",
+                                     (long long) resume, (long long) best_d, checks.size());
+                        resume = best_d;
+                    }
+                }
                 if (!swapped_parked && std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
@@ -20323,7 +20588,7 @@ int main(int argc, char** argv) {
                 const size_t N = wins.size();
                 std::vector<int32_t> w0((size_t) S), w1((size_t) S), nx((size_t) S);
                 size_t l0 = 0, f0 = 0, l1 = 0, f1 = 0;   // stage 0 launched / finished, stage 1 launched / finished
-                drive.d.layers = 0;
+                drive.d.layers = 0; drive.d.hist_ptrs = nullptr; drive.d.hist_n = 0; s5d_point(drive.d, g.n_layers);
                 drive.d.experts = 0;
                 drive.d.failed = false;
                 auto fail = [&](std::string why) -> bool {
@@ -20439,7 +20704,7 @@ int main(int argc, char** argv) {
                         win[(size_t) t] = (int32_t) cur[(size_t) (q + t)];
                         nxt[(size_t) t] = (int32_t) cur[(size_t) (q + t + 1)];
                     }
-                    drive.d.layers = 0;
+                    drive.d.layers = 0; drive.d.hist_ptrs = nullptr; drive.d.hist_n = 0; s5d_point(drive.d, g.n_layers);
                     drive.d.experts = 0;
                     drive.d.failed = false;
                     if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
@@ -20846,6 +21111,7 @@ int main(int argc, char** argv) {
                             cudaDeviceSynchronize();
                         }
                         bs[(size_t) c->slot] = BSlot{};   // (it holds nothing until the read is done)
+                        s5d_cur = &bs[(size_t) c->slot].exp_hist;
                     }
                     const auto tco = Clock::now();
                     std::fprintf(stderr, "strata batch: co-read starting: %zu more prompt(s) with this request's %lld tokens\n",
@@ -20862,6 +21128,7 @@ int main(int argc, char** argv) {
                     for (const CoReq* c : used) {
                         BSlot& sl = bs[(size_t) c->slot];
                         sl = BSlot{};
+                        s5d_cur = &sl.exp_hist;
                         sl.ids.assign(c->ids.begin(), c->ids.end() - 1);
                         sl.cached = true;
                         sl.cvec = want_cvec;
@@ -20983,6 +21250,7 @@ int main(int argc, char** argv) {
                     if (can && copy_to_slot(ys, pre, ye)) {
                         BSlot& sl = bs[(size_t) ys];
                         sl = BSlot{};
+                        s5d_cur = &sl.exp_hist;
                         sl.ids = std::move(pre);
                         sl.cached = true;
                         sl.partial = true;
@@ -21792,6 +22060,7 @@ int main(int argc, char** argv) {
             const int64_t dt_sw0 = ajob ? a_swapped : adapt_nswaps;
             int64_t dec_windows = 0, dec_T = 0;
             const int64_t decode_hits0 = drive.d.cache_hits;
+            live_hist.clear();   // S5d: a switch's park already read the previous conversation's counts; this request records fresh
             // CS-T: the RAM and file tiers of this request (the mmap source; 0 with the arena)
             const int64_t ram0 = src.ram_reads(), files0 = src.file_reads();
             const uint64_t file_bytes0 = src.file_read_bytes();
@@ -21902,7 +22171,7 @@ int main(int argc, char** argv) {
                 A.p = p;
                 A.tok[0] = x;
                 A.ready = true;
-                drive.d.layers = 0;
+                drive.d.layers = 0; drive.d.hist_ptrs = nullptr; drive.d.hist_n = 0; s5d_point(drive.d, g.n_layers);
                 drive.d.experts = 0;
                 drive.d.failed = false;
                 // the adaptive tier beside the pipeline: the serial loop's rule and adapt() on a thread of its own (its
@@ -22806,7 +23075,7 @@ int main(int argc, char** argv) {
                                                     : drafts[(size_t) i - 1];
                 for (int i = 0; i < chain_n; ++i) window[(size_t) (T_mtp + i)] = cbuf[(size_t) i];
                 if (!keep_sync()) { std::printf("ERR %s\n", err.c_str()); return 1; }
-                drive.d.layers = 0;
+                drive.d.layers = 0; drive.d.hist_ptrs = nullptr; drive.d.hist_n = 0; s5d_point(drive.d, g.n_layers);
                 drive.d.experts = 0;
                 drive.d.failed = false;
                 // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
@@ -23604,6 +23873,8 @@ int main(int argc, char** argv) {
                     if (ckpt_pool.on())
                         for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
                     sl = BSlot{};
+                    s5d_cur = &sl.exp_hist;   // S5d: the admitted request's hits record here
+                    if (pd_hist_on) sl.exp_hist = live_hist;
                     const auto tc2 = Clock::now();   // (the slot's old checkpoints freed)
                     sl.active = true;
                     sl.x = x;
@@ -24289,7 +24560,7 @@ int main(int argc, char** argv) {
         // running across tokens asks for layer 48 of a 48-layer file on the second token - which
         // `FileExpertSource` REFUSES rather than wrapping into layer 0's experts, and that refusal is the only
         // reason this was a clean error instead of a silently wrong second token.
-        drive.d.layers = 0;
+        drive.d.layers = 0; drive.d.hist_ptrs = nullptr; drive.d.hist_n = 0; s5d_point(drive.d, g.n_layers);
         drive.d.experts = 0;
         drive.d.failed = false;
         err.clear();
@@ -25093,7 +25364,7 @@ int main(int argc, char** argv) {
                 if (o.spec_corrupt > 0 && (++corrupt_counter % o.spec_corrupt) == 0) d = (d + 1) % (int32_t) n_vocab;
                 window[(size_t) i] = d;
             }
-            drive.d.layers = 0;
+            drive.d.layers = 0; drive.d.hist_ptrs = nullptr; drive.d.hist_n = 0; s5d_point(drive.d, g.n_layers);
             drive.d.experts = 0;
             drive.d.failed = false;
             // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
