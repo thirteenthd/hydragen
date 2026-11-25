@@ -156,6 +156,7 @@
 #include "strata/program/batch_groups.hpp"
 #include "strata/program/par_counters.hpp"
 #include "strata/program/decode_governor.hpp"
+#include "strata/program/fanout_prefix.hpp"   // HydraGen 2A: the fan-out prefix cut
 #if defined(__linux__)
 #include <execinfo.h>
 #include <fcntl.h>
@@ -22156,7 +22157,53 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: pin=%lld: the cache has no checkpoint there to pin (it resumed from "
                                  "%lld)\n", (long long) req_pin, (long long) read_from);
             }
-            std::vector<int64_t> cuts = {reread_to, root_at, message_at, turn_at, n - 1};
+            // HydraGen 2A: an agent harness farms several requests off one long shared header.  A hybrid GDN+QSA
+            // model resumes only from a checkpoint at or before the point where the siblings diverge, and at
+            // --prefill auto:N a header shorter than N runs as ONE chunk that checkpoints at the LAST turn
+            // boundary - after the divergence - so every sibling matches nothing and re-reads the whole header
+            // (G9 fan-out: S1..S3 cached_tokens 0 against the control's 6144).  Where another stream of the same
+            // conversation shares a long prefix with this prompt, split the read at the shared length: the header
+            // gets a checkpoint of its own and the siblings after it resume from there.  Solo or unrelated traffic
+            // finds no peer and pays nothing, and the scan walks only the state this request already walks.
+            static const char* const fanout_env = hg_getenv("HG_FANOUT_PREFIX_CKPT");
+            static const int64_t fanout_min = (int64_t) hg_env_u64("HG_FANOUT_PREFIX_MIN").value_or(2048);
+            const bool fanout_on = fanout_env != nullptr && fanout_env[0] ? std::atoi(fanout_env) != 0
+                                                                         : o.prompt_cache >= 2;
+            int64_t fanout_at = -1;
+            if (fanout_on && req_ckpt && !multi_gpu && o.prompt_cache > 0 && req_imgs.empty() && n > fanout_min) {
+                std::vector<strata::program::FanoutPeer> peers;
+                std::vector<int64_t> saved;   // checkpoints THIS request could already resume from: its own state's
+                                              // checks (a parked match is already carried by `resume`)
+                if (want_cvec == cvec_cached) {
+                    if (live_ok && live.size() > 1) peers.push_back(strata::program::FanoutPeer{live});
+                    for (const ConvCheckpoint& c : checks)
+                        if (c.imgs.empty() && c.ids.size() > 1) {
+                            peers.push_back(strata::program::FanoutPeer{c.ids});
+                            saved.push_back((int64_t) c.ids.size());
+                        }
+                }
+                for (const BSlot& sl : bs) {
+                    if (sl.img || sl.tainted || sl.cvec != want_cvec) continue;   // (pictures need their keys)
+                    if ((!sl.active && !sl.cached) || sl.ids.size() < 2) continue;
+                    // A sibling slot's own checkpoints are NOT reachable from this request - only this state's checks
+                    // and the parked conversation cache are, and a parked match already shows up in `resume`.  The
+                    // slot is a peer for the shared LENGTH, never a reason to skip the cut: in G9 the seed's only
+                    // checkpoint sat past where the siblings diverge, so treating it as "already covered" left every
+                    // sibling re-reading the whole header.
+                    peers.push_back(strata::program::FanoutPeer{sl.ids});
+                }
+                const auto cb = conversations.common_best(ids, req_imgs, want_cvec);   // a parked conversation (M-C2)
+                int64_t lcp = strata::program::fanout_lcp(ids, peers);
+                if (cb.tokens > lcp) lcp = cb.tokens;
+                fanout_at = strata::program::fanout_prefix_cut(ids, lcp, resume, fanout_min, 256,
+                                                               {reread_to, root_at, message_at, turn_at, pin_at, n - 1},
+                                                               saved);
+                if (fanout_at >= 0)
+                    std::fprintf(stderr, "strata serve: fan-out prefix: %lld of %lld tokens shared with another "
+                                         "stream: the header is checkpointed there for the siblings after it\n",
+                                 (long long) fanout_at, (long long) n);
+            }
+            std::vector<int64_t> cuts = {reread_to, root_at, message_at, fanout_at, turn_at, n - 1};
             if (pin_at >= 0) {
                 cuts.push_back(pin_at);
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
@@ -22247,7 +22294,7 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
-                if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
+                if ((to == turn_at || to == root_at || to == message_at || to == pin_at || to == fanout_at) &&
                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
                     if (!ckpt_why.empty() || !checkpoint_failure_is_survivable()) {   // #3350: only an unwell GPU ends the request
                         std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
