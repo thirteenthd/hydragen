@@ -125,6 +125,7 @@ int main() {
         cfg.hit_floor_pct = 86.0;
         cfg.initial_width = 4;
         cfg.eval_every = 4;
+        cfg.grace_windows = 0;   // this test counts judgement windows; warmup is covered in test 9
         DecodeGovernor gov(cfg);
 
         const std::vector<int> r8 = {0, 1, 2, 3, 4, 5, 6, 7};
@@ -255,6 +256,187 @@ int main() {
         CHECK((gov.select_cohort({0, 1, 2, 3, 4}, 8, 0.0) == std::vector<int>{0, 1, 2}));
         // Slot 1 finishes; remaining cohort [0, 2] stays sticky and admits slot 3
         CHECK((gov.select_cohort({0, 2, 3, 4}, 8, 10.0) == std::vector<int>{0, 2, 3}));
+    }
+
+    // 9. P3-3A warmup grace: the cold windows a resize or rotation leaves behind are observed but
+    //    never judged, so they cannot undo the widening that caused them.
+    {
+        DecodeGovernorConfig cfg;
+        cfg.enabled = true;
+        cfg.min_stream_tps = 0.0;
+        cfg.hit_floor_pct = 86.0;
+        cfg.initial_width = 3;
+        cfg.eval_every = 4;
+        cfg.cohort_quantum_ms = 50.0;
+        cfg.grace_windows = 3;
+        DecodeGovernor gov(cfg);
+
+        const std::vector<int> r6 = {0, 1, 2, 3, 4, 5};
+        CHECK((gov.select_cohort(r6, 8, 0.0) == std::vector<int>{0, 1, 2}));
+        CHECK(gov.grace_left() == 0);   // a cold start is the baseline, not a warmup
+        for (int i = 0; i < 4; ++i) gov.observe_window(25.0, 3, 3, 95.0, 8);
+        CHECK(gov.target_width() == 4);
+        CHECK(gov.grace_left() == 3);   // the widening armed warmup for the width it just bought
+    }
+
+    // 9b. the resize arms warmup, and four cold windows after it do not shed
+    {
+        DecodeGovernorConfig cfg;
+        cfg.enabled = true;
+        cfg.min_stream_tps = 0.0;
+        cfg.hit_floor_pct = 86.0;
+        cfg.initial_width = 4;
+        cfg.eval_every = 4;
+        cfg.cohort_quantum_ms = 0.0;   // sticky: this test is about warmup, not rotation
+        cfg.grace_windows = 3;
+        DecodeGovernor gov(cfg);
+
+        const std::vector<int> r8 = {0, 1, 2, 3, 4, 5, 6, 7};
+        CHECK(gov.select_cohort(r8, 8, 0.0).size() == 4);
+        for (int i = 0; i < 4; ++i) gov.observe_window(25.0, 4, 4, 95.0, 8);
+        CHECK(gov.target_width() == 5);
+        CHECK(gov.grace_left() == 3);   // the widening itself armed the warmup
+
+        // Four windows at a thrashing 40%: without warmup the fourth would shed 5 -> 4.
+        for (int i = 0; i < 4; ++i) gov.observe_window(60.0, 5, 5, 40.0, 8);
+        CHECK(gov.target_width() == 5);
+        CHECK(gov.grace_left() == 0);
+
+        // Once warmup is spent the brake works again.
+        for (int i = 0; i < 4; ++i) gov.observe_window(60.0, 5, 5, 40.0, 8);
+        CHECK(gov.target_width() == 4);
+    }
+
+    // 9c. a cohort rotation re-arms warmup for the slot that just came in
+    {
+        DecodeGovernorConfig cfg;
+        cfg.enabled = true;
+        cfg.initial_width = 3;
+        cfg.cohort_quantum_ms = 50.0;
+        cfg.grace_windows = 2;
+        DecodeGovernor gov(cfg);
+
+        const std::vector<int> r6 = {0, 1, 2, 3, 4, 5};
+        CHECK((gov.select_cohort(r6, 8, 0.0) == std::vector<int>{0, 1, 2}));
+        CHECK(gov.grace_left() == 0);
+        CHECK((gov.select_cohort(r6, 8, 55.0) == std::vector<int>{1, 2, 3}));
+        CHECK(gov.grace_left() == 2);   // slot 3 is cold in this window
+        CHECK((gov.select_cohort(r6, 8, 60.0) == std::vector<int>{1, 2, 3}));
+        CHECK(gov.grace_left() == 2);   // no rotation, so no extra warmup
+    }
+
+    // 10. P3-3A prefix affinity: the seat goes to a sibling of the prefix the cohort shares
+    {
+        DecodeGovernorConfig cfg;
+        cfg.enabled = true;
+        cfg.min_stream_tps = 0.0;
+        cfg.hit_floor_pct = 86.0;
+        cfg.initial_width = 2;
+        cfg.eval_every = 4;
+        cfg.cohort_quantum_ms = 0.0;   // sticky cohort: watch admissions only
+        cfg.grace_windows = 0;
+        cfg.affinity = true;
+        cfg.affinity_max_wait = 2;
+        DecodeGovernor gov(cfg);
+
+        const std::vector<int> r6 = {0, 1, 2, 3, 4, 5};
+        // slots 0, 1 and 4 are one fan-out family; 2, 3, 5 are unrelated
+        const std::vector<int64_t> key = {33, 33, 11, 22, 33, 44};
+
+        CHECK((gov.select_cohort(r6, 8, 0.0, key) == std::vector<int>{0, 1}));
+        for (int i = 0; i < 4; ++i) gov.observe_window(25.0, 2, 2, 95.0, 8);
+        CHECK(gov.target_width() == 3);
+        const auto c = gov.select_cohort(r6, 8, 10.0, key);
+        CHECK((c == std::vector<int>{0, 1, 4}));   // the sibling, not slot 2
+        CHECK(is_strictly_sorted(c));              // rows[] keys stay canonical
+        CHECK(gov.waited_for(2) == 1);             // the passed-over slots age
+    }
+
+    // 10b. aging: a prefix group cannot hold the seat forever
+    {
+        DecodeGovernorConfig cfg;
+        cfg.enabled = true;
+        cfg.min_stream_tps = 0.0;
+        cfg.hit_floor_pct = 86.0;
+        cfg.initial_width = 2;
+        cfg.eval_every = 4;
+        cfg.cohort_quantum_ms = 0.0;
+        cfg.grace_windows = 0;
+        cfg.affinity = true;
+        cfg.affinity_max_wait = 2;
+        DecodeGovernor gov(cfg);
+
+        const std::vector<int> r6 = {0, 1, 2, 3, 4, 5};
+        const std::vector<int64_t> key = {33, 33, 11, 22, 33, 44};
+        CHECK((gov.select_cohort(r6, 8, 0.0, key) == std::vector<int>{0, 1}));
+        for (int i = 0; i < 4; ++i) gov.observe_window(25.0, 2, 2, 95.0, 8);
+        CHECK((gov.select_cohort(r6, 8, 10.0, key) == std::vector<int>{0, 1, 4}));
+        for (int i = 0; i < 4; ++i) gov.observe_window(25.0, 3, 3, 95.0, 8);
+        CHECK(gov.target_width() == 4);
+        const auto c4 = gov.select_cohort(r6, 8, 20.0, key);
+        CHECK((c4 == std::vector<int>{0, 1, 4, 5}));   // no sibling left, so circular order
+        for (int i = 0; i < 4; ++i) gov.observe_window(25.0, 4, 4, 95.0, 8);
+        CHECK(gov.target_width() == 5);
+        const auto c5 = gov.select_cohort(r6, 8, 30.0, key);
+        CHECK(is_strictly_sorted(c5));
+        CHECK(c5.size() == 5);
+        CHECK(std::find(c5.begin(), c5.end(), 2) != c5.end());   // 2 aged out of the queue
+    }
+
+    // 10c. affinity off keeps the shipped circular slot-ID order
+    {
+        DecodeGovernorConfig cfg;
+        cfg.enabled = true;
+        cfg.initial_width = 2;
+        cfg.cohort_quantum_ms = 0.0;
+        cfg.affinity = false;
+        DecodeGovernor gov(cfg);
+        const std::vector<int> r6 = {0, 1, 2, 3, 4, 5};
+        const std::vector<int64_t> key = {33, 33, 11, 22, 33, 44};
+        CHECK((gov.select_cohort(r6, 8, 0.0, key) == std::vector<int>{0, 1}));
+        CHECK((gov.select_cohort({0, 1, 2}, 8, 5.0, key) == std::vector<int>{0, 1}));
+    }
+
+    // 11. P3-3A prefix_affinity_key: same header -> same key whatever the tail; different header ->
+    //     different key; too short to mean anything -> 0 (no packing).
+    {
+        std::vector<int32_t> head;
+        for (int i = 0; i < 600; ++i) head.push_back((int32_t) (i % 251) + 1);
+        std::vector<int32_t> sibling = head;
+        sibling.push_back(9001);
+        sibling.push_back(9002);
+        CHECK(strata::program::prefix_affinity_key(head) == strata::program::prefix_affinity_key(sibling));
+
+        std::vector<int32_t> other = head;
+        other[40] = 7;
+        CHECK(strata::program::prefix_affinity_key(head) != strata::program::prefix_affinity_key(other));
+
+        CHECK(strata::program::prefix_affinity_key(std::vector<int32_t>(4, 1)) == 0);
+        CHECK(strata::program::prefix_affinity_key(std::vector<int32_t>()) == 0);
+    }
+
+    // 12. P3-3A config: the new knobs read through the HG_ shim, and 0 is a real value
+    {
+        set_env_var("STRATA_DECODE_GRACE_WINDOWS", "0");
+        set_env_var("STRATA_DECODE_AFFINITY", "1");
+        set_env_var("STRATA_DECODE_AFFINITY_MAX_WAIT", "5");
+        const DecodeGovernorConfig on = parse_decode_governor_config(0.0);
+        CHECK(on.grace_windows == 0);
+        CHECK(on.affinity);
+        CHECK(on.affinity_max_wait == 5);
+
+        set_env_var("STRATA_DECODE_GRACE_WINDOWS", "7");
+        set_env_var("STRATA_DECODE_AFFINITY", "0");
+        set_env_var("STRATA_DECODE_AFFINITY_MAX_WAIT", "");
+        const DecodeGovernorConfig off = parse_decode_governor_config(0.0);
+        CHECK(off.grace_windows == 7);
+        CHECK(!off.affinity);
+        CHECK(off.affinity_max_wait == 2);   // default
+
+        set_env_var("STRATA_DECODE_GRACE_WINDOWS", "");
+        set_env_var("STRATA_DECODE_AFFINITY", "");
+        const DecodeGovernorConfig dflt = parse_decode_governor_config(0.0);
+        CHECK(dflt.grace_windows == 3);      // shipped default
     }
 
     if (fails == 0) std::printf("decode_governor_test: all passed\n");

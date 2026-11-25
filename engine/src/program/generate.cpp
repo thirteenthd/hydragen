@@ -17581,7 +17581,30 @@ int main(int argc, char** argv) {
                     if (bs[b].active) runnable_slots.push_back((int) b);
                 }
                 const double gov_now_ms = std::chrono::duration<double, std::milli>(Clock::now() - gov_t0).count();
-                gov_cohort = decode_gov.select_cohort(runnable_slots, gov_slot_cap, gov_now_ms);
+                // P3-3A: prefix affinity.  Fan-out siblings (one header, different tails) share
+                // their routed experts and their KV prefix, so they belong in the same cohort
+                // window rather than spread across rotations.  The key hashes the slot's first
+                // tokens; it is stable once the header passes the hash depth, so it is cached per
+                // slot and retaken only when the slot is re-admitted (ids shrink) or its header is
+                // still growing.
+                static std::vector<int64_t> gov_aff_key;
+                static std::vector<int> gov_aff_len;
+                std::vector<int64_t> gov_aff;
+                if (decode_gov.affinity_enabled() && !runnable_slots.empty()) {
+                    if (gov_aff_key.size() < bs.size()) { gov_aff_key.resize(bs.size(), 0); gov_aff_len.resize(bs.size(), -1); }
+                    gov_aff.assign(runnable_slots.size(), 0);
+                    for (size_t i = 0; i < runnable_slots.size(); ++i) {
+                        const size_t s = (size_t) runnable_slots[i];
+                        const int n = (int) bs[s].ids.size();
+                        if (gov_aff_len[s] < 0 || n < gov_aff_len[s] ||
+                            (gov_aff_len[s] < strata::program::kPrefixAffinityDepth && n != gov_aff_len[s])) {
+                            gov_aff_key[s] = strata::program::prefix_affinity_key(bs[s].ids);
+                            gov_aff_len[s] = n;
+                        }
+                        gov_aff[i] = gov_aff_key[s];
+                    }
+                }
+                gov_cohort = decode_gov.select_cohort(runnable_slots, gov_slot_cap, gov_now_ms, gov_aff);
             }
             int nrow[strata::kernels::kVerifyMaxT] = {};   // the rows slot a (the a-th active) holds: its token and its drafts
             // DFlash2 slots: the rows beyond one a slot are SPARE; they carry the slots' drafts, shared evenly in slot order (so the layout of a window
