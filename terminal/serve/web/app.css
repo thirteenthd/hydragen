@@ -494,14 +494,14 @@ a.st-header__brand:hover { color: var(--st-accent-text); text-decoration: none; 
 }
 
 .slot-tile__badge.tone-generating {
-  background: color-mix(in srgb, var(--st-accent) 20%, transparent);
-  color: var(--st-accent-text, var(--st-accent));
+  background: color-mix(in srgb, #4ade80 20%, transparent);
+  color: #4ade80;
   font-weight: var(--st-fw-bold);
 }
 
 .slot-tile__badge.tone-reading {
-  background: color-mix(in srgb, var(--st-info) 20%, transparent);
-  color: var(--st-info-text, var(--st-info));
+  background: color-mix(in srgb, #38bdf8 20%, transparent);
+  color: #38bdf8;
   font-weight: var(--st-fw-bold);
 }
 
@@ -548,8 +548,12 @@ a.st-header__brand:hover { color: var(--st-accent-text); text-decoration: none; 
   gap: 6px;
 }
 
+/* P5-5D.4: the track is ALWAYS a flex row. With the old block layout the zero-width restored fill still took
+   its own line and pushed the prefill fill down out of the overflow:hidden track - only its glow stayed visible.
+   Flex lays both segments side by side in every state, split or not, so the bar is solid. */
 .slot-tile__bar-track {
   position: relative;
+  display: flex;
   width: 100%;
   height: 10px;
   background: var(--st-surface);
@@ -560,18 +564,21 @@ a.st-header__brand:hover { color: var(--st-accent-text); text-decoration: none; 
 
 .slot-tile__bar-fill {
   height: 100%;
+  flex-shrink: 0;
   transition: width 0.35s cubic-bezier(0.4, 0, 0.2, 1);
   border-radius: var(--st-r-sm);
 }
 
+/* P5-5D.4: one colour per stream state across every graph and badge:
+   prefill/reading = light blue, restored-from-park = dark green, generating/decoding = light green. */
 .slot-tile__bar-fill.is-generating {
-  background: linear-gradient(90deg, var(--st-accent), color-mix(in srgb, var(--st-accent) 70%, white));
-  box-shadow: 0 0 8px var(--st-accent);
+  background: linear-gradient(90deg, #22c55e, #4ade80);
+  box-shadow: 0 0 8px #4ade80;
 }
 
 .slot-tile__bar-fill.is-reading {
-  background: linear-gradient(90deg, var(--st-info), color-mix(in srgb, var(--st-info) 70%, white));
-  box-shadow: 0 0 8px var(--st-info);
+  background: linear-gradient(90deg, #38bdf8, #7dd3fc);
+  box-shadow: 0 0 8px #38bdf8;
 }
 
 .slot-tile__bar-fill.is-idle {
@@ -650,24 +657,27 @@ a.st-header__brand:hover { color: var(--st-accent-text); text-decoration: none; 
   align-items: center;
 }
 
-/* parked-restore pill: this request's prompt came back from the engine's cache, it was not read again */
+/* parked-restore pill: this request's prompt came back from the engine's cache, it was not read again.
+   P5-5D.4: dark green - the restored bar segment's own colour, never the prefill blue. */
 .slot-tile__badge.tone-restored {
-  background: color-mix(in srgb, var(--st-info) 16%, transparent);
-  color: var(--st-info-text, var(--st-info));
+  background: color-mix(in srgb, #15803d 22%, transparent);
+  color: #15803d;
 }
 
-/* restored-vs-generated: two stacked segments in one track (restored first, then generated) */
-.slot-tile__bar-track.is-split {
-  display: flex;
-}
-
+/* restored-vs-generated: two segments in one track (restored first, then generated). P5-5D.4: the track is
+   flex in EVERY state now (see .slot-tile__bar-track), so is-split is only a state marker, never a layout need. */
 .slot-tile__bar-fill.is-restored {
-  background: linear-gradient(90deg, var(--st-info), color-mix(in srgb, var(--st-info) 60%, white));
+  background: linear-gradient(90deg, #166534, #15803d);
 }
 
 .slot-tile__bar-fill.is-generated {
-  background: linear-gradient(90deg, var(--st-accent), color-mix(in srgb, var(--st-accent) 70%, white));
-  box-shadow: 0 0 8px var(--st-accent);
+  background: linear-gradient(90deg, #22c55e, #4ade80);
+  box-shadow: 0 0 8px #4ade80;
+}
+
+/* a generated segment that exists is never a rounding ghost: keep the light-green tip visible at the bar's end */
+.slot-tile__bar-fill.is-generated.has-output {
+  min-width: 6px;
 }
 
 /* the compact summary shown while every slot is on standby */

@@ -308,6 +308,7 @@ class WebDynamicSlots(unittest.TestCase):
         self.assertIn("is-split", out["els"]["slot-track-0"]["cls"])
         self.assertEqual(out["els"]["slot-restored-fill-0"]["width"], "98%")   # 1200 of 1230
         self.assertEqual(out["els"]["slot-fill-0"]["width"], "2%")             # 30 of 1230
+        self.assertIn("has-output", out["els"]["slot-fill-0"]["cls"])          # P5-5D.4: the green tip stays >= 6px
         self.assertEqual(out["els"]["slot-tokens-0"]["text"], "1,200 restored · 30 generated")
 
     def test_a_disk_restore_reads_as_disk(self):
@@ -329,6 +330,19 @@ class WebDynamicSlots(unittest.TestCase):
         self.assertEqual(out["calc"]["kMax"], 8)
         self.assertEqual(out["keys"], ["slot-0", "slot-1", "slot-queue-tile"])
         self.assertEqual(out["els"]["slots-active-badge"]["text"], "2 / 2 Active (Max 8) · SLA 25 t/s")
+
+    def test_queued_requests_never_count_as_active_slots(self):
+        # P5-5D.4 regression: live.running also counts requests waiting behind K_active, so the old
+        # max(inSlotsCount, rawRunning) read "3 / 1 Active (Max 8)" while one slot card was rendered.
+        # The badge must match the cards: one decoding slot -> 1 / 1 Active, the waiters into the queue.
+        live = base_live(state="generating", running=3, waiting=2, k_active=1,
+                         slots=slots([("decoding", {"state": "decoding", "generated": 10}),
+                                      ("idle", {}), ("idle", {}), ("idle", {})]))
+        out = self.run_scenarios({"s": {"frames": [[live, ENG, {}]]}})["s"]
+        self.assertEqual(out["calc"]["curConcurrency"], 1)
+        self.assertGreaterEqual(out["calc"]["queuedCount"], 2)
+        self.assertEqual(out["keys"], ["slot-0", "slot-queue-tile"])
+        self.assertEqual(out["els"]["slots-active-badge"]["text"], "1 / 1 Active (Max 8) · SLA 25 t/s")
 
     def test_a_solo_gen_request_gets_a_solo_card(self):
         # P5-5D.2: N=1 runs on the solo GEN path (admit_slot -1): running=1, state generating, every slot idle
@@ -519,6 +533,44 @@ class PageSource(unittest.TestCase):
         self.assertIn("renderParkDisk(m.park_disk)", self.app)
         self.assertIn('["Parked / restored"', self.app)
         self.assertIn('["Read back"', self.app)
+
+
+class PageStyles(unittest.TestCase):
+    """P5-5D.4: one colour per stream state across every graph and badge, the bar track flex in every
+    state (the prefill bar was pushed out of its own track by the block layout), and the Resource Stats
+    card in place of the Context fill gauge."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.css = (WEB / "app.css").read_text(encoding="utf-8")
+        cls.html = (WEB / "index.html").read_text(encoding="utf-8")
+
+    def rule(self, sel):
+        i = self.css.index(sel)
+        return self.css[i:self.css.index("}", i)]
+
+    def test_the_bar_track_is_flex_in_every_state(self):
+        self.assertIn("display: flex", self.rule(".slot-tile__bar-track {"))
+        self.assertIn("flex-shrink: 0", self.rule(".slot-tile__bar-fill {"))
+        self.assertNotIn(".slot-tile__bar-track.is-split", self.css)   # flex no longer depends on is-split
+
+    def test_one_colour_per_stream_state(self):
+        for sel in (".slot-tile__bar-fill.is-reading", ".slot-tile__badge.tone-reading"):
+            self.assertIn("#38bdf8", self.rule(sel))                   # prefill: light blue
+        self.assertIn("#7dd3fc", self.rule(".slot-tile__bar-fill.is-reading"))
+        for sel in (".slot-tile__bar-fill.is-restored", ".slot-tile__badge.tone-restored"):
+            self.assertIn("#15803d", self.rule(sel))                   # restored: dark green, never blue
+        self.assertIn("#166534", self.rule(".slot-tile__bar-fill.is-restored"))
+        for sel in (".slot-tile__bar-fill.is-generated", ".slot-tile__bar-fill.is-generating",
+                    ".slot-tile__badge.tone-generating"):
+            self.assertIn("#4ade80", self.rule(sel))                   # decoding: light green
+        self.assertIn("#22c55e", self.rule(".slot-tile__bar-fill.is-generated"))
+        self.assertIn("min-width: 6px", self.rule(".slot-tile__bar-fill.is-generated.has-output"))
+
+    def test_the_resource_stats_card_replaced_the_gauge(self):
+        self.assertIn('<span class="card-title">Resource Stats</span>', self.html)
+        for gone in ("ctx-gauge", "ctx-legend", "ctx-note"):
+            self.assertNotIn(gone, self.html)
 
 
 if __name__ == "__main__":

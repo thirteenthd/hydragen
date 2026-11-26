@@ -498,7 +498,12 @@ function calcConcurrencyAndQueue(live, eng, hw) {
   const slots = (live && live.slots && live.slots.length) ? live.slots : [];
   const inSlotsCount = slots.filter((s) => s.state && s.state !== "idle").length;
   const rawRunning = (live && live.running != null) ? live.running : (live && live.state !== "idle" ? 1 : 0);
-  const curConcurrency = Math.min(maxSlots, Math.max(inSlotsCount, rawRunning, (hw && hw.concurrency) || 0));
+  // P5-5D.4: with batch slots published, "Active" is the number of slots actually in use - never live.running,
+  // which also counts requests still waiting behind K_active (that is how "3 / 1 Active" appeared with one card).
+  // A solo GEN request owns no slot but is still one active stream. Without slot data keep the old max() fallback.
+  const curConcurrency = slots.length
+    ? Math.min(maxSlots, inSlotsCount > 0 ? inSlotsCount : (rawRunning > 0 ? 1 : 0))
+    : Math.min(maxSlots, Math.max(inSlotsCount, rawRunning, (hw && hw.concurrency) || 0));
   const outsideCount = (live && live.outside_slots != null) ? live.outside_slots : Math.max(0, rawRunning - maxSlots);
   const engineWaiters = ((live && live.waiting) || 0);
   const rawWaiting = outsideCount + engineWaiters + Math.max(0, ((live && live.queued) || 0) - (kActive - curConcurrency));
@@ -716,7 +721,9 @@ function renderConcurrency(live, eng, hw) {
       if (trackEl) trackEl.className = "slot-tile__bar-track is-split";
       if (restFillEl) restFillEl.style.width = `${Math.min(100, Math.round((100 * rt) / Math.max(1, total)))}%`;
       if (fillEl) {
-        fillEl.className = "slot-tile__bar-fill is-generated";
+        // P5-5D.4: has-output keeps a non-zero generated segment at least 6px wide, so the light-green tip
+        // stays visible at the right end of the dark-green restored bar however small the share rounds to.
+        fillEl.className = "slot-tile__bar-fill is-generated" + (gen > 0 ? " has-output" : "");
         fillEl.style.width = `${Math.min(100, Math.round((100 * gen) / Math.max(1, total)))}%`;
       }
       if (phaseEl) phaseEl.textContent = phaseText;
@@ -883,10 +890,14 @@ function contextParts(live, eng, last, on) {
           now: on === "reading" ? "read" : on === "generating" ? "answer" : null, queued: on === "queued"};
 }
 function renderContext(live, eng, last, on) {
+  // P5-5D.4: the Monitor's Context fill gauge was replaced by the Resource Stats card - guard every ctx-* lookup
+  // so the page runs clean without the gauge markup (contextParts stays for its tests and any future consumer).
+  if (!$("ctx-pct")) return;
   const c = contextParts(live, eng, last, on), ARC = 235.6;
   let at = 0;
   for (const k of ["cached", "read", "answer"]) {
     const len = c.ctx ? ARC * c[k] * c.scale / c.ctx : 0, el = $(`ctx-seg-${k}`);
+    if (!el) continue;
     el.setAttribute("stroke-dasharray", `${len.toFixed(1)} 314.2`);
     el.setAttribute("stroke-dashoffset", `${(-at).toFixed(1)}`);
     el.style.opacity = len >= 1 ? "1" : "0";
@@ -894,12 +905,12 @@ function renderContext(live, eng, last, on) {
   }
   $("ctx-pct").textContent = c.pct == null ? "–" : `${c.pct}%`;
   $("ctx-pct").dataset.tone = c.tone;
-  $("ctx-sub").textContent = c.ctx ? `${kfmt(c.used)} / ${ctxfmt(c.ctx)}` : "–";
+  if ($("ctx-sub")) $("ctx-sub").textContent = c.ctx ? `${kfmt(c.used)} / ${ctxfmt(c.ctx)}` : "–";
   for (const k of ["cached", "read", "answer", "free"]) {
-    $(`ctx-leg-${k}`).textContent = c.ctx || k !== "free" ? kfmt(c[k]) : "–";
-    $(`ctx-row-${k}`).classList.toggle("is-now", c.now === k);
+    if ($(`ctx-leg-${k}`)) $(`ctx-leg-${k}`).textContent = c.ctx || k !== "free" ? kfmt(c[k]) : "–";
+    if ($(`ctx-row-${k}`)) $(`ctx-row-${k}`).classList.toggle("is-now", c.now === k);
   }
-  $("ctx-note").hidden = !c.queued;
+  if ($("ctx-note")) $("ctx-note").hidden = !c.queued;
 }
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // model state

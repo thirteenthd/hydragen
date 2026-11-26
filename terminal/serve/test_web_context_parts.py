@@ -85,15 +85,15 @@ process.stdout.write(JSON.stringify({cached: seg('cached'), read: seg('read'), a
         self.assertEqual(got["answer"], [47.1, -141.4])
         self.assertEqual((got["pct"], got["sub"], got["now"], got["legend"], got["note"]), ("80%", "800 / 1000", ["answer"], ["200", "400", "200", "200"], True))
 
-    def test_the_legend_and_its_words(self):
+    def test_the_gauge_markup_is_gone_and_the_card_is_resource_stats(self):
+        # P5-5D.4: the gauge, its legend and its note left the page; the card is Resource Stats now, and
+        # renderContext guards every ctx-* lookup so the page runs clean without them.
         html = (WEB / "index.html").read_text(encoding="utf-8")
-        for k, label in (("cached", "Cached"), ("read", "Reading"), ("answer", "Answer"), ("free", "Free")):
-            self.assertIn(f'id="ctx-row-{k}"', html)
-            self.assertIn(f"<span>{label}</span>", html)
-        for tip in ("Prompt tokens the engine already had in its cache, so they were not read again.", "Prompt tokens being read now.",
-                    "Tokens of the answer written so far.", "Room left in this model&rsquo;s context window."):
-            self.assertIn(f'title="{tip}"', html)
-        self.assertIn(">Waiting in the queue</p>", html)
+        self.assertIn('<span class="card-title">Resource Stats</span>', html)
+        for gone in ("ctx-gauge", "ctx-legend", "ctx-row-cached", "ctx-leg-cached", "ctx-note", "ctx-seg-cached"):
+            self.assertNotIn(gone, html)
+        app = (WEB / "app.js").read_text(encoding="utf-8")
+        self.assertIn('if (!$("ctx-pct")) return;', app)   # the early guard
 
 
 if __name__ == "__main__":
