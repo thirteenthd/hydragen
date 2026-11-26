@@ -354,6 +354,9 @@ void qsa_cow_release(QsaState& st);
 void qsa_cow_state_release(QsaState& st);
 /// cow-m1d: telemetry: joins-at-fetch this arena has served.
 uint64_t qsa_cow_joins(int64_t qsa_ordinal);
+uint64_t qsa_cow_shared_fetches(int64_t qsa_ordinal);   // cow-m1e/§235 telemetry: committed lineage fetches (sh_ctr)
+void qsa_set_cow_shared(int64_t slots);                 // cow-m1e/§235: shared-region slots per arena (0 = off; call before state init)
+int64_t qsa_cow_shared_enabled();                       // cow-m1e/§235: configured shared-region slots (0 = off)
 /// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
 /// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully

@@ -5106,6 +5106,18 @@ int main(int argc, char** argv) {
             const char* jh = hg_getenv("STRATA_COW_JOIN_HH");
             if (jh != nullptr) strata::core::qsa_set_cow_join_hh(std::atoll(jh));
             if (sc != nullptr) strata::core::qsa_set_cow_slot_cells(std::atoll(sc));
+            // cow-m1e/§235: the shared region — arena slots [arena, arena+n_shared) hold lineage-
+            // shared KV; a conv's hint table (lin_all[conv%16][page]) names a region slot per
+            // block, and a hint hit costs a lineage fetch instead of a PCIe miss. Default 0 (OFF):
+            // the §235 tail-slot pin-law fix must prove itself on the probe222x matrix before any
+            // config turns it on.
+            if (const char* sh = hg_getenv("STRATA_COW_SHARED")) {
+                strata::core::qsa_set_cow_shared(std::atoll(sh));
+                if (strata::core::qsa_cow_shared_enabled() > 0)
+                    std::fprintf(stderr, "strata generate: cow: shared region on: %s slots/layer (lineage fetches beat PCIe misses)\n", sh);
+            }
+        } else if (const char* sh = hg_getenv("STRATA_COW_SHARED"); sh != nullptr && sh[0] != '0') {
+            std::fprintf(stderr, "strata generate: cow: STRATA_COW_SHARED requires STRATA_COW_ARENA=1 with streamed INT8 KV — sharing disabled\n");
         }
     }
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
@@ -17220,8 +17232,9 @@ int main(int argc, char** argv) {
                     }
                     std::fprintf(stderr, "cow: the admission fork points at %lld of %lld prefix pages per K/V layer (upto %lld cells)\n",
                                  (long long) sh0, (long long) ((upto + 3) / 4), (long long) upto);
-                    std::fprintf(stderr, "cow: joins-at-fetch served so far: %llu\n",
-                                 (unsigned long long) strata::core::qsa_cow_joins(0));
+                    std::fprintf(stderr, "cow: joins-at-fetch served so far: %llu (shared-region lineage fetches: %llu)\n",
+                                 (unsigned long long) strata::core::qsa_cow_joins(0),
+                                 (unsigned long long) strata::core::qsa_cow_shared_fetches(0));
                 }
             }
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
@@ -17355,8 +17368,9 @@ int main(int argc, char** argv) {
                     }
                     std::fprintf(stderr, "cow: the admission fork points at %lld of %lld prefix pages per K/V layer (upto %lld cells)\n",
                                  (long long) sh0, (long long) ((upto + 3) / 4), (long long) upto);
-                    std::fprintf(stderr, "cow: joins-at-fetch served so far: %llu\n",
-                                 (unsigned long long) strata::core::qsa_cow_joins(0));
+                    std::fprintf(stderr, "cow: joins-at-fetch served so far: %llu (shared-region lineage fetches: %llu)\n",
+                                 (unsigned long long) strata::core::qsa_cow_joins(0),
+                                 (unsigned long long) strata::core::qsa_cow_shared_fetches(0));
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
             }
@@ -17454,8 +17468,9 @@ int main(int argc, char** argv) {
                     }
                     std::fprintf(stderr, "cow: the admission fork points at %lld of %lld prefix pages per K/V layer (upto %lld cells)\n",
                                  (long long) sh0, (long long) ((upto + 3) / 4), (long long) upto);
-                    std::fprintf(stderr, "cow: joins-at-fetch served so far: %llu\n",
-                                 (unsigned long long) strata::core::qsa_cow_joins(0));
+                    std::fprintf(stderr, "cow: joins-at-fetch served so far: %llu (shared-region lineage fetches: %llu)\n",
+                                 (unsigned long long) strata::core::qsa_cow_joins(0),
+                                 (unsigned long long) strata::core::qsa_cow_shared_fetches(0));
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
             }

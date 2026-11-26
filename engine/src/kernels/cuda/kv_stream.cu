@@ -86,22 +86,40 @@ __device__ int block_scan(int v, int* warp_sums, int& total) {
     return excl;
 }
 
+// §235 tail-slot pin law: a join pin may only land on a LIVE slot (use >= 1). A blind atomicAdd
+// could bump a free 0 to 1 (the sweeper then can never claim it: its CAS expects 0) or an
+// in-flight -2 claim to -1 (the sweeper's hand-back CAS(-2, 0) then fails forever). CAS from the
+// observed value: 0 (free) and -2 (claimed) are NEVER perturbed.
+__device__ __forceinline__ bool pin_if_live(int* p) {
+    int cur = *reinterpret_cast<volatile int*>(p);
+    for (;;) {
+        if (cur < 1) return false;
+        const int prev = atomicCAS(p, cur, cur + 1);
+        if (prev == cur) return true;
+        cur = prev;
+    }
+}
+
 __device__ __forceinline__ void resolve_body(KvStreamMap m, const int32_t* __restrict__ ids,
-                                             const int32_t* __restrict__ steps, int n_q, int cap, int page_size) {
+                                             const int32_t* __restrict__ steps, int n_q, int cap, int page_size,
+                                             const bool grouped) {
     __shared__ int s_nmiss, s_lookups, s_nsh, s_cut;
     __shared__ int warp_sums[32];
     const int epoch = m.ctl[0] + 1;
     if (threadIdx.x == 0) { s_nmiss = 0; s_lookups = 0; s_nsh = 0; }
     // cow-m1e: this map's lineage hint table and byte-identity floor (found once in the registry)
     int32_t* lin = nullptr;
+    int my_conv_slot = -1;   // §235: which hint tab (conv % kCowLinTabs) this map arms and revalidates against
     int32_t fl = 0x7FFFFFFF;
     // dyn-conc §222: the floor gates joins-at-fetch (cow-m1d) and must be read whenever the registry
     // exists; only the cow-m1e lineage hint table needs the shared region (lin_all) to be mapped.
     if (m.reg != nullptr)
         for (int e = 0; e < m.reg_n; ++e)
             if (m.reg[e].pt == m.page_table) {
-                if (m.reg[e].conv >= 0 && m.n_shared > 0 && m.lin_all != nullptr)   // §234: hint path is a shared-region mechanism; the floor (fl) below stays live regardless
+                if (m.reg[e].conv >= 0 && m.n_shared > 0 && m.lin_all != nullptr) {  // §234: hint path is a shared-region mechanism; the floor (fl) below stays live regardless
                     lin = m.lin_all + (size_t) (m.reg[e].conv % kCowLinTabs) * (size_t) m.n_blocks;
+                    my_conv_slot = m.reg[e].conv % kCowLinTabs;
+                }
                 fl = m.reg[e].floor;
                 break;
             }
@@ -143,16 +161,31 @@ __device__ __forceinline__ void resolve_body(KvStreamMap m, const int32_t* __res
                             // leaves the tab unmapped/null when the shared region is off), so the zero-init aliasing
                             // that armed-227 for cannot recur.
                             if (L >= 0) {
-                                // prev-gated add (the M-C1d protocol): an unpinned hint (a dead holder)
-                                // or an in-flight claim (-2) takes itself back; revalidate against a
-                                // reclaim that moved the hint mid-protocol.
-                                const int prev = atomicAdd(&m.slot_use[L], 1);
-                                if (prev >= 1 && vlin[b] == L) {
-                                    m.page_table[b] = L;
-                                    joined = true;
-                                    if (m.join_ctr) atomicAdd(m.join_ctr, 1ull);
-                                } else atomicSub(&m.slot_use[L], 1);
-                            } else if (L == -1 && atomicCAS(&lin[b], -1, -2) == -1) {
+                                // §235 tail-slot pin law: pin_if_live never perturbs a free (0) or
+                                // in-flight-claim (-2) slot. After the pin, revalidate ALL THREE:
+                                // the hint still names L, and L's region slot still names this block
+                                // in THIS lineage's tab (sblk/sconv). A slot whose bytes moved (or
+                                // moved to another lineage) fails the revalidation and unpins: the
+                                // miss falls through, never a foreign adoption.
+                                if (pin_if_live(&m.slot_use[L])) {
+                                    __threadfence();
+                                    volatile int32_t* vsblk = m.sblk;
+                                    volatile int32_t* vsconv = m.sconv;
+                                    const int j = L - m.shared_base;
+                                    const bool live = vlin[b] == L && j >= 0 && j < (int) m.n_shared &&
+                                                      vsblk[j] == b && vsconv[j] == my_conv_slot;
+                                    if (live) {
+                                        m.page_table[b] = L;
+                                        joined = true;
+                                        if (m.join_ctr) atomicAdd(m.join_ctr, 1ull);
+                                    } else atomicSub(&m.slot_use[L], 1);
+                                }
+                            } else if (L == -1 && !grouped && atomicCAS(&lin[b], -1, -2) == -1) {
+                                // §235: the grouped copy kernel (copy_groups_kernel) does not publish
+                                // region fetches, so the grouped resolve never CLAIMS one: a claim it
+                                // made would sit at -2 forever and permanently shrink the region.
+                                // Adoption (the L >= 0 branch above) needs no copy and stays live
+                                // in both paths.
                                 const int k = atomicAdd(&s_nsh, 1);
                                 if (k < (int) m.n_slots) { m.miss_sh[k] = b; shpend = true; }   // the entry stays -1: host read this step
                                 else (void) atomicCAS(&lin[b], -2, -1);                         // the claim list is full: hand the hint back
@@ -176,15 +209,17 @@ __device__ __forceinline__ void resolve_body(KvStreamMap m, const int32_t* __res
                             // hhead caps how many foreign joins one range accepts, keeping every window
                             // turning. Over the cap the miss falls through to a cold fetch instead.
                             if (atomicSub(&m.reg[e].hhead, 1) <= 0) { atomicAdd(&m.reg[e].hhead, 1); continue; }
-                            const int prev = atomicAdd(&m.slot_use[s2], 1);
-                            if (prev >= 1 && vpt[b] == s2) {
-                                m.page_table[b] = s2;
-                                joined = true;
-                                if (m.join_ctr) atomicAdd(m.join_ctr, 1ull);
-                            } else {
-                                atomicSub(&m.slot_use[s2], 1);
-                                atomicAdd(&m.reg[e].hhead, 1);
-                            }
+                            // §235 tail-slot pin law: the same live-only pin over peer ranges.
+                            if (pin_if_live(&m.slot_use[s2])) {
+                                if (vpt[b] == s2) {
+                                    m.page_table[b] = s2;
+                                    joined = true;
+                                    if (m.join_ctr) atomicAdd(m.join_ctr, 1ull);
+                                } else {
+                                    atomicSub(&m.slot_use[s2], 1);
+                                    atomicAdd(&m.reg[e].hhead, 1);
+                                }
+                            } else atomicAdd(&m.reg[e].hhead, 1);
                         }
                     }
                 }
@@ -303,9 +338,17 @@ __device__ __forceinline__ void resolve_body(KvStreamMap m, const int32_t* __res
         if (k >= placed_sh) { (void) atomicCAS(&lin[b], -2, -1); continue; }   // region full: release the claim, host read this step
         const int gs = (int) m.miss_sh_slot[k] + (int) m.slot_base;
         const int j = gs - m.shared_base;
+        // §235 root cause 1: the old block's hint dies in the tab of the LINEAGE that armed the
+        // slot (sconv[j]), not in this claimer's tab. Clearing it here (lin[oldb] = -1) left the
+        // previous owner's hint pointing at this slot; once the copy kernel re-published the slot
+        // for the new block, the old lineage adopted the new lineage's KV bytes.
         const int oldb = m.sblk[j];
-        if (oldb >= 0) lin[oldb] = -1;
+        const int oldc = m.sconv[j];
+        if (oldb >= 0 && oldc >= 0 && m.lin_all != nullptr)
+            m.lin_all[(size_t) oldc * (size_t) m.n_blocks + (size_t) oldb] = -1;
+        __threadfence();
         m.sblk[j] = b;
+        m.sconv[j] = my_conv_slot;
         m.sst[j] = epoch;
         m.srf[j] = 1;
     }
@@ -327,7 +370,7 @@ __device__ __forceinline__ void resolve_body(KvStreamMap m, const int32_t* __res
 __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_t* __restrict__ ids,
                                                      const int32_t* __restrict__ steps, int n_q, int cap,
                                                      int page_size) {
-    resolve_body(m, ids, steps, n_q, cap, page_size);
+    resolve_body(m, ids, steps, n_q, cap, page_size, false);
 }
 
 // Lean per-kernel parameter structs to stay well within CUDA's 4 KB pass-by-value kernel argument limit.
@@ -356,7 +399,7 @@ __global__ void __launch_bounds__(RT) resolve_groups_kernel(KvResolveMapGroups m
     const KvStreamMap m = mg.map[g];
     const int first = mg.first[g];
     const int n_q = mg.ntok[g];
-    resolve_body(m, ids + (long long) first * cap, steps + (long long) first * kStepCount, n_q, cap, page_size);
+    resolve_body(m, ids + (long long) first * cap, steps + (long long) first * kStepCount, n_q, cap, page_size, true);
 }
 
 // One block-row per distinct streamed slot (blockIdx.y = g): copies that slot's missed blocks from host into VRAM.
@@ -382,10 +425,12 @@ __global__ void copy_groups_kernel(KvCopyGroups cg) {
 __global__ void copy_kernel(KvStreamMap m, Runs r) {
     const int need = m.ctl[2], nsh = m.ctl[11];   // cow-m1e: + region fetches
     int32_t* lin = nullptr;
+    int my_conv_slot = -1;   // §235: the tab this map's lineage owns (see resolve_body)
     if (m.n_shared > 0 && m.reg != nullptr && m.lin_all != nullptr)
         for (int e = 0; e < m.reg_n; ++e)
             if (m.reg[e].pt == m.page_table && m.reg[e].conv >= 0) {
                 lin = m.lin_all + (size_t) (m.reg[e].conv % kCowLinTabs) * (size_t) m.n_blocks;
+                my_conv_slot = m.reg[e].conv % kCowLinTabs;
                 break;
             }
     for (int k = blockIdx.x; k < need + nsh; k += gridDim.x) {
@@ -404,9 +449,15 @@ __global__ void copy_kernel(KvStreamMap m, Runs r) {
         __syncthreads();
         if (threadIdx.x == 0) {
             const int32_t gs = (int32_t) (sl + m.slot_base);
-            if (sh) {   // cow-m1e: the fetcher keeps its claim (-2 -> held 1), names the page, then
-                        // lets the lineage see the hint LAST, behind a fence: any joiner that reads
-                        // the hint is guaranteed to find a refcount it can pin.
+            if (sh) {   // cow-m1e + §235: publish the slot's block map and owning tab FIRST (fenced),
+                        // then take the refcount live (-2 claim -> held 1), name the page, and let
+                        // the lineage see the hint LAST: any joiner that can pin the slot already
+                        // sees sblk/sconv that pass its revalidation, and any joiner that reads the
+                        // hint is guaranteed to find a refcount it can pin.
+                const int j = gs - m.shared_base;
+                m.sblk[j] = (int32_t) b;
+                m.sconv[j] = my_conv_slot;
+                __threadfence();
                 (void) atomicExch(&m.slot_use[gs], 1);
                 if (m.sh_ctr) atomicAdd(m.sh_ctr, 1ull);
                 m.page_table[b] = gs;

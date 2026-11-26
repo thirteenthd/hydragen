@@ -1251,6 +1251,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(kv_stream_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME kv_stream_parity COMMAND kv_stream_parity)
 
+  # §235: the shared-region tail-slot pin law - three maps (two one lineage) roll a tiny shared
+  # region with detach/re-admit cycles; content, refcount and hint invariants after every round
+  # (GPU, synthetic, no model).
+  add_executable(kv_cow_shared_test src/kernels/kv_cow_shared_test.cpp)
+  target_include_directories(kv_cow_shared_test PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(kv_cow_shared_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME kv_cow_shared_test COMMAND kv_cow_shared_test)
+
   # #2403: the verify window's KV calls on a streamed layer and on a ring (steps appends with the host copy, batched
   # resolve + attention, plain launches and graph replays), q4_0 / int8 / K8V4 (GPU, synthetic, no model).
   add_executable(kv_window_parity src/kernels/kv_window_parity.cpp)

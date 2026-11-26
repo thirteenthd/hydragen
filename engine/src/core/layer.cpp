@@ -632,6 +632,7 @@ int64_t g_cow_slot_cells = 0;
 int64_t g_cow_join_hh = 0;               // cow-m1d: per-range join headroom; 0 = join-at-fetch OFF (forkb4 behavior)
 namespace {
 struct CowArena { int8_t* k = nullptr; int8_t* v = nullptr; uint16_t* ks = nullptr; uint16_t* vs = nullptr; int* use = nullptr; unsigned long long* jctr = nullptr;   // cow-m1d: jctr = joins-at-fetch counter (telemetry)
+    int32_t* lin = nullptr; int32_t* sblk = nullptr; int32_t* sst = nullptr; int32_t* srf = nullptr; int32_t* sconv = nullptr; unsigned long long* sctr = nullptr;   // cow-m1e/§235: hint tables, region clock + owner tab, fetch counter
     std::unique_ptr<strata::core::VmmRange> vr;   // (dyn-conc P2) one address range per arena; the pointers above point into it
     int64_t off[6] = {0};               // (dyn-conc P2) chunk-aligned array offsets inside *vr
 };
@@ -833,6 +834,10 @@ void qsa_set_cow_arena(int64_t slots_per_layer) {   // cow-m1 (extern scope; the
 void qsa_cow_session_begin() { ++g_cow_session_ctr; }
 void qsa_set_cow_slot_cells(int64_t cells) { g_cow_slot_cells = cells > 0 ? cells : 0; }
 void qsa_set_cow_join_hh(int64_t v) { g_cow_join_hh = v > 0 ? v : 0; }
+int64_t g_cow_shared = 0;                // cow-m1e/§235: shared-region slots appended to each arena; 0 = OFF (stays OFF until the §235 matrix proves the pin-law fix)
+int64_t g_cow_lin_blocks = 0;            // cow-m1e: hint table width (blocks)
+void qsa_set_cow_shared(int64_t slots) { g_cow_shared = slots > 0 ? slots : 0; }
+int64_t qsa_cow_shared_enabled() { return g_cow_shared; }
 
 // cow-m1d: the join-at-fetch registry. Entries are born at state init (full write, before anything decodes)
 // and afterwards ONLY `conv` mutates, and only as its own 4 B store: a concurrent device scan never sees a
@@ -856,6 +861,13 @@ uint64_t qsa_cow_joins(int64_t qsa_ordinal) {
         g_cow_arenas[(size_t) qsa_ordinal].jctr == nullptr) return 0;
     uint64_t v = 0;
     if (cudaMemcpy(&v, g_cow_arenas[(size_t) qsa_ordinal].jctr, 8, cudaMemcpyDeviceToHost) != cudaSuccess) return 0;
+    return v;
+}
+uint64_t qsa_cow_shared_fetches(int64_t qsa_ordinal) {   // cow-m1e/§235 telemetry: committed lineage fetches (sh_ctr)
+    if (qsa_ordinal < 0 || (size_t) qsa_ordinal >= g_cow_arenas.size() ||
+        g_cow_arenas[(size_t) qsa_ordinal].sctr == nullptr) return 0;
+    uint64_t v = 0;
+    if (cudaMemcpy(&v, g_cow_arenas[(size_t) qsa_ordinal].sctr, 8, cudaMemcpyDeviceToHost) != cudaSuccess) return 0;
     return v;
 }
 
@@ -918,6 +930,14 @@ static int32_t cow_conv_new() {   // claim a tab, return its fresh conv serial
     const int32_t c = (int32_t) (++g_cow_conv_serial) * strata::kernels::kCowLinTabs + tab;
     g_cow_lin_owner[tab] = c;
     g_cow_lin_clock[tab] = ++g_cow_lin_clock_ctr;
+    // cow-m1e/§234: the fresh holder claims a CLEAN tab (the "tab cleared at claim" contract):
+    // stale hints from the evicted conv would at worst cost a rollback round-trip, but zeroing
+    // is bounded and keeps the §235 sconv revalidation honest.
+    if (g_cow_shared > 0 && g_cow_lin_blocks > 0)
+        for (CowArena& a : g_cow_arenas)
+            if (a.lin != nullptr)
+                (void) cudaMemset(a.lin + (size_t) tab * (size_t) g_cow_lin_blocks,
+                                  0xFF, (size_t) g_cow_lin_blocks * 4);
     return c;
 }
 static int32_t cow_conv_for_ids(const std::vector<int32_t>& ids, int64_t upto) {
@@ -1088,6 +1108,9 @@ static bool cow_arena_live_past(int64_t slots) {
 int64_t qsa_cow_arena_need(int64_t slots) {
     if (!g_cow_arena || slots <= g_cow_mapped_slots || slots > g_cow_arena_slots) return 0;
     const uint64_t G = strata::core::vmm_granularity();
+    // cow-m1e: the window arrays also cover the shared region tail [arena, arena+n_shared), which
+    // boot maps and shrink never unmaps (see qsa_cow_arena_shrink): the demand math stays the
+    // window delta, grow's mapped() check skips the region chunks.
     int64_t n = 0;
     for (int arr = 0; arr < 5; ++arr) {
         const int64_t have = (int64_t) (((uint64_t) g_cow_slot_b[arr] * (uint64_t) g_cow_mapped_slots + G - 1) / G);
@@ -1107,6 +1130,8 @@ bool qsa_cow_arena_grow(int64_t slots, const std::function<strata::core::VmmChun
         if (!a.vr) { ok = false; break; }
         for (int arr = 0; arr < 5 && ok; ++arr) {
             const int64_t c0 = a.off[arr] / (int64_t) G + (int64_t) (((uint64_t) g_cow_slot_b[arr] * (uint64_t) from + G - 1) / G);
+            // cow-m1e: window chunks only (the elastic budget): the anchored region chunks were
+            // mapped at boot and qsa_cow_arena_shrink never unmaps them.
             const int64_t c1 = a.off[arr] / (int64_t) G + (int64_t) (((uint64_t) g_cow_slot_b[arr] * (uint64_t) slots + G - 1) / G);
             for (int64_t c = c0; c < c1 && ok; ++c) {
                 if (a.vr->mapped(c)) continue;
@@ -1131,8 +1156,14 @@ int64_t qsa_cow_arena_shrink(int64_t slots, const std::function<void(strata::cor
         if (!a.vr) return 0;
         for (int arr = 0; arr < 5; ++arr) {
             const int64_t c0 = a.off[arr] / (int64_t) G + (int64_t) (((uint64_t) g_cow_slot_b[arr] * (uint64_t) slots + G - 1) / G);
+            // cow-m1e: the shared region is anchored at the arena's FAR end [arena_slots,
+            // arena_slots+n_shared): the chunk that first holds region bytes is never unmapped,
+            // so the region's use/clock/hint entries stay mapped through any trim.
+            const int64_t c_region = a.off[arr] / (int64_t) G +
+                                     (int64_t) ((uint64_t) g_cow_slot_b[arr] * (uint64_t) g_cow_arena_slots / G);
             const int64_t c1 = a.off[arr] / (int64_t) G + (int64_t) (((uint64_t) g_cow_slot_b[arr] * (uint64_t) g_cow_mapped_slots + G - 1) / G);
-            for (int64_t c = c0; c < c1; ++c)
+            const int64_t c1e = std::min(c1, c_region);
+            for (int64_t c = c0; c < c1e; ++c)
                 if (const strata::core::VmmChunk h = a.vr->unmap(c)) { give(h); ++freed; }
         }
     }
@@ -1389,7 +1420,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             return 0;
         }
         if (g_cow_arenas.empty()) {
-            const int64_t T = g_cow_arena_slots;
+            const int64_t T = g_cow_arena_slots + g_cow_shared;   // cow-m1e: [0,arena) session windows, [arena,T) shared region
             const uint64_t nc = (uint64_t) s.n_head_kv * s.page_size;
             const uint64_t kb = (uint64_t) T * nc * s.head_dim;
             const uint64_t sb2 = (uint64_t) T * nc * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
@@ -1413,7 +1444,10 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                 a.off[3] = a.off[2] + al(sb2);
                 a.off[4] = a.off[3] + al(sb2);
                 a.off[5] = a.off[4] + al((uint64_t) T * 4);                                   // the join counter
-                const int64_t total = a.off[5] + (int64_t) G64;
+                int64_t total = a.off[5] + (int64_t) G64;
+                if (g_cow_shared > 0)   // cow-m1e/§235: the always-mapped region tail: clock + owner-tab arrays, fetch counter, hint tables
+                    total += 4 * al((uint64_t) g_cow_shared * 4) + (int64_t) G64 +
+                             al((uint64_t) strata::kernels::kCowLinTabs * (uint64_t) pages * 4);
                 a.vr = std::make_unique<strata::core::VmmRange>();
                 if (!a.vr->reserve((uint64_t) total)) ok = false;
                 else if (!a.vr->map_range(0, total / (int64_t) G64, [] { return (strata::core::VmmChunk) 0; })) ok = false;
@@ -1424,6 +1458,21 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                     a.use = (int32_t*) (pb + a.off[4]); a.jctr = (unsigned long long*) (pb + a.off[5]);
                     ok = cudaMemset(a.use, 0, (size_t) T * 4) == cudaSuccess &&
                          cudaMemset(a.jctr, 0, 8) == cudaSuccess;
+                    if (ok && g_cow_shared > 0) {
+                        int64_t t7 = a.off[5] + (int64_t) G64;
+                        a.sblk  = (int32_t*) (pb + t7); t7 += al((uint64_t) g_cow_shared * 4);
+                        a.sst   = (int32_t*) (pb + t7); t7 += al((uint64_t) g_cow_shared * 4);
+                        a.srf   = (int32_t*) (pb + t7); t7 += al((uint64_t) g_cow_shared * 4);
+                        a.sconv = (int32_t*) (pb + t7); t7 += al((uint64_t) g_cow_shared * 4);
+                        a.sctr  = (unsigned long long*) (pb + t7); t7 += (int64_t) G64;
+                        a.lin   = (int32_t*) (pb + t7);
+                        ok = cudaMemset(a.sblk, 0xFF, (size_t) g_cow_shared * 4) == cudaSuccess &&
+                             cudaMemset(a.sst, 0xFF, (size_t) g_cow_shared * 4) == cudaSuccess &&
+                             cudaMemset(a.srf, 0, (size_t) g_cow_shared * 4) == cudaSuccess &&
+                             cudaMemset(a.sconv, 0xFF, (size_t) g_cow_shared * 4) == cudaSuccess &&
+                             cudaMemset(a.sctr, 0, 8) == cudaSuccess &&
+                             cudaMemset(a.lin, 0xFF, (size_t) strata::kernels::kCowLinTabs * (uint64_t) pages * 4) == cudaSuccess;
+                    }
                 }
             }
             if (ok) {   // cow-m1d: the join-at-fetch registry: a fixed device array, entries created at state init, never destroyed
@@ -1434,9 +1483,10 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                     ok = false;
             }
             g_cow_mapped_slots = g_cow_arena_slots;
+            if (ok) g_cow_lin_blocks = pages;   // cow-m1e: hint table width (every streamed state shares this page count)
             if (ok)
-                std::fprintf(stderr, "cow: K/V arenas: %lld QSA layers x %lld slots = %.2f GiB reserved, all mapped (INT8 streamed, VMM)\n",
-                             (long long) g.n_qsa_layers(), (long long) g_cow_arena_slots,
+                std::fprintf(stderr, "cow: K/V arenas: %lld QSA layers x %lld slots (%lld shared region) = %.2f GiB reserved, all mapped (INT8 streamed, VMM)\n",
+                             (long long) g.n_qsa_layers(), (long long) (g_cow_arena_slots + g_cow_shared), (long long) g_cow_shared,
                              (double) g.n_qsa_layers() * 2.0 * (kb + sb2) / 1073741824.0);
             if (ok) {   // (dyn-conc P2) boot floor: STRATA_COW_ARENA_FLOOR commits the expected resident
                         // budget, not the ceiling; the released chunks land back on the driver's free list,
@@ -1592,9 +1642,15 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.map.reg = g_cow_reg;
         st.map.reg_n = kCowRegCap;
         st.map.join_ctr = g_cow_arenas[(size_t) qsa_ordinal].jctr;
-        {   // Depth 1 prune (Phase 1): pin shared-region map fields null/0
-            st.map.lin_all = nullptr; st.map.sblk = nullptr; st.map.sst = nullptr; st.map.srf = nullptr;
-            st.map.shared_base = 0; st.map.n_shared = 0; st.map.sh_ctr = nullptr;
+        {   // cow-m1e/§235: bake the shared region (null/0 when g_cow_shared == 0: sharing OFF by
+            // default, the arena tail was never allocated, and every path degrades to M-C1d exactly
+            // as the Phase 1 prune left it).
+            const CowArena& a7 = g_cow_arenas[(size_t) qsa_ordinal];
+            st.map.lin_all = a7.lin; st.map.sblk = a7.sblk; st.map.sst = a7.sst; st.map.srf = a7.srf;
+            st.map.sconv = a7.sconv;
+            st.map.shared_base = g_cow_shared > 0 ? (int32_t) g_cow_arena_slots : 0;
+            st.map.n_shared = (int32_t) g_cow_shared;
+            st.map.sh_ctr = a7.sctr;
         }
     }
     if (g_cow_reg && st.map.slot_use != nullptr) {   // cow-m1d: register this state for join-at-fetch (init only: refresh reuses this table buffer forever)

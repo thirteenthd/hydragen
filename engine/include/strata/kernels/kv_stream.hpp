@@ -119,6 +119,12 @@ struct KvStreamMap {
     int32_t* sblk = nullptr;          ///< (n_shared,) shared slot -> block it holds, or -1
     int32_t* sst  = nullptr;          ///< (n_shared,) epoch stamp (per-map epochs: aliasing only skips a candidate, conservative)
     int32_t* srf  = nullptr;          ///< (n_shared,) clock reference bit
+    /// §235 tail-slot pin law: (n_shared,) the hint tab slot (conv % kCowLinTabs) that armed sblk[j].
+    /// When a region slot is re-armed, the OLD block's hint must die in the PREVIOUS owner's tab —
+    /// clearing it in the claimer's tab left the old lineage's hint dangling at a slot whose bytes
+    /// were about to move, and that lineage then adopted foreign KV. Also the adoption revalidation:
+    /// a joiner pins only when sblk/sconv still name its block in its own tab. -1: never armed.
+    int32_t* sconv = nullptr;
     int32_t* miss_sh = nullptr;       ///< (n_slots,) blocks whose lineage fetch this call claimed
     int32_t* miss_sh_slot = nullptr;  ///< (n_slots,) their arena-global slots (same slot_base basis as miss_slot)
     unsigned long long* sh_ctr = nullptr; ///< telemetry: committed lineage fetches
