@@ -303,8 +303,10 @@ class WebDynamicSlots(unittest.TestCase):
                                                     "restored_tokens": 1200, "restored_from": "parked"}),
                                       ("idle", {}), ("idle", {}), ("idle", {})]))
         out = self.run_scenarios({"s": {"frames": [[live, ENG, {}]]}})["s"]
-        self.assertEqual(out["els"]["slot-restored-badge-0"]["text"], "Restored · parked")
+        self.assertEqual(out["els"]["slot-restored-badge-0"]["text"], "Restored · RAM")   # P5-5D.5: RAM, not "parked"
         self.assertFalse(out["els"]["slot-restored-badge-0"]["hidden"])
+        html0 = out["html"][0]
+        self.assertLess(html0.index("slot-restored-badge-0"), html0.index("st-badge-0"))  # restored pill sits left
         self.assertIn("is-split", out["els"]["slot-track-0"]["cls"])
         self.assertEqual(out["els"]["slot-restored-fill-0"]["width"], "98%")   # 1200 of 1230
         self.assertEqual(out["els"]["slot-fill-0"]["width"], "2%")             # 30 of 1230
@@ -317,7 +319,7 @@ class WebDynamicSlots(unittest.TestCase):
                                                     "restored_tokens": 900, "restored_from": "disk"}),
                                       ("idle", {}), ("idle", {}), ("idle", {})]))
         out = self.run_scenarios({"s": {"frames": [[live, ENG, {}]]}})["s"]
-        self.assertEqual(out["els"]["slot-restored-badge-0"]["text"], "Restored · disk")
+        self.assertEqual(out["els"]["slot-restored-badge-0"]["text"], "Restored · Storage")
 
     def test_a_burst_past_k_active_queues(self):
         live = base_live(state="generating", running=2, waiting=3,
@@ -514,10 +516,12 @@ class PageSource(unittest.TestCase):
         self.assertIn("${curConcurrency} / ${kActive} Active (Max ${kMax})", self.app)
 
     def test_the_restored_breakdown_rendering(self):
-        self.assertIn('"Restored · parked"', self.app)
-        self.assertIn('"Restored · disk"', self.app)
+        self.assertIn('"Restored · RAM"', self.app)
+        self.assertIn('"Restored · Storage"', self.app)
         self.assertIn("restored · ${fmt(gen)} generated", self.app)
         self.assertIn("slot-tile__bar-track is-split", self.app)
+        # P5-5D.5: the restored pill is emitted before the state pill, matching the bar's left-to-right chunks
+        self.assertLess(self.app.index('id="slot-restored-badge-${i}"'), self.app.index('id="st-badge-${i}"'))
 
     def test_the_idle_summary_tile(self):
         self.assertIn("`Idle · Auto Cap K=${kActive} of ${kMax}`", self.app)

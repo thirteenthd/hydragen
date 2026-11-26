@@ -564,8 +564,10 @@ function renderConcurrency(live, eng, hw) {
           <div class="slot-tile__header">
             <span class="slot-tile__name">${s.label || `Slot ${i}`}</span>
             <span class="slot-tile__badges">
-              <span class="slot-tile__badge tone-reading" id="st-badge-${i}">Reading</span>
+              <!-- P5-5D.5: left-to-right like the bar graph: the restored chunk sits left of the live one,
+                   so the Restored pill reads before the state pill. -->
               <span class="slot-tile__badge tone-restored" id="slot-restored-badge-${i}" hidden></span>
+              <span class="slot-tile__badge tone-reading" id="st-badge-${i}">Reading</span>
             </span>
           </div>
           <div class="slot-tile__metrics">
@@ -710,7 +712,7 @@ function renderConcurrency(live, eng, hw) {
       if (rt > 0) {
         const from = sInfo.restored_from;
         restBadgeEl.hidden = false;
-        restBadgeEl.textContent = from === "parked" ? "Restored · parked" : from === "disk" ? "Restored · disk" : "Restored";
+        restBadgeEl.textContent = from === "parked" ? "Restored · RAM" : from === "disk" ? "Restored · Storage" : "Restored";
       } else {
         restBadgeEl.hidden = true;
       }

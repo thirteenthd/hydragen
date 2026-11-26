@@ -346,6 +346,8 @@ class PickSlot(unittest.TestCase):
         e.slot_used = [0.0] * n
         e.slot_live = [None] * n
         e.slot_group = [0] * n
+        # P5-5D.5: slots_view reads the release set and the free-times the batch start would have set
+        e.slot_releasing, e.slot_t_free = set(), [0.0] * n
         return e
 
     def test_the_slot_that_holds_the_conversation(self):
@@ -556,7 +558,8 @@ class PickSlot(unittest.TestCase):
         v = e.slots_view()
         self.assertEqual(v[0]["state"], "decoding")
         self.assertEqual(v[0]["generated"], 4)
-        self.assertEqual(v[1], {"slot": 1, "state": "idle", "held_tokens": 2})
+        self.assertEqual(v[1], {"slot": 1, "state": "idle", "releasing": False, "held_tokens": 2,
+                                "idle_s": None, "restored_tokens": 0, "restored_from": None})
 
 
 class FakeEngineCase(unittest.TestCase):
