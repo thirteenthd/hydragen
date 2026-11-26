@@ -2859,3 +2859,78 @@ Open for Phase 4: the §235 shared-region tail-slot pin law fix — adoption is 
 (`fetches 4286`, joins the flow, zero markers) but the shared region corrupts while rolling
 (`2048` 3/4×2, `0` and `8192` 8/8), `COW_SHARED` stays 0, and the fix is still unwritten.
 counter 194.
+
+## §242 — Phase 4: the §235 shared-region tail-slot pin law is fixed; COW_SHARED is unlocked as a safe opt-in (2026-11-26)
+
+Phase 4 on `phase4/v0.0.1` (tip `e35e7b3`, parent `1a69f4f`). The §235 blocker — the
+shared region corrupting while rolling (`2048` parallel 3/4×2, `0` and `8192` 8/8) — is
+fixed at the kernel level and the failing arm now runs 8/8. `STRATA_COW_SHARED` stays
+**0** by default.
+
+**Root cause 1 — cross-lineage stale hint (`kv_stream.cu`).** When a new lineage claimed
+a rolled region slot, the old block's hint was cleared in the **claimer's** lineage tab
+(`lin[oldb] = -1`) instead of the **previous owner's**, leaving `linA[oldb] == gs`
+dangling; once the claimer published, lineage A adopted the slot and read lineage B's KV
+bytes. Fix: a new `sconv` array (`(n_shared,)`, in `KvStreamMap`, `kv_stream.hpp`)
+records which lineage tab armed each region slot; re-arming clears
+`m.lin_all[oldc * m.n_blocks + oldb] = -1` behind `__threadfence()` before arming
+`sblk[j]`/`sconv[j]`.
+
+**Root cause 2 — pin-vs-claim race.** A blind `atomicAdd(&slot_use[L], 1)` on the
+adoption and peer-join paths could bump a free slot `0 → 1` (the sweeper's
+`atomicCAS(gs, -2, 0)` then never fires and the slot sticks) or perturb an in-flight `-2`
+claim. Fix: the live-only CAS loop `pin_if_live()` — `0` and `-2` are never perturbed —
+plus a fenced triple revalidation after pinning (`vlin[b] == L && vsblk[j] == b &&
+vsconv[j] == my_conv_slot`), unpinning on mismatch; `copy_kernel` publish order is
+`sblk`/`sconv` → fence → `atomicExch(slot_use, 1)` → `page_table` → fence → hint last.
+
+**Root cause 3 — grouped-resolve leak guard.** `copy_groups_kernel` never publishes
+region fetches, so a claim from `resolve_groups_kernel` would sit at `-2` forever;
+region claims are gated on `!grouped`.
+
+**Host wiring (`layer.cpp`, `generate.cpp`).** `STRATA_COW_SHARED` / `HG_COW_SHARED`
+re-exposed, default **0** (opt-in on 12 GiB to preserve expert VRAM); the region tail is
+anchored at the arena VMM range's far end, boot-mapped, with `qsa_cow_arena_shrink`
+clamped at `c_region` so region bytes are never unmapped; `cow_conv_new()` zeroes a
+freshly claimed hint tab (`0xFF`) so the revalidation sees a clean tab. All three join
+sites print `joins-at-fetch` and `shared-region lineage fetches`.
+
+**Unit test `kv_cow_shared_test` (new, GPU).** 3 maps — A/B share one conv (legal peer
+joins), C a different lineage, so cross-lineage hint poisoning is directly observable —
+a 16-slot rolling region, 80 sequential + concurrent rounds, detach/re-admit/zombie
+sweeps, per-round content/pin-law/hint invariants. **PASS**: `106` joins, `448`
+shared-region lineage fetches, `432` region re-arms, `0` corruption, `0` pin leaks,
+`0` dangling hints.
+
+**Gates.** Windows CPU `ctest -E 'dot_x4_bench'`: **178/178 passed** (41.2 s). Windows
+CUDA `p1-cuda-t16`: `hydragen.exe --version` → `hydragen v0.0.1`, `kv_cow_shared_test`
+**PASS**. ms01 `build-p4-arm16` at `e35e7b3`: **G3 + `kv_cow_shared_test` 11/11 passed**
+(14.67 s).
+
+**The §235 `probe222x` matrix, closed** (ms01, Arm-16 build, `--batch 8`, engine-default
+PCIe cap, park-disk wiped once → real 13k admissions; `~/g9/p4_final.log` +
+`~/g9/p4_9172.log`):
+
+- `STRATA_COW_SHARED=2048` (rolling; §235's failing arm): parallel `9170` 4/4 + `9172`
+  4/4 and serial `9171` 4/4 + `9173` 4/4 — **8/8 parallel, 8/8 serial**; `7,281`
+  shared-region lineage fetches, `194` joins, KV streaming `88.30 %`, `OOM=0`.
+- `STRATA_COW_SHARED=8192`: **8/8 parallel** (`9170` 4/4 + `9172` 4/4); `10,918`
+  fetches, KV streaming `99.92 %`, `OOM=0`.
+- `STRATA_COW_SHARED=0` (default control): **8/8 parallel** (`9170` 4/4 + `9172` 4/4);
+  `0` fetches, KV streaming `80.11 %`, `OOM=0`.
+- Harness notes, stated plainly: the second parallel probe first returned HTTP 503
+  (wrapper admission backpressure while the first probe's conversations park); re-run
+  with 300 s settles gave 4/4 in every arm. One intermediate-pass serial run showed a
+  truncated tail (`317`, `finish=stop`, correct first number) — a sampling miss, not
+  §235's foreign-pair corruption signature; the fresh-admission pass was 4/4.
+
+**Quick `parallel=8` A/B** (fresh topic per arm). bench_quick agg tok/s N=1/2/4/8:
+`0` 73.5/77.2/63.8/51.0 · `2048` 72.7/66.4/60.6/45.9 · `8192` 69.2/74.3/58.8/43.7 —
+N≥4 carries wrapper rejections (errors 2/6), so short-prompt throughput shows **no
+measurable gain** from the region. Fan-out (4×8k identical prompt): 4/4 in 4.2 s at both
+`0` and `2048`. Arena reserved `1.64 → 1.74 → 2.03 GiB` across `0/2048/8192` while boot
+VRAM stays flat (11497/11495/11489 MiB) — the region is VMM address space, physically
+paid only when used. The region's win is hit rate (`99.92 %` @8192, `88.30 %` @2048 vs
+`80.11 %` control), not short-prompt throughput: the default stays **0** on 12 GiB and
+opt-in shared-region adoption is now safe.
+counter 195.
