@@ -157,6 +157,7 @@
 #include "strata/program/batch_groups.hpp"
 #include "strata/program/par_counters.hpp"
 #include "strata/program/decode_governor.hpp"
+#include "strata/core/auto_batch_controller.hpp"   // P5-5C.2: the admission-level auto batch-N controller
 #include "strata/program/fanout_prefix.hpp"   // HydraGen 2A: the fan-out prefix cut
 #if defined(__linux__)
 #include <execinfo.h>
@@ -11970,6 +11971,7 @@ int main(int argc, char** argv) {
         int64_t reserve_bytes = 0;        // reclaim grows only while free VRAM stays above this
         int64_t lent_bytes = 0;           // bytes the lends have handed to the driver so far
         int64_t lends = 0, reclaims = 0, evicted = 0, refilled = 0;
+        int initial_k = 0;                // P5-5C.2: the pool's start-up K_active cap (0: not computed)
     } cow_pool;
     {
         const char* up = hg_getenv("STRATA_UNIFIED_POOL");
@@ -12003,6 +12005,7 @@ int main(int argc, char** argv) {
                     const int kcap = strata::core::initial_active_cap(
                         (int64_t) fb - ((int64_t) o.vram_reserve_mib << 20), flex, slot_vram,
                         o.batch > 0 ? o.batch : 1);
+                    cow_pool.initial_k = kcap;   // P5-5C.2: the auto-batch controller starts here
                     std::fprintf(stderr, "strata generate: unified pool: the expert cache (%lld slots) may lend down "
                                          "to slot %lld (floor override %s); flex %.0f MiB, slot %.2f MiB, initial "
                                          "K_active %d of %d, min-stream-tps %.1f\n",
@@ -16318,6 +16321,29 @@ int main(int argc, char** argv) {
                 cudaDeviceSynchronize();
             }
         };
+        // ---- P5-5C.2: the admission-level auto batch-N controller (Track 5C).  One instance sits at the
+        // admission boundary: every batch completion (BDONE) feeds it one observation, and it moves the
+        // number of streams admission should keep active (K) by at most one, damped.  The wrapper reads
+        // K through `KCAP <k_active> <max_k> <live_slots> <full_slots>` lines on stdout (consumed by the
+        // server's pump thread, never a request's line) and gates pick_slot on it, so excess streams
+        // queue cleanly instead of pushing the engine into a memory-limit refusal.  On when --batch > 1
+        // unless STRATA_AUTO_BATCH=0.  The pool's start-up K cap (initial_active_cap) is its starting K.
+        const bool auto_batch_on = o.batch > 1 && [] {
+            const char* v = hg_getenv("STRATA_AUTO_BATCH");
+            return v == nullptr || v[0] != '0';
+        }();
+        strata::core::AutoBatchConfig ab_cfg;
+        ab_cfg.min_k = 1;
+        ab_cfg.max_k = o.batch;
+        ab_cfg.initial_k = (cow_pool.on && cow_pool.initial_k > 0) ? cow_pool.initial_k : o.batch;
+        ab_cfg.min_stream_tps = o.min_stream_tps;
+        strata::core::AutoBatchController auto_batch(ab_cfg);
+        auto emit_kcap = [&] {
+            if (!auto_batch_on) return;
+            std::printf("KCAP %d %d %lld %lld\n", auto_batch.k_active(), o.batch,
+                        (long long) xcache.slots(), (long long) xcache.full_slots());
+            std::fflush(stdout);
+        };
     // P5-5B: the unified pool's lend/reclaim, placed after the prompt path's plan is known: the cache's
     // tail slots ARE the prompt path's loan buffers, so a lend floor must clear them (the serve VRAM
     // command's protocol, #533: quiesce, shrink/grow in whole segments, evict/refill the residency
@@ -16360,6 +16386,7 @@ int main(int argc, char** argv) {
                      (long long) (before - xcache.slots()), (double) gave / 1073741824.0,
                      (double) want_bytes / 1073741824.0, (long long) cow_pool.evicted,
                      (long long) xcache.slots(), (long long) xcache.full_slots());
+        emit_kcap();   // P5-5C.2: the pool's live slots just moved; the wrapper re-reads them
         return gave;
     };
     // Take VRAM back after a detach lifted the pressure: grow the cache toward its full size while free
@@ -16415,9 +16442,10 @@ int main(int argc, char** argv) {
         cow_pool.refilled += refilled;
         ++cow_pool.reclaims;
         std::fprintf(stderr, "strata: unified pool: %lld slots back to the expert cache (%lld experts refilled "
-                             "from the profile), %lld of %lld slots hold experts%s\n",
+                             "from the profile), %lld of %lld slots mapped (live of full)%s\n",
                      (long long) (live - before), (long long) refilled,
-                     (long long) xcache.resident(), (long long) live, grew ? "" : " (the driver had no more)");
+                     (long long) live, (long long) xcache.full_slots(), grew ? "" : " (the driver had no more)");
+        emit_kcap();   // P5-5C.2: the pool's live slots just moved; the wrapper re-reads them
         return live - before;
     };
         // --pipeline-windows 2: the loop has drained (nothing in flight on either card): what waits for a gap goes now,
@@ -16883,6 +16911,8 @@ int main(int argc, char** argv) {
         g_gpu_pause_idle.idle(gpu_pause_now());   // AMD on Linux: the gap before the first request starts here (the start-up's own pauses are not a "between")
         std::printf("READY %lld stop hold holdb\n", (long long) o.max_context);   // "stop": this engine honours STOP; "hold": GEN hold=N:ID; "holdb": the --batch slots end at the hold too (BDONE hold)
         std::fflush(stdout);
+        emit_kcap();   // P5-5C.2: the wrapper learns the starting K_active right after READY (a line it
+                       // parses and consumes; an older wrapper that ignores unknown lines is unaffected)
         std::string line;
         int64_t rounds = 0;
         const int S = o.spec;
@@ -17326,7 +17356,19 @@ int main(int argc, char** argv) {
         strata::core::BatchWindowSampler batch_telemetry(batch_telemetry_enabled);
         strata::program::ParCounters pc;   // STRATA_PAR_COUNTERS=1: counters only (par_counters.hpp); off: a branch
         const Clock::time_point gov_t0 = Clock::now();
-        strata::program::DecodeGovernor decode_gov(strata::program::parse_decode_governor_config(o.min_stream_tps));
+        // P5-5C.2: with the admission-level auto-batch controller on, the mid-decode cohort governor stands
+        // down by default: the two must not fight over N (the controller moves K between requests, the
+        // governor would toggle rows inside a window).  STRATA_DECODE_GOVERNOR=1 re-arms it anyway.
+        strata::program::DecodeGovernorConfig gov_cfg = strata::program::parse_decode_governor_config(o.min_stream_tps);
+        if (auto_batch_on && gov_cfg.enabled) {
+            const char* dg = hg_getenv("STRATA_DECODE_GOVERNOR");
+            if (dg == nullptr || dg[0] != '1') {
+                gov_cfg.enabled = false;
+                std::fprintf(stderr, "strata serve: auto-batch: the decode governor stands down (the admission "
+                                     "controller owns N; STRATA_DECODE_GOVERNOR=1 re-arms it)\n");
+            }
+        }
+        strata::program::DecodeGovernor decode_gov(gov_cfg);
         if (decode_gov.enabled())
             std::fprintf(stderr, "strata serve: decode governor: on (min_stream_tps=%.1f hit_floor=%.1f%% "
                                  "init_n=%d quantum=%.0f ms grace=%d affinity=%d affinity_max_wait=%d)\n",
@@ -17334,6 +17376,48 @@ int main(int argc, char** argv) {
                          decode_gov.config().initial_width, decode_gov.config().cohort_quantum_ms,
                          decode_gov.config().grace_windows, decode_gov.config().affinity ? 1 : 0,
                          decode_gov.config().affinity_max_wait);
+        // P5-5C.2: the controller's boundary feed.  One observation per batch completion (BDONE): the rows
+        // advanced and the routed-expert entries served since the last boundary, the slots still active, and
+        // whether the unified pool could still lend.  K moves only through the controller's damping; a K
+        // change is said on stderr and re-published with emit_kcap().  A BGEN memory-limit refusal feeds
+        // mem_refused: the controller clamps K to the rows actually running at once.
+        int64_t ab_rows = 0;   // rows advanced since the last boundary (monotonic feed, never reset)
+        Clock::time_point ab_t0 = Clock::now();
+        uint64_t ab_hits0 = drive.d.cache_hits, ab_off0 = drive.d.offload_entries, ab_cpu0 = drive.d.multi_entries;
+        int ab_k = auto_batch.k_active();
+        if (auto_batch_on)
+            std::fprintf(stderr, "strata serve: auto-batch: on (K_active %d of max %d, min-stream-tps %.1f, "
+                                 "STRATA_AUTO_BATCH=0 turns it off)\n", ab_k, o.batch, o.min_stream_tps);
+        auto ab_note = [&](bool mem_refused) {
+            if (!auto_batch_on) return;
+            const Clock::time_point now = Clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(now - ab_t0).count();
+            int active_rows = 0;
+            for (const BSlot& s : bs) if (s.active) ++active_rows;
+            strata::core::AutoBatchObs obs;
+            obs.active_rows = active_rows;
+            obs.agg_tps = ms > 0.5 ? 1000.0 * (double) ab_rows / ms : 0.0;
+            obs.per_stream_tps = active_rows > 0 ? obs.agg_tps / (double) active_rows : 0.0;
+            const uint64_t d_hits = drive.d.cache_hits - ab_hits0;
+            const uint64_t d_off = drive.d.offload_entries - ab_off0;
+            const uint64_t d_cpu = drive.d.multi_entries - ab_cpu0;
+            const uint64_t d_tot = d_hits + d_off + d_cpu;
+            obs.expert_hit_pct = d_tot > 0 ? 100.0 * (double) d_hits / (double) d_tot : 100.0;
+            obs.pool_has_headroom = cow_pool.on ? (xcache.slots() > cow_pool.floor) : true;
+            obs.mem_refused = mem_refused;
+            const int k = auto_batch.observe_boundary(obs);
+            ab_rows = 0;
+            ab_t0 = now;
+            ab_hits0 = drive.d.cache_hits; ab_off0 = drive.d.offload_entries; ab_cpu0 = drive.d.multi_entries;
+            if (k != ab_k) {
+                std::fprintf(stderr, "strata serve: auto-batch: K_active %d -> %d (rows=%d agg=%.1f tok/s "
+                                     "stream=%.1f tok/s hit=%.1f%% headroom=%d ups=%d downs=%d)\n",
+                             ab_k, k, active_rows, obs.agg_tps, obs.per_stream_tps, obs.expert_hit_pct,
+                             obs.pool_has_headroom ? 1 : 0, auto_batch.step_ups(), auto_batch.step_downs());
+                ab_k = k;
+                emit_kcap();
+            }
+        };
         auto pc_ex = [&]() {
             strata::program::ParCounters::Ex e;
             e.misses = drive.d.multi_misses; e.entries = drive.d.multi_entries; e.hits = drive.d.cache_hits;
@@ -17789,9 +17873,10 @@ int main(int argc, char** argv) {
                 }
             }
             (void) strata::core::qsa_cow_arena_trim();
-            // P5-5B.2: the arena just got room back; take the expert cache's lent chunks with it, so solo
-            // (N=1) snaps back to full_slots (bank chunks first: they cost no new VRAM).
-            if (cow_pool.on) cow_reclaim(adapt_quiesce);
+            // P5-5C.2: cow_reclaim moved out of here to the sweep (once after every idle slot has detached):
+            // each detach returns its 0.31 GiB session arena, and reclaiming per-detach grew the expert
+            // cache back into the room one slot's arena made, before the other idle slots had given theirs
+            // back — the sweep reclaims once, with all of it free.
             return true;
         };
         auto sweep_idle_detach = [&] {
@@ -17807,6 +17892,10 @@ int main(int argc, char** argv) {
                 oldest = std::max(oldest, (long long) std::chrono::duration_cast<std::chrono::milliseconds>(tsw - s2.t_idle).count());
                 if (detach_slot((int) b)) ++nsw;
             }
+            // P5-5C.2: every idle slot's arena is back now — reclaim once, so the expert cache grows with
+            // the whole freed region in view (solo N=1 snaps toward full_slots in one step, not one slot
+            // at a time).
+            if (nsw > 0 && cow_pool.on) cow_reclaim(adapt_quiesce);
             size_t ncache = 0;
             for (const BSlot& s2 : bs) if (s2.cached && !s2.active) ++ncache;
             mem_mark("a request completed (the serve's steady state)");
@@ -18049,6 +18138,7 @@ int main(int argc, char** argv) {
             for (int a = 0; a < A; ++a) {
                 gov_win_tokens += keep[active[a]];
                 bt_rows += keep[active[a]];
+                ab_rows += keep[active[a]];   // P5-5C.2: the auto-batch controller's row feed
                 bt_accepted += keep[active[a]] - 1;
                 if (batch_mtp) {   // #5890: the slot's own counters, for its BDONE (the response's draft_n / draft_n_accepted)
                     bs[(size_t) active[a]].drafts_off += nrow[a] - 1;
@@ -18081,6 +18171,7 @@ int main(int argc, char** argv) {
                                  (long long) pos[first[t]]);
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                     std::printf("BDONE %d %lld nonfinite %.1f\n", b, (long long) sl.produced, ms);
+                    ab_note(false);   // P5-5C.2: a completion boundary feeds the admission controller
                     sl.active = false;
                     sl.cached = false;
                     sl.checks.clear();
@@ -18100,6 +18191,7 @@ int main(int argc, char** argv) {
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f%s\n", b, (long long) sl.produced, fin, ms, strata::program::bdone_drafts_text(sl.drafts_off, sl.drafts_acc).c_str());
+                        ab_note(false);   // P5-5C.2: a completion boundary feeds the admission controller
                         sl.active = false;
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;   // S4-v2
                         if (sl.cached) sl.t_idle = Clock::now();
@@ -18643,6 +18735,7 @@ int main(int argc, char** argv) {
                                          "nonfinite) and the next request reads its prompt from token 0\n", b, (long long) sl.p);
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                     std::printf("BDONE %d %lld nonfinite %.1f\n", b, (long long) sl.produced, ms);
+                    ab_note(false);   // P5-5C.2: a completion boundary feeds the admission controller
                     sl.active = false;
                     sl.fly = 0;
                     sl.cached = false;
@@ -18658,6 +18751,7 @@ int main(int argc, char** argv) {
                     char rd_txt[40] = "";   // (STRATA_SLOT_READ: what the slot's own read of the turn took)
                     if (sl.rd_ms > 0.0) std::snprintf(rd_txt, sizeof rd_txt, " read=%.1f", sl.rd_ms);
                     std::printf("BDONE %d %lld %s %.1f%s%s\n", blk.b, (long long) sl.produced, fin, ms, rd_txt, strata::program::bdone_drafts_text(sl.drafts_off, sl.drafts_acc).c_str());
+                    ab_note(false);   // P5-5C.2: a completion boundary feeds the admission controller
                     sl.active = false;
                     sl.draft_ready = false;
                     // a cache again (#857), as on the pipelined path without drafts: final once its commits have run
@@ -18707,6 +18801,7 @@ int main(int argc, char** argv) {
                     std::printf("BT %d %d\n", blk.b, (int) y);
                     ++sl.produced;
                     ++bt_rows;
+                    ++ab_rows;   // P5-5C.2
                     ++pipe_rows;
                     const char* fin = is_eos(y) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
                                     : sl.p + 1 > o.max_context ? "length" : nullptr;
@@ -18723,6 +18818,7 @@ int main(int argc, char** argv) {
                     std::printf("BT %d %d\n", blk.b, (int) y);
                     ++sl.produced;
                     ++bt_rows;
+                    ++ab_rows;   // P5-5C.2
                     ++pipe_rows;
                     strata::core::slot_hold_emitted(sl.hold, (int64_t) y);
                     const char* fin = is_eos(y) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
@@ -18866,6 +18962,7 @@ int main(int argc, char** argv) {
                                      gi * GS + t, (long long) sl.p);
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld nonfinite %.1f\n", gi * GS + t, (long long) sl.produced, ms);
+                        ab_note(false);   // P5-5C.2: a completion boundary feeds the admission controller
                         sl.active = false;
                         sl.cached = false;
                         sl.checks.clear();
@@ -18876,6 +18973,7 @@ int main(int argc, char** argv) {
                     std::printf("BT %d %d\n", gi * GS + t, (int) y);
                     ++sl.produced;
                     ++bt_rows;
+                    ++ab_rows;   // P5-5C.2
                     ++pipe_rows;
                     strata::core::slot_hold_emitted(sl.hold, (int64_t) y);
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
@@ -18886,6 +18984,7 @@ int main(int argc, char** argv) {
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f%s\n", gi * GS + t, (long long) sl.produced, fin, ms, strata::program::bdone_drafts_text(sl.drafts_off, sl.drafts_acc).c_str());
+                        ab_note(false);   // P5-5C.2: a completion boundary feeds the admission controller
                         sl.active = false;
                         // a pipelined slot is a cache again (#857: a request left alone in its slot goes back to the solo path with its
                         // drafts): its state is final once its last window has left the last stage.  A later group window whose pad
@@ -19282,6 +19381,8 @@ int main(int argc, char** argv) {
                 if (!ensure_slot_session((int) b)) {
                     std::printf("ERR BGEN: slot %ld session unavailable (memory limit)\n", b);
                     std::fflush(stdout);
+                    ab_note(true);   // P5-5C.2: a memory-limit refusal is the controller's hard signal: K
+                                     // clamps at once to the rows actually running
                     continue;
                 }
                 admit_slot = (int) b;
@@ -19602,6 +19703,11 @@ int main(int argc, char** argv) {
             const bool geni = bgen_rewritten ? bgen_img : (line.rfind("GENI ", 0) == 0);
             const bool is_gen = bgen_rewritten || geni || line.rfind("GEN ", 0) == 0;
             if (is_gen) {
+                // P5-5C.2: a solo (N=1) GEN with no batch slot decoding: sweep the idle slots first, so
+                // their session arenas are back and cow_reclaim (in the sweep) snaps the expert cache
+                // toward full_slots before this request runs — the returning-solo case the 5B.2 snap-back
+                // was meant to cover but only got per-detach, mid-sweep.
+                if (!bgen_rewritten && !bs.empty() && !batch_on()) sweep_idle_detach();
                 refresh_file_tier();
                 if (dc_learning || dc_calib) {   // the request's arrival, before its prompt is read: a pause since the last one ended starts a new busy run
                     const Clock::time_point dc_now = Clock::now();

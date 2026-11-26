@@ -1106,6 +1106,16 @@ class StrataEngine:
         self.slot_gs = gs if groups > 1 and groups_run > 1 and not self.info.get("slot_read") else 0
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
+        # P5-5C.2: the engine's admission-level auto batch-N controller publishes the number of streams
+        # the unified expert pool can actually lend as "KCAP <k_active> <max_k> <live_slots> <full_slots>"
+        # lines (_pump consumes them; pick_slot gates on k_active, so excess streams queue cleanly
+        # instead of pushing the engine into a memory-limit refusal).  Until one arrives every slot is
+        # admissible: an engine that never says KCAP behaves exactly as before.  A restart re-runs this
+        # and the new engine re-publishes right after its READY.
+        self.k_active = self.batch
+        self.k_max = self.batch
+        self.pool_live_slots = 0
+        self.pool_full_slots = 0
         self.slot_t_free = [0.0] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
         # given back; slot_releasing: slots handed to the background BDONE wait.  A busy slot in neither has no owner
@@ -1180,6 +1190,24 @@ class StrataEngine:
                 sample = parse_stage_in_flight_sample(line)
                 if sample is not None and self.proc is proc:
                     self.terminal_stage_sample = {**sample, "observed_monotonic": time.monotonic()}
+                continue
+            if line.startswith("KCAP "):   # P5-5C.2: the engine's admission controller's K (consumed here,
+                parts = line.split()       # never a request's line, like BSTAT/PSTAT above)
+                try:
+                    k, mx = int(parts[1]), int(parts[2])
+                    live = int(parts[3]) if len(parts) > 3 else None
+                    full = int(parts[4]) if len(parts) > 4 else None
+                except (IndexError, ValueError):
+                    continue               # a malformed line changes nothing; the old K stands
+                if self.proc is proc and self.batch:
+                    with self.slot_cv:
+                        self.k_max = max(1, mx)
+                        self.k_active = min(max(1, k), self.batch)   # the wrapper clamps to its own slots
+                        if live is not None:
+                            self.pool_live_slots = live
+                        if full is not None:
+                            self.pool_full_slots = full
+                        self.slot_cv.notify_all()   # a raised K wakes requests waiting for a slot
                 continue
             if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
                 try:
@@ -2760,6 +2788,13 @@ class StrataEngine:
         """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
         prompt (the engine then reads only the rest), else an empty one, else the one used longest ago - so the
         conversations other slots hold stay for their next turns.  None: every slot is busy."""
+        # P5-5C.2: the engine's admission controller (KCAP lines, see _pump) says how many streams the
+        # unified expert pool can actually lend: past that the request waits on slot_cv (woken when K
+        # rises or a slot frees) rather than pushing the engine into a memory-limit refusal.  k_active
+        # starts at batch, so an engine that never says KCAP never gates.
+        ka = getattr(self, "k_active", 0)
+        if ka and sum(1 for x in self.slot_busy if x) >= ka:
+            return None
         if patience_until is not None and getattr(self, "inkling_engine", False) and time.monotonic() < patience_until:
             # a second pass of a request (the thinking budget's wrap-up: the prompt plus what the first pass wrote plus the wrap-up) arrives while
             # the first pass's slot is still being released: it waits for that slot, instead of taking the only free one (the chat's) and wiping it
