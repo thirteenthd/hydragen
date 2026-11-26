@@ -519,6 +519,19 @@ function renderConcurrency(live, eng, hw) {
   const poolFull = (live && live.pool_full_slots) || 0;
   const activeSlots = slots.filter(slotIsUtilized);
   const activeGeneratingSlots = slots.filter((s) => s && (s.state === "generating" || s.state === "decoding"));
+  // P5-5D.2: a single request runs on the solo GEN path (admit_slot -1): it is active but owns no batch slot,
+  // so the header can read "1 / K Active" while every slot entry is idle. Render it as a synthetic Solo card.
+  if (activeSlots.length === 0 && curConcurrency > 0) {
+    const soloRestored = (live && (live.restored_tokens || live.reused)) || 0;
+    activeSlots.push({ slot: "solo", label: "Solo",
+      state: (live && live.state === "reading") ? "reading" : "generating",
+      tok_s: live && live.tok_s, prefill_tok_s: live && live.prefill_tok_s_mean,
+      prompt_tokens: live && (live.prompt_total || live.prompt_tokens),
+      prompt_read: live && live.prompt_read,
+      generated: live && live.generated,
+      restored_tokens: soloRestored,
+      restored_from: (live && live.restored_from) || (soloRestored > 0 ? "cache" : null) });
+  }
 
   const slotsGrid = $("slots-bars-grid");
   if (!slotsGrid) return;
@@ -542,7 +555,7 @@ function renderConcurrency(live, eng, hw) {
       tile.innerHTML = `
         <div class="slot-tile__top">
           <div class="slot-tile__header">
-            <span class="slot-tile__name">Slot ${i}</span>
+            <span class="slot-tile__name">${s.label || `Slot ${i}`}</span>
             <span class="slot-tile__badges">
               <span class="slot-tile__badge tone-reading" id="st-badge-${i}">Reading</span>
               <span class="slot-tile__badge tone-restored" id="slot-restored-badge-${i}" hidden></span>

@@ -330,6 +330,24 @@ class WebDynamicSlots(unittest.TestCase):
         self.assertEqual(out["keys"], ["slot-0", "slot-1", "slot-queue-tile"])
         self.assertEqual(out["els"]["slots-active-badge"]["text"], "2 / 2 Active (Max 8) · SLA 25 t/s")
 
+    def test_a_solo_gen_request_gets_a_solo_card(self):
+        # P5-5D.2: N=1 runs on the solo GEN path (admit_slot -1): running=1, state generating, every slot idle
+        live = base_live(state="generating", running=1, tok_s=42.5, generated=17, reused=900)
+        out = self.run_scenarios({"s": {"frames": [[live, ENG, {}]]}})["s"]
+        self.assertEqual(out["keys"], ["slot-solo"])          # no idle summary while a solo request is live
+        self.assertEqual(out["els"]["st-badge-solo"]["text"], "Decoding")
+        self.assertIn("42.5", out["els"]["slot-decode-solo"]["html"])
+        self.assertEqual(out["els"]["slot-tokens-solo"]["text"], "900 restored · 17 generated")
+        self.assertEqual(out["els"]["slot-restored-badge-solo"]["text"], "Restored")
+        self.assertIn("Solo", out["html"][0])                 # the card is named Solo, not "Slot solo"
+
+    def test_a_solo_read_shows_its_prompt_progress(self):
+        live = base_live(state="reading", running=1, prompt_total=900, prompt_read=450)
+        out = self.run_scenarios({"s": {"frames": [[live, ENG, {}]]}})["s"]
+        self.assertEqual(out["keys"], ["slot-solo"])
+        self.assertEqual(out["els"]["st-badge-solo"]["text"], "Reading")
+        self.assertEqual(out["els"]["slot-phase-solo"]["text"], "Reading prompt (50%)")
+
     def test_the_cards_change_dynamically_between_polls(self):
         idle_live = base_live()
         busy_live = base_live(state="reading", running=1,
