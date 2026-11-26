@@ -2777,3 +2777,85 @@ Open for Phase 3: one fan-out sibling still reports `cached_tokens 0` in most ru
 of three siblings reuse, the third's cause is not established; the routed-expert VRAM hit%
 as the binding concurrency limit; and the §235 tail-slot pin fix, still unwritten, still
 hard-gating Phase 4. counter 193.
+
+## §241 — Phase 3 closes: batched stages stop paying the PCIe miss-share default, the decode governor learns cohort packing, and the 12 GiB envelope probe says capacity is not the ceiling (ms01 + Windows, 2026-11-25)
+
+Five commits on `phase3/v0.0.1` (`b7b84f5` → `d2c0a8c` → `f9ecc12` 3A → `52c6cb3` 3C →
+`563f394` review fixes), 5 files, +517/−9, measured on `modelserver01` (RTX 3080 Ti
+12 GiB, Arm 16, `CUDA_MODULE_LOADING=LAZY`) against the Phase 2 `e42087b` Arm 16 posture.
+
+**Track 3C — `52c6cb3` + the ordering fix in `563f394`: batched stages cap the PCIe
+miss-share start.**
+`pcie_frac` is the share of routed-expert misses allowed to travel the host→device path in
+one step. The worker-pool default derives it from core count (`f0 = 2/workers`), which on
+this box meant `0.50`, and a batched step at that share loses the batch window to transfer
+time. A `--pcie-frac` sweep at `--batch 8` found the peak at **0.25**, not at either
+extreme — `0.75 → 0.50 → 0.00 → 0.25` — with 0.25 beating 0.50 by **+10 %…+16 %** across
+N=1..8 and the fan-out leg: `N1 64.9 → 75.4`, `N2 65.8 → 73.8`, `N4 64.3 → 70.6`,
+`N8 59.7 → 67.2`, fan-out `63.85 → 72.75`, shared decode `142.1 → 164.3` tok/s, while the
+routed-expert VRAM hit% stayed flat — the gain is scheduling, not cache.
+`strata::pcie_batch_frac_cap()` (`STRATA_PCIE_FRAC_BATCH_MAX`, default `0.25`) now applies
+that ceiling at every batched start site, and `PcieAuto` is gated off when batch is on. The
+engine-default arm `p3k-batchdef-b8` — no `--pcie-frac` on the command line — reproduces
+the swept numbers at the cap: `N8 = 69.5`, `sh_agg = 73.04`, `sh_dec = 164.6`.
+The ordering fix matters on low-core hosts: the cap ran at `:5659` before the worker-pool
+assignment at `:15189` wrote `o.pcie_frac = f0`, so a 4-worker CPU (`f0 = 0.50`) overwrote
+the cap back to 0.50. The cap now runs at both sites, still only when `--pcie-frac` was not
+given, so an explicit flag keeps overriding everything.
+
+**Track 3A — `b7b84f5`..`f9ecc12` + the `waited_`/`BSlot` review fixes: the decode
+governor.**
+`DecodeGovernor` adds warmup grace windows (a stream that has not produced `warmup_tokens`
+is not eligible for a width cut) and prefix-affinity cohort packing (slots whose first
+`kPrefixAffinityDepth = 512` tokens hash together are admitted as one cohort so they share
+the prefix's expert rows), plus two counters on every step line — prefix-sibling seats and
+stepped-over slots — so an affinity arm shows the packing fired rather than only that it was
+enabled. `d2c0a8c` puts grace/affinity/`affinity_max_wait` in the config echo, so each arm's
+engine log states the posture it ran.
+Two lifetime bugs came out of review and are fixed in `563f394`. `pick_next_waiting()` chose
+an aged-out slot (`waited_of(id) >= affinity_max_wait`) without clearing its wait clock, so
+that slot stayed permanently aged-out and was skipped in every later rotation; the chosen
+id's entry is now erased, and `decode_governor_test` asserts `waited_for(pick) == 0`
+immediately after admission and that affinity resumes on the following rotations. And the
+per-slot affinity key lived in a `static` vector keyed on a length heuristic
+(`n < gov_aff_len[s]`): a slot that finished a short conversation and was re-admitted with a
+prompt of 512 tokens or more kept the previous conversation's hash and packed into the wrong
+cohort. The key now lives on `BSlot` (`aff_key` / `aff_key_len`, reset by `BSlot{}` on
+re-admission, recomputed whenever the stored depth is short of `kPrefixAffinityDepth`).
+The verdict on the governor itself: in throughput mode it oscillates decode width `1 ↔ 2`
+even at the tuned `pcie_frac = 0.25` and `eval_every = 12`, and the oscillation costs rows —
+`bt_rows 1.66–1.85` against `2.00` with the governor off. It stays **opt-in**
+(`HG_DECODE_AUTO=1` / `--min-stream-tps`); the shipped default is governor-off.
+
+**Track 3B — measurement only, no code change.**
+`--adapt-async 1` beats `--adapt-async 0` on the batched legs (`N2 69.0 vs 64.9`,
+`N4 64.3 vs 57.3`, `bt_adapt_wait 0.18 ms vs 0.89 ms`), which leaves the asynchronous
+adaptation tier's default where Phase 2 set it. `STRATA_BATCH_MTP_FUSED=1` regressed the
+fan-out leg (`68.24 → 64.0`) and stays opt-in.
+
+**Bonus — the `p3m` envelope probe: capacity is not the binding ceiling.**
+`--max-context 16384` sizes `3,932` expert slots and sustains `2.98` achieved rows at
+`86.8 %` routed-expert VRAM hit with `N2 = 86.9`, `N4 = 74.7`, `N8 = 76.9`,
+`sh_agg = 74.49` — the best concurrency figure of the phase. `32k` went the other way
+(`OOM = 6`), and `kvres2k` broke fan-out reuse outright. At 12 GiB the limit is the
+per-stream working set and its hit rate, not the slot count.
+
+**Gates, at `563f394`.** Windows CPU `ctest -E 'dot_x4_bench'`: **178/178 passed**
+(63.9 s), `decode_governor_test` #12 and `arch_defaults_test` #106 both Passed. Windows CUDA
+`p1-cuda-t16`: `hydragen.exe --version` → `hydragen v0.0.1` (binary 16:16:43, after the
+15:52:59 source edit, so the fixes are in it). ms01 `build-p3c-arm16` at HEAD `563f394`:
+`hydragen --version` → `hydragen v0.0.1` (binary 23:23:42, after the 23:17:02 checkout),
+`ctest -R 'decode_governor_test|arch_defaults_test'` **2/2 passed**, and **G3 10/10**
+(`kv_*_parity`, `verify_batch_parity`, `batch_rows_parity`, `batch_groups_test`, 14.6 s).
+**G5 `probe222x`** holds at the pre-review Phase 3 tip: `PROBE222-four-OK=4/4` and
+`PROBE222-serial-OK=4/4` in all three Phase 3 G5 logs (`~/logs-p3/g5.log`, `g5b.log`,
+`g5c.log`), `OOM=0`; it was not re-run on `563f394` because the live `:8181` service still
+runs the `build-s180` mech binary and re-gating it would mean restarting that service — the
+review commit changes only governor-gated code and the cap ordering. The `dot_x4_bench` MSVC
+target is the pre-existing upstream portability failure (`type_info` ambiguity) and stays
+excluded from the CPU gate, as in §240.
+
+Open for Phase 4: the §235 shared-region tail-slot pin law fix — adoption is live
+(`fetches 4286`, joins the flow, zero markers) but the shared region corrupts while rolling
+(`2048` 3/4×2, `0` and `8192` 8/8), `COW_SHARED` stays 0, and the fix is still unwritten.
+counter 194.
