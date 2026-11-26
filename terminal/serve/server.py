@@ -5622,6 +5622,13 @@ class Service:
                 parked.get("last_tokens") if parked.get("last_event") == "restored" else None, parked.get("last_at"))
         except AttributeError:
             pass                                        # an engine that carries no per-slot state
+        if disk.get("enabled") and disk.get("dir"):     # P5-5D.3: the usable room the tier still has, as the
+            try:                                        # Monitor's utilization bar denominator (never a fake full bar)
+                free = shutil.disk_usage(disk["dir"]).free
+            except OSError:
+                free = 0                                # the folder is gone or unreadable: the bar shows 0
+            floor = int(disk.get("min_free_mib") or 0) * 1048576
+            disk["disk_avail_bytes"] = max(0, free - floor) + int(disk.get("bytes") or 0)
         par = int(getattr(self.engine, "batch", 0) or 0)
         if par:                                         # #465: the requests running together, slot by slot
             with self.status_lock:

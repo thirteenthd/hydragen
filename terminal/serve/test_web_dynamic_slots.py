@@ -360,6 +360,128 @@ class WebDynamicSlots(unittest.TestCase):
         self.assertEqual(out["els"]["slot-phase-0"]["text"], "Reading prompt (50%)")  # (updated while it was up)
 
 
+JS_HARNESS_PD = r"""
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[2], "utf8");
+const start = src.indexOf("function renderParkDisk(d) {");
+const end = src.indexOf("function renderTotals(t) {");
+if (start < 0 || end < 0) { console.error("markers not found"); process.exit(2); }
+const fmt = (n, d = 0) => (n == null || Number.isNaN(n) ? "\u2013" : Number(n).toLocaleString(undefined, {maximumFractionDigits: d, minimumFractionDigits: d}));
+const gb = (b, d = 1) => (b == null ? "\u2013" : fmt(b / 1073741824, d));
+const facts = () => {};
+const since = () => "just now";
+const scenarios = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+const out = {};
+for (const [name, d] of Object.entries(scenarios)) {
+  const els = {};
+  function mkEl(tag) {
+    let html = "";
+    return { tag, id: "", className: "", hidden: false, style: {}, dataset: {}, children: [],
+      get innerHTML() { return html; },
+      set innerHTML(v) { html = v; this.children.length = 0; },
+      appendChild(c) { this.children.push(c); return c; } };
+  }
+  const $ = (id) => (els[id] ||= Object.assign(mkEl("div"), {id}));
+  const document = { createElement: (t) => mkEl(t) };
+  const f = new Function("fmt", "gb", "facts", "since", "$", "document",
+    src.slice(start, end) + "; return {renderParkDisk};");
+  f(fmt, gb, facts, since, $, document).renderParkDisk(d);
+  out[name] = {text: $("pd-mem-text").textContent, width: $("pd-mem-bar").style.width};
+}
+console.log(JSON.stringify(out));
+"""
+
+
+def pd_state(**kw):
+    d = {"enabled": True, "bytes": 0, "budget_mib": None, "disk_avail_bytes": 0, "entries": 0,
+         "skips": 0, "refuses": 0, "fails": 0, "spills": 0, "drops": 0, "restores": 0,
+         "v2": False, "chunks": 0, "chunk_bytes": 0, "saved_mib": 0, "min_free_mib": 1024,
+         "last_tokens": None}
+    return {**d, **kw}
+
+
+@unittest.skipUnless(NODE, "node is needed to run the page's own code")
+class WebParkDiskBar(unittest.TestCase):
+    """P5-5D.3: the ParkDisk utilization bar fills against the real usable space, never a fake 100%."""
+
+    def run_pd(self, scenarios):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(scenarios, f)
+            path = f.name
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as f:
+            f.write(JS_HARNESS_PD)
+            harness = f.name
+        try:
+            done = subprocess.run([NODE, harness, str(WEB / "app.js"), path],
+                                  capture_output=True, text=True, encoding="utf-8", timeout=60, check=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+            Path(harness).unlink(missing_ok=True)
+        return json.loads(done.stdout)
+
+    def test_nothing_parked_on_a_roomy_disk_is_a_zero_bar(self):
+        out = self.run_pd({"s": pd_state(disk_avail_bytes=400 * 1073741824)})["s"]
+        self.assertEqual(out["width"], "0%")
+        self.assertEqual(out["text"], "0.0 / 400.0 GB available")
+
+    def test_a_small_spill_fills_a_small_share(self):
+        out = self.run_pd({"s": pd_state(bytes=512 * 1048576, disk_avail_bytes=400 * 1073741824)})["s"]
+        self.assertAlmostEqual(float(out["width"].rstrip("%")), 0.125, places=3)
+        self.assertEqual(out["text"], "0.5 / 400.0 GB available")
+
+    def test_no_known_capacity_never_fakes_a_full_bar(self):
+        out = self.run_pd({"s": pd_state(bytes=5 * 1073741824, disk_avail_bytes=0)})["s"]
+        self.assertEqual(out["width"], "0%")                        # never the old fake 100% green
+        self.assertEqual(out["text"], "5.0 GB")
+
+    def test_a_budget_still_wins(self):
+        out = self.run_pd({"s": pd_state(bytes=2 * 1073741824, budget_mib=4096,
+                                         disk_avail_bytes=400 * 1073741824)})["s"]
+        self.assertEqual(out["width"], "50%")
+        self.assertEqual(out["text"], "2.0 / 4.0 GB")
+
+
+class ParkDiskAvailTest(unittest.TestCase):
+    """P5-5D.3: /metrics' park_disk carries disk_avail_bytes: the filesystem's free space minus the
+    keep-free floor, plus what the tier already holds (the bar's denominator)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log = Path(self.tmp.name) / "engine.log"
+        self.e = batch_engine(n=2)
+        self.e.log_path, self.e.log_start = str(self.log), 0
+        self.svc = Service(self.e, ByteTokenizer(), ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def on_line(self, pd_dir, budget="free-space only", keep=1024):
+        self.log.write_text(
+            f"strata serve: park disk: ON {pd_dir} (index 0 files, 0.0 GiB, 0 refused, rebuilt in 5 ms; "
+            f"budget {budget}, keep-free {keep} MiB)\n", encoding="utf-8")
+
+    def test_avail_is_real_free_minus_the_keep_free_floor(self):
+        self.on_line(self.tmp.name)
+        d = self.svc.metrics()["park_disk"]
+        self.assertTrue(d["enabled"])
+        want = max(0, shutil.disk_usage(self.tmp.name).free - 1024 * 1048576)
+        self.assertAlmostEqual(d["disk_avail_bytes"], want, delta=100 * 1048576)   # free moves between the two reads
+
+    def test_a_gone_folder_reports_only_what_is_held(self):
+        self.on_line(str(Path(self.tmp.name) / "not-a-real-folder"))
+        self.assertEqual(self.svc.metrics()["park_disk"]["disk_avail_bytes"], 0)
+
+    def test_a_budgeted_tier_reports_it_too(self):
+        self.on_line(self.tmp.name, budget="4096 MiB")
+        d = self.svc.metrics()["park_disk"]
+        self.assertEqual(d["budget_mib"], 4096)
+        self.assertIn("disk_avail_bytes", d)
+
+    def test_a_disabled_tier_has_no_capacity_field(self):
+        self.log.write_text("strata serve: park disk: DISABLED\n", encoding="utf-8")
+        self.assertNotIn("disk_avail_bytes", self.svc.metrics()["park_disk"])
+
+
 class PageSource(unittest.TestCase):
     """The dynamic rendering must stay in the page even where node is not installed to run it."""
 

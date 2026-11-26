@@ -450,11 +450,13 @@ function renderParkDisk(d) {
   const pct = (a, b) => (b ? `${Math.min(100, (100 * a) / b)}%` : "0%");
   $("pd-bars").hidden = !d.enabled;
   if (d.enabled) {
-    const cap = d.budget_mib ? d.budget_mib * 1048576 : 0;
-    $("pd-mem-text").textContent = cap ? `${gb(d.bytes)} / ${gb(cap)} GB` : `${gb(d.bytes)} GB (free space only)`;
-    // "free space only" has no denominator: a full bar means something IS parked, an empty grey
-    // track means nothing is — never full-green over an empty folder (dashboard zero-state law).
-    $("pd-mem-bar").style.width = cap ? pct(d.bytes, cap) : (d.bytes > 0 ? "100%" : "0%");
+    // P5-5D.3: fill against the budget when one is set, else against the real usable disk space
+    // (disk_avail_bytes: the filesystem's free space minus the keep-free floor, plus what the tier already
+    // holds). 0 bytes = 0% grey track; a small spill on a big SSD = a small fill; never a fake 100% green.
+    const cap = d.budget_mib ? d.budget_mib * 1048576 : (d.disk_avail_bytes || 0);
+    $("pd-mem-text").textContent = d.budget_mib ? `${gb(d.bytes)} / ${gb(cap)} GB`
+      : (cap ? `${gb(d.bytes)} / ${gb(cap)} GB available` : `${gb(d.bytes)} GB`);
+    $("pd-mem-bar").style.width = (d.bytes > 0 && cap > 0) ? pct(d.bytes, cap) : "0%";
   }
   $("pd-sum").textContent = d.enabled
     ? `${fmt(d.entries)} conversation image${d.entries === 1 ? "" : "s"} on disk` : "off";
