@@ -34,6 +34,12 @@ if(STRATA_BUILD_TESTS)
     target_include_directories(unified_pool_test PRIVATE include)
     add_test(NAME unified_pool_test COMMAND unified_pool_test)
   endif()
+  # P5-5C.1: the damped admission-level auto batch-N controller (header-only, CPU)
+  if(NOT TARGET auto_batch_controller_test)   # the CMakeLists blocks register it first under STRATA_BUILD_TESTS=ON
+    add_executable(auto_batch_controller_test src/core/auto_batch_controller_test.cpp)
+    target_include_directories(auto_batch_controller_test PRIVATE include)
+    add_test(NAME auto_batch_controller_test COMMAND auto_batch_controller_test)
+  endif()
   add_executable(kpack_path_test src/core/kpack_path_test.cpp)   # #5060: the package's kpack archives for ROCM_KPACK_PATH
   target_include_directories(kpack_path_test PRIVATE include)
   add_test(NAME kpack_path_test COMMAND kpack_path_test)
