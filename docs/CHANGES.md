@@ -2934,3 +2934,48 @@ paid only when used. The region's win is hit rate (`99.92 %` @8192, `88.30 %` @2
 `80.11 %` control), not short-prompt throughput: the default stays **0** on 12 GiB and
 opt-in shared-region adoption is now safe.
 counter 195.
+
+## §243 — Phase 5 Track 5A: the rebased wrapper already carries admission backpressure; the §242 N≥4 collapse was a wrapper artifact (ms01, 2026-11-26)
+
+Track 5A on `phase5/v0.0.1` (tip `d48ac9b`; engine binary unchanged from §242's
+`build-p4-arm16`). The §242 matrix's 503s and "errors 2/6" came from the **stale
+wrapper** (`hydragen-experimental/serve/server.py`), not from the rebased layout: the
+committed `terminal/serve/server.py` already implements the #1994 admission
+backpressure. On an engine `session unavailable` refusal the wrapper releases the slot
+claim, marks the slot busy with a per-slot **30 s memory backoff**
+(`SLOT_MEM_BACKOFF_S = 30.0`, server.py:1884), retries the request on another slot, and
+only raises `GpuBusy` (HTTP 503, `retry_after 5`) after `BGEN_REFUSALS_MAX = 6`
+refusals for one request (server.py:2472–2504). **No code delta was needed — the
+rebase itself is the fix.**
+
+**Re-run** (`bench/p5_5a_admission.sh`, new; ms01, `--batch 8`, `parallel 8`, fresh
+park-disk, arms `STRATA_COW_SHARED 0/2048/8192`, wrapper from `~/hydragen-v0221` @
+`d48ac9b` — tested tree verified == branch, clean):
+
+- bench_quick N=1/2/4/8: **errors=0 at every N in every arm**; probe222x **4/4
+  parallel + 4/4 serial in every arm**.
+- `wrapper_503=0` everywhere; engine refusals and wrapper backoffs match **1:1**
+  (`24/24`, `30/30`, `24/24`) — every refusal absorbed; `OOM=0`, `zombie_freed=0`.
+
+**Clean N≥4 throughput** (bench_quick agg tok/s N=1/2/4/8): `0` 74.9/78.9/66.3/68.3 ·
+`2048` 70.3/70.2/70.4/66.8 · `8192` 71.8/70.8/65.0/66.2. Against §242's contaminated
+`0` 73.5/77.2/63.8/**51.0** · `2048` 72.7/66.4/60.6/**45.9** · `8192`
+69.2/74.3/58.8/**43.7**: the N=8 collapse was the wrapper rejecting requests, not the
+engine paying for the region. With clean admission all arms land **65–68 agg at N=8**
+and the region's claimed N≥4 cost is inside noise (the ±40 % N≥4 swing law still
+applies — 5B needs paired probes before any sizing-law claim).
+
+**Region telemetry** (last serve line per arm `0/2048/8192`): KV streaming hit `82.60 /
+90.69 / 93.13 %`; joins-at-fetch `200/291/186`; shared-region lineage fetches
+`0/6148/11840`.
+
+**Harness pitfall (cost one restart):** `~/g9/bench_quick.py` and `probe222x.py` take
+the endpoint from the `PORT` env (defaults 8080/8181); with `PORT` unset bench_quick
+hammered a dead port and died on `statistics.mean([])` while the grep filter hid the
+traceback and the matrix marched on — silent data loss. The committed script sets
+`PORT=8181` on every bench line; grade each stage by its expected summary line, not by
+the next stage header appearing.
+
+Gates: engine binary unchanged from §242 (all gates green there); this change is docs +
+bench script only. Production `:8181` restored after the matrix (`PROD_RESTORED`).
+counter 196.
