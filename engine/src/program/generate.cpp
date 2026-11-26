@@ -17408,6 +17408,19 @@ int main(int argc, char** argv) {
                 return;   // a short tail of windows proves nothing: no boundary, no vote
             strata::core::AutoBatchObs obs;
             obs.active_rows = active_rows;
+            if (mem_refused) {
+                // P5-5C.4: the clamp's floor is the VRAM the slots already hold, not just the rows
+                // running this instant: an idle-cached slot keeps its session arena (0.31 GiB each on
+                // the 131K mech), so with 3 slots attached and a 4th refused the true ceiling is 3 —
+                // the §244 p5c3 arms clamped K_active to 1 off active_slots 0/1 while 3 sessions sat
+                // in VRAM.  attached = slots active OR holding a VRAM session; never below 1.
+                int attached = 0;
+                const size_t n_attached = std::min(bs.size(),
+                                                   bslot_arena.empty() ? (size_t) 0 : bslot_arena[0].size());
+                for (size_t i = 0; i < n_attached; ++i)
+                    if (bs[i].active || bslot_arena[0][i] != nullptr) ++attached;
+                obs.active_rows = std::max(1, std::max(active_rows, attached));
+            }
             if (ab_win_count > 0 && ab_decode_ms > 1.0) {
                 const int avg_rows = std::max(1, (int) std::lround((double) ab_rows_sum / (double) ab_win_count));
                 obs.agg_tps = (double) ab_rows_sum * 1000.0 / ab_decode_ms;
@@ -19396,8 +19409,8 @@ int main(int argc, char** argv) {
                 if (!ensure_slot_session((int) b)) {
                     std::printf("ERR BGEN: slot %ld session unavailable (memory limit)\n", b);
                     std::fflush(stdout);
-                    ab_note(true);   // P5-5C.2: a memory-limit refusal is the controller's hard signal: K
-                                     // clamps at once to the rows actually running
+                    ab_note(true);   // P5-5C.2/4: a memory-limit refusal is the controller's hard signal: K
+                                     // clamps at once to the slots attached in VRAM (never below 1)
                     continue;
                 }
                 admit_slot = (int) b;
