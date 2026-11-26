@@ -329,6 +329,7 @@ bool under_wddm() {
 static int64_t g_lend_keep = 128;
 // (dyn-conc P2 stage C.5) STRATA_COW_CACHE_FUND=1: collateralized arena admission reservation.
 static bool g_cow_cache_fund = false;
+static bool g_unified_pool_want = false;   // P5-5B: the elastic arena asked for a VMM-backed expert cache (survives the --kv-grow block's set_vmm below)
 
 // May a start short of VRAM be moved off the GPU (strata/core/spill_gate.hpp)?  A discrete card only: not Metal, not an integrated GPU (Strix Halo and the other APUs share the host's RAM).
 static bool spill_discrete_gpu() {
@@ -5110,6 +5111,7 @@ int main(int argc, char** argv) {
                         const char* up = hg_getenv("STRATA_UNIFIED_POOL");
                         if ((up == nullptr || up[0] != '0') && strata::core::qsa_cow_arena_elastic() &&
                             strata::core::vmm_available()) {
+                            g_unified_pool_want = true;
                             strata::core::ExpertCache::set_vmm(true);
                             std::fprintf(stderr, "strata generate: cow: unified pool on: the expert cache opens its "
                                                  "arena as a VMM range (HG_UNIFIED_POOL=0 to turn it back)\n");
@@ -7849,7 +7851,8 @@ int main(int argc, char** argv) {
                                      "every expert in RAM, no --batch, --vram-elastic or --peer-device)\n");
             const char* iv = std::getenv("STRATA_KV_GROW_INIT");
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
-            strata::core::ExpertCache::set_vmm(on);
+            // P5-5B fixup: --kv-grow off must not undo the unified pool's VMM ask (it ran first, at the arena's sizing)
+            strata::core::ExpertCache::set_vmm(on || g_unified_pool_want);
         }
         if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
