@@ -485,38 +485,68 @@ function renderTotals(t) {
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
 // Full Concurrency States panel, ported from the archived HydraGen dashboard (experimental-final serve/web):
-// live.slots carries one entry per batch slot (idle/reading/decoding + held tokens);
+// live.slots carries one entry per batch slot (idle/reading/decoding/detaching + held tokens);
 // queued/outside_slots/waiting/admitting count requests that want a slot; engine capacity = engine.batch_slots.
+// P5-5D: the engine's admission controller publishes the dynamic cap (live.k_active of live.k_max, from the
+// KCAP line) - bursts past K_active queue on slot_cv, so the queue count is computed against K_active.
 function calcConcurrencyAndQueue(live, eng, hw) {
   const maxSlots = (eng && eng.batch_slots) || (live && live.parallel) || 2;
+  const kActive = (live && live.k_active > 0) ? live.k_active : maxSlots;
+  const kMax = (live && live.k_max > 0) ? live.k_max : maxSlots;
   const slots = (live && live.slots && live.slots.length) ? live.slots : [];
   const inSlotsCount = slots.filter((s) => s.state && s.state !== "idle").length;
   const rawRunning = (live && live.running != null) ? live.running : (live && live.state !== "idle" ? 1 : 0);
   const curConcurrency = Math.min(maxSlots, Math.max(inSlotsCount, rawRunning, (hw && hw.concurrency) || 0));
   const outsideCount = (live && live.outside_slots != null) ? live.outside_slots : Math.max(0, rawRunning - maxSlots);
   const engineWaiters = ((live && live.waiting) || 0);
-  const rawWaiting = outsideCount + engineWaiters + Math.max(0, ((live && live.queued) || 0) - (maxSlots - curConcurrency));
-  const queuedCount = curConcurrency >= maxSlots ? Math.max(0, rawWaiting) : (rawWaiting > (maxSlots - curConcurrency) ? rawWaiting - (maxSlots - curConcurrency) : 0);
-  return { curConcurrency, maxSlots, queuedCount, slots, inSlotsCount };
+  const rawWaiting = outsideCount + engineWaiters + Math.max(0, ((live && live.queued) || 0) - (kActive - curConcurrency));
+  const queuedCount = curConcurrency >= kActive ? Math.max(0, rawWaiting) : (rawWaiting > (kActive - curConcurrency) ? rawWaiting - (kActive - curConcurrency) : 0);
+  return { curConcurrency, kActive, kMax, maxSlots, queuedCount, slots, inSlotsCount };
+}
+
+// P5-5D: a slot card exists only while its slot is being utilized - reading, decoding/generating, or detaching
+// (its reply ended and the background BDONE wait still owns it). Idle standby slots get no static empty card;
+// with nothing active and nothing queued one compact summary tile shows the dynamic auto cap instead.
+function slotIsUtilized(s) {
+  return !!s && (s.state === "reading" || s.state === "decoding" || s.state === "generating" ||
+                 s.state === "detaching" || s.releasing === true);
 }
 
 function renderConcurrency(live, eng, hw) {
-  const { curConcurrency, maxSlots, queuedCount, slots } = calcConcurrencyAndQueue(live, eng, hw);
+  const { curConcurrency, kActive, kMax, maxSlots, queuedCount, slots } = calcConcurrencyAndQueue(live, eng, hw);
+  const minTps = (live && live.min_stream_tps) || 0;
+  const poolLive = (live && live.pool_live_slots) || 0;
+  const poolFull = (live && live.pool_full_slots) || 0;
+  const activeSlots = slots.filter(slotIsUtilized);
   const activeGeneratingSlots = slots.filter((s) => s && (s.state === "generating" || s.state === "decoding"));
 
   const slotsGrid = $("slots-bars-grid");
   if (!slotsGrid) return;
-  if (slotsGrid.children.length !== (maxSlots + 1)) {
+
+  const showQueue = queuedCount > 0 || curConcurrency >= kActive;
+  const showIdle = activeSlots.length === 0 && queuedCount === 0;
+  const want = activeSlots.map((s) => `slot-${s.slot}`);
+  if (showQueue) want.push("slot-queue-tile");
+  if (showIdle) want.push("slot-idle-summary");
+  const have = Array.from(slotsGrid.children).map((el) => el.dataset.key || el.id);
+  if (have.join(",") !== want.join(",")) {
+    // the set of cards changed (a slot started, detached, or went back to standby): rebuild, then update below
     slotsGrid.innerHTML = "";
-    for (let i = 0; i < maxSlots; i++) {
+    for (const s of activeSlots) {
+      const i = s.slot;
       const tile = document.createElement("div");
-      tile.className = "slot-tile is-idle";
+      tile.className = "slot-tile is-reading";
+      tile.id = `slot-tile-${i}`;
+      tile.dataset.key = `slot-${i}`;
       tile.dataset.slot = `${i}`;
       tile.innerHTML = `
         <div class="slot-tile__top">
           <div class="slot-tile__header">
             <span class="slot-tile__name">Slot ${i}</span>
-            <span class="slot-tile__badge tone-idle" id="st-badge-${i}">Idle</span>
+            <span class="slot-tile__badges">
+              <span class="slot-tile__badge tone-reading" id="st-badge-${i}">Reading</span>
+              <span class="slot-tile__badge tone-restored" id="slot-restored-badge-${i}" hidden></span>
+            </span>
           </div>
           <div class="slot-tile__metrics">
             <div class="slot-tile__metric">
@@ -530,60 +560,88 @@ function renderConcurrency(live, eng, hw) {
           </div>
         </div>
         <div class="slot-tile__progress-wrap">
-          <div class="slot-tile__bar-track">
-            <div class="slot-tile__bar-fill is-idle" id="slot-fill-${i}" style="width: 0%"></div>
+          <div class="slot-tile__bar-track" id="slot-track-${i}">
+            <div class="slot-tile__bar-fill is-restored" id="slot-restored-fill-${i}" style="width: 0%"></div>
+            <div class="slot-tile__bar-fill is-reading" id="slot-fill-${i}" style="width: 0%"></div>
             <div class="slot-tile__ticks"></div>
           </div>
           <div class="slot-tile__detail">
-            <span class="slot-tile__phase" id="slot-phase-${i}">Waiting for request</span>
+            <span class="slot-tile__phase" id="slot-phase-${i}">Reading prompt</span>
             <span class="slot-tile__tokens" id="slot-tokens-${i}">–</span>
           </div>
         </div>`;
       slotsGrid.appendChild(tile);
     }
-    const qTile = document.createElement("div");
-    qTile.className = "slot-tile slot-tile--queue is-idle";
-    qTile.id = "slot-queue-tile";
-    qTile.innerHTML = `
-      <div class="slot-tile__top">
-        <div class="slot-tile__header">
-          <span class="slot-tile__name">Queue</span>
-          <span class="slot-tile__badge tone-idle" id="queue-tile-badge">0 Queued</span>
-        </div>
-        <div class="slot-tile__metrics">
-          <div class="slot-tile__metric">
-            <span class="slot-tile__metric-val" id="queue-metric-count">0</span>
-            <span class="slot-tile__metric-sub">Waiting</span>
+    if (showQueue) {
+      const qTile = document.createElement("div");
+      qTile.className = "slot-tile slot-tile--queue is-idle";
+      qTile.id = "slot-queue-tile";
+      qTile.dataset.key = "slot-queue-tile";
+      qTile.innerHTML = `
+        <div class="slot-tile__top">
+          <div class="slot-tile__header">
+            <span class="slot-tile__name">Queue</span>
+            <span class="slot-tile__badge tone-idle" id="queue-tile-badge">0 Queued</span>
           </div>
-          <div class="slot-tile__metric">
-            <span class="slot-tile__metric-val" id="queue-metric-status">Direct</span>
-            <span class="slot-tile__metric-sub">Admission</span>
+          <div class="slot-tile__metrics">
+            <div class="slot-tile__metric">
+              <span class="slot-tile__metric-val" id="queue-metric-count">0</span>
+              <span class="slot-tile__metric-sub">Waiting</span>
+            </div>
+            <div class="slot-tile__metric">
+              <span class="slot-tile__metric-val" id="queue-metric-status">Direct</span>
+              <span class="slot-tile__metric-sub">Admission</span>
+            </div>
           </div>
         </div>
-      </div>
-      <div class="slot-tile__progress-wrap">
-        <div class="slot-tile__detail">
-          <span class="slot-tile__phase" id="queue-tile-phase">Direct admission</span>
+        <div class="slot-tile__progress-wrap">
+          <div class="slot-tile__detail">
+            <span class="slot-tile__phase" id="queue-tile-phase">Direct admission</span>
+          </div>
+        </div>`;
+      slotsGrid.appendChild(qTile);
+    }
+    if (showIdle) {
+      const bits = [`Idle · Auto Cap K=${kActive} of ${kMax}`];
+      if (minTps > 0) bits.push(`SLA ≥ ${fmt(minTps, minTps % 1 ? 1 : 0)} t/s`);
+      if (poolFull > 0) bits.push(`Experts ${fmt(poolLive)} / ${fmt(poolFull)}`);
+      bits.push("Ready for direct admission");
+      const idleTile = document.createElement("div");
+      idleTile.className = "slot-tile slot-tile--idle-summary is-idle";
+      idleTile.id = "slot-idle-summary";
+      idleTile.dataset.key = "slot-idle-summary";
+      idleTile.innerHTML = `
+        <div class="slot-tile__top">
+          <div class="slot-tile__header">
+            <span class="slot-tile__name">Idle</span>
+            <span class="slot-tile__badge tone-idle">Standby</span>
+          </div>
+          <div class="slot-tile__metrics">
+            <div class="slot-tile__metric">
+              <span class="slot-tile__metric-val">${kActive} / ${kMax}</span>
+              <span class="slot-tile__metric-sub">Auto Cap K</span>
+            </div>
+          </div>
         </div>
-      </div>`;
-    slotsGrid.appendChild(qTile);
+        <div class="slot-tile__progress-wrap">
+          <div class="slot-tile__detail">
+            <span class="slot-tile__phase" id="idle-summary-phase">${bits.join(" · ")}</span>
+          </div>
+        </div>`;
+      slotsGrid.appendChild(idleTile);
+    }
   }
 
-  for (let i = 0; i < maxSlots; i++) {
-    const tile = slotsGrid.children[i];
-    if (!tile) continue;
-    const sInfo = slots[i] || {};
-    const isBusy = (sInfo.state && sInfo.state !== "idle") || (curConcurrency > i);
-    let sState = "idle";
-    if (sInfo.state && sInfo.state !== "idle") {
-      sState = (sInfo.state === "decoding" || sInfo.state === "generating") ? "generating" : "reading";
-    } else if (isBusy) {
-      sState = (live && live.state === "reading") ? "reading" : "generating";
-    }
-    tile.className = `slot-tile is-${sState}`;
+  for (const s of activeSlots) {
+    const i = s.slot;
+    const sInfo = s;
+    const detaching = sInfo.state === "detaching" || sInfo.releasing === true;
+    const sState = detaching ? "detaching" : (sInfo.state === "decoding" || sInfo.state === "generating") ? "generating" : "reading";
+    const tile = $(`slot-tile-${i}`);
+    if (tile) tile.className = `slot-tile is-${sState}`;
 
     const badgeEl = $(`st-badge-${i}`);
-    const stateTitle = sState === "generating" ? "Generating" : (sState === "reading" ? "Reading" : "Idle");
+    const stateTitle = sState === "generating" ? "Decoding" : (sState === "reading" ? "Reading" : "Detaching");
     if (badgeEl) {
       badgeEl.textContent = stateTitle;
       badgeEl.className = `slot-tile__badge tone-${sState}`;
@@ -600,12 +658,15 @@ function renderConcurrency(live, eng, hw) {
       else if (sState === "reading" && live.prefill_tok_s_mean) prefEl.innerHTML = `${fmt(live.prefill_tok_s_mean)}<small>t/s</small>`;
       else prefEl.textContent = "–";
     }
+    const trackEl = $(`slot-track-${i}`);
     const fillEl = $(`slot-fill-${i}`);
+    const restFillEl = $(`slot-restored-fill-${i}`);
+    const restBadgeEl = $(`slot-restored-badge-${i}`);
     const phaseEl = $(`slot-phase-${i}`);
     const tokensEl = $(`slot-tokens-${i}`);
     let fillPct = 0;
-    let phaseText = sInfo.held_tokens ? "Idle · context held" : "Idle · Slot ready";
-    let tokensText = sInfo.held_tokens ? `${fmt(sInfo.held_tokens)} held tokens` : "–";
+    let phaseText = "Slot ready";
+    let tokensText = "–";
     if (sState === "reading") {
       const pTotal = sInfo.prompt_total || sInfo.prompt_tokens || (live.state === "reading" ? (live.prompt_total || live.prompt_tokens) : 0);
       const pRead = sInfo.prompt_read != null ? sInfo.prompt_read : (live.state === "reading" ? live.prompt_read : 0);
@@ -618,13 +679,43 @@ function renderConcurrency(live, eng, hw) {
       fillPct = Math.min(100, Math.round((100 * (gen || 0)) / maxTok));
       phaseText = "Decoding answer";
       tokensText = `${fmt(gen || 0)} tokens generated`;
+    } else {
+      phaseText = "Detaching · releasing the slot";
+      tokensText = sInfo.held_tokens ? `${fmt(sInfo.held_tokens)} held tokens` : "–";
     }
-    if (fillEl) {
-      fillEl.style.width = isBusy ? `${Math.max(8, fillPct)}%` : "0%";
-      fillEl.className = `slot-tile__bar-fill is-${sState}`;
+    // P5-5D: parked-restore indicator + restored-vs-generated breakdown, when this request's prompt came back
+    // from the engine's cache instead of being read again (the admission's RESUME line)
+    const rt = sInfo.restored_tokens || 0;
+    if (restBadgeEl) {
+      if (rt > 0) {
+        const from = sInfo.restored_from;
+        restBadgeEl.hidden = false;
+        restBadgeEl.textContent = from === "parked" ? "Restored · parked" : from === "disk" ? "Restored · disk" : "Restored";
+      } else {
+        restBadgeEl.hidden = true;
+      }
     }
-    if (phaseEl) phaseEl.textContent = phaseText;
-    if (tokensEl) tokensEl.textContent = tokensText;
+    if (rt > 0) {
+      const gen = sInfo.generated || 0;
+      const total = rt + gen;
+      if (trackEl) trackEl.className = "slot-tile__bar-track is-split";
+      if (restFillEl) restFillEl.style.width = `${Math.min(100, Math.round((100 * rt) / Math.max(1, total)))}%`;
+      if (fillEl) {
+        fillEl.className = "slot-tile__bar-fill is-generated";
+        fillEl.style.width = `${Math.min(100, Math.round((100 * gen) / Math.max(1, total)))}%`;
+      }
+      if (phaseEl) phaseEl.textContent = phaseText;
+      if (tokensEl) tokensEl.textContent = `${fmt(rt)} restored · ${fmt(gen)} generated`;
+    } else {
+      if (trackEl) trackEl.className = "slot-tile__bar-track";
+      if (restFillEl) restFillEl.style.width = "0%";
+      if (fillEl) {
+        fillEl.className = `slot-tile__bar-fill is-${sState}`;
+        fillEl.style.width = `${Math.max(sState === "detaching" ? 0 : 8, fillPct)}%`;
+      }
+      if (phaseEl) phaseEl.textContent = phaseText;
+      if (tokensEl) tokensEl.textContent = tokensText;
+    }
   }
 
   const qTile = $("slot-queue-tile");
@@ -653,7 +744,10 @@ function renderConcurrency(live, eng, hw) {
   }
   const activeBadge = $("slots-active-badge");
   if (activeBadge) {
-    activeBadge.textContent = `${curConcurrency} / ${maxSlots} Active`;
+    // P5-5D: the dynamic cap: K_active streams admitted now of the K_max the pool can lend (Max), plus the
+    // --min-stream-tps SLA floor the governor flexes K under when one is configured
+    activeBadge.textContent = `${curConcurrency} / ${kActive} Active (Max ${kMax})` +
+      (minTps > 0 ? ` · SLA ${fmt(minTps, minTps % 1 ? 1 : 0)} t/s` : "");
     activeBadge.className = curConcurrency > 0 ? "st-badge st-badge--generating" : "st-badge";
   }
 }
@@ -955,8 +1049,17 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // context fill (#4636): the running request in its parts, else the last one
   renderContext(live, eng, last, on);
   const cacheBytes = (eng.expert_cache_mib || 0) * 1048576;
-  $("slots-text").textContent = eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB` : "–";
-  $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";
+  if (live && live.pool_full_slots > 0) {
+    // P5-5D: the unified expert pool flexes live (the KCAP line's numbers): show the pool's live expert slots
+    // against its full slots, so the flex and the snap-back are visible as the auto cap moves
+    const pl = live.pool_live_slots || 0, pf = live.pool_full_slots;
+    $("slots-text").textContent = `${fmt(pl)} / ${fmt(pf)} slots live` +
+      (eng.expert_slots ? ` · ${gb(cacheBytes)} GB` : "");
+    $("slots-bar").style.width = `${Math.min(100, (100 * pl) / pf)}%`;
+  } else {
+    $("slots-text").textContent = eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB` : "–";
+    $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";
+  }
   $("ram-text").textContent = hw.ram_total ? `${gb(hw.ram_used)} / ${gb(hw.ram_total, 0)} GB` : "–";
   const ramPct = hw.ram_total ? (100 * hw.ram_used) / hw.ram_total : 0;
   $("ram-bar").style.width = `${ramPct}%`;

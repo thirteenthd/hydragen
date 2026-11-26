@@ -26,7 +26,9 @@ class WebLoadUnloadMarkup(unittest.TestCase):
 
     def test_header_button_and_monitor_badge(self):
         self.assertIn('id="unload-btn"', self.html)
-        self.assertIn('data-s="unloaded"', self.html)
+        # cb4c5c8 replaced the Model State card's data-s badges with the Concurrency States panel: the state
+        # badge now lives in that card's header (app.js keeps its #state-badges loop null-safe for old pages)
+        self.assertIn('id="slots-state-badge"', self.html)
         self.assertLess(self.html.index('id="unload-btn"'), self.html.index('id="theme-btn"'))   # in the header row
 
     def test_button_posts_load_and_unload(self):

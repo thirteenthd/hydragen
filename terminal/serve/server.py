@@ -906,6 +906,12 @@ class StrataEngine:
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
         self.progress_ms = 0             # PP's own milliseconds since the prompt started (its third field)
         self.reused = 0                  # RESUME: prompt tokens not read again (a client takes them out of the work)
+        # P5-5D: the DecodeGovernor SLA floor this engine was started with (--min-stream-tps; 0.0 = unset/auto).
+        # The Monitor's Concurrency panel shows it beside the dynamic auto cap so the SLA the K flexes under is visible.
+        try:
+            self.min_stream_tps = float(args[args.index("--min-stream-tps") + 1]) if "--min-stream-tps" in args else 0.0
+        except (IndexError, ValueError):
+            self.min_stream_tps = 0.0
         self.silent_note = None
         self.last_err = None
         self._last_exit_code = None
@@ -1651,7 +1657,7 @@ class StrataEngine:
                     self.slot_cv.notify_all()
         threading.Thread(target=run, daemon=True).start()
 
-    def _control(self, cancel, on_token, stop_when=None, on_quiet=None, want_lp=False, lines_q=None):
+    def _control(self, cancel, on_token, stop_when=None, on_quiet=None, want_lp=False, lines_q=None, resume_sink=None):
         """Reads the control lines of the request on them (GEN / BGEN), yielding None heartbeats.  Calls on_token(id)
         for each `T`; returns ("done", None) at DONE, or ("badm", continues) at BADM (after DONE).  `stop_when()`
         true sends STOP once (the request is then read to its DONE).  `on_quiet()` runs whenever the engine has been
@@ -1725,6 +1731,8 @@ class StrataEngine:
             elif line.startswith("RESUME "):          # #4636: the reused prefix (the Monitor's Context gauge); read only there
                 try:
                     self.reused = int(line.split()[1])
+                    if resume_sink is not None:       # P5-5D: this exchange's own count (self.reused is shared between
+                        resume_sink.append(self.reused)   # threads; the batch admission keeps its own for the slot card)
                 except (IndexError, ValueError):
                     pass
             elif line.startswith("DONE"):
@@ -2451,7 +2459,9 @@ class StrataEngine:
                             else f"BGEN {slot} {left}{leg_keys()}{pf}{sr}")
                     live = {"slot": slot, "request_id": getattr(cancel, "_strata_request_id", None),
                             "state": "reading", "prompt_tokens": len(prompt), "prompt_read": 0, "generated": 0,
-                            "started": began, "first_token": None}
+                            "started": began, "first_token": None,
+                            "restored_tokens": 0, "restored_from": None}   # P5-5D: filled once the RESUME line is read
+                    reused_leg = []                     # this admission's own reused count (self.reused is shared)
                     deadline = getattr(cancel, "_strata_queue_deadline", None)
                     if deadline is not None and time.monotonic() >= deadline:
                         raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
@@ -2465,6 +2475,11 @@ class StrataEngine:
                     started = getattr(cancel, "_strata_queue_started", None)
                     if started is not None:
                         started()
+                    # P5-5D: how much of this prompt the slot itself already held, before the admission overwrites it:
+                    # the restored-vs-generated card badge uses it to tell in-slot KV reuse from a parked restore
+                    h_held = self.slot_held[slot]
+                    n_shared = min(len(h_held), len(prompt))
+                    shared_held = n_shared if n_shared and h_held[:n_shared] == prompt[:n_shared] else 0
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
                     self._recent_reads.append(prompt)
                     self.slot_prompt[slot] = list(prompt)   # (Inkling: valid once the BDONE sets slot_held again)
@@ -2488,7 +2503,7 @@ class StrataEngine:
                             live["prompt_read"] = self.progress[0]
                     try:
                         for x in self._control(cancel, arrived, on_quiet=lambda: (ask(), note_progress()),
-                                               want_lp=want_lp, lines_q=lines_q):
+                                               want_lp=want_lp, lines_q=lines_q, resume_sink=reused_leg):
                             while pending:
                                 t = pending.pop(0)
                                 out.append(t)
@@ -2535,6 +2550,13 @@ class StrataEngine:
                     cont = bool(self._ctl_result and self._ctl_result[1])
                     admission_pending = cont
                     phase = "slot" if cont else "none"
+                    # P5-5D: the admission's RESUME line: prompt tokens the engine did not read again. The slot card
+                    # shows them as restored-vs-generated; _shared_held lets slots_view re-classify the source once
+                    # the server has polled the engine log's restore events (a disk read-back lands there after RESUME).
+                    restored = int(reused_leg[-1]) if reused_leg else 0
+                    live["restored_tokens"] = restored
+                    live["restored_from"] = self._restore_source(shared_held, restored)
+                    live["_shared_held"] = shared_held
                     while pending:
                         t = pending.pop(0)
                         out.append(t)
@@ -2843,19 +2865,51 @@ class StrataEngine:
                                         len(self.slot_held[b]) >= self.SIDE_REQUEST_MIN,
                                         self.slot_used[b]))
 
+    RESTORE_MATCH_S = 10.0   # P5-5D: a log restore event this many seconds from the admission names the source
+
+    def _restore_source(self, shared_held: int, restored: int) -> str | None:
+        """P5-5D: where a slot's reused prefix came from (the Monitor's per-slot restored badge). The engine's RESUME
+        line says how many prompt tokens were not read again, never from where: the slot's own held stream first (the
+        KV was already there: "cache"), else the parked conversation cache ("parked") - and its disk tier ("disk")
+        when the engine log says it read back the same number of tokens around this admission (the server stamps the
+        last polled restore events on the engine as _restore_events)."""
+        if restored <= 0:
+            return None
+        if shared_held >= restored:
+            return "cache"
+        ev = getattr(self, "_restore_events", None)
+        if ev:
+            disk_tok, disk_at, conv_tok, conv_at = ev
+            now = time.time()
+            if disk_tok == restored and disk_at and now - disk_at <= self.RESTORE_MATCH_S:
+                return "disk"
+            if conv_tok == restored and conv_at and now - conv_at <= self.RESTORE_MATCH_S:
+                return "parked"
+        return "parked"
+
     def slots_view(self) -> list[dict]:
-        """/metrics: each batch slot - idle (with the tokens it holds for a next turn), reading or decoding."""
+        """/metrics: each batch slot - idle (with the tokens it holds for a next turn), reading, decoding, or
+        detaching (its reply ended and the background BDONE wait still owns it). P5-5D adds `releasing` (that wait
+        as a flag) and the admission's restored-vs-generated counts for the Monitor's dynamic slot cards."""
         now, view = time.time(), []
         for b in range(self.batch):
             r = self.slot_live[b]
+            releasing = b in self.slot_releasing
             if r is None:
-                view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b]),
-                             "idle_s": round(now - self.slot_t_free[b], 1) if self.slot_t_free[b] else None})
+                view.append({"slot": b, "state": "detaching" if releasing else "idle", "releasing": releasing,
+                             "held_tokens": len(self.slot_held[b]),
+                             "idle_s": round(now - self.slot_t_free[b], 1) if self.slot_t_free[b] else None,
+                             "restored_tokens": 0, "restored_from": None})
                 continue
             ft = r.get("first_token")
-            view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
+            rt = int(r.get("restored_tokens") or 0)
+            rf = r.get("restored_from")
+            if rt and rf != "cache":     # re-classify with restore events polled since the admission (a disk read-back lands late)
+                rf = self._restore_source(r.get("_shared_held", 0), rt)
+            view.append({"slot": b, "state": r["state"], "releasing": releasing, "prompt_tokens": r["prompt_tokens"],
                          "prompt_read": r.get("prompt_read") if r["state"] == "reading" else None,
                          "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
+                         "restored_tokens": rt, "restored_from": rf,
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
         return view
 
@@ -5557,6 +5611,17 @@ class Service:
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
+        # #596 / M-C3a: the parked conversations and their disk tier, as the engine's log tells them. Polled before
+        # slots_view (P5-5D): the last restore events it sees are stamped on the engine so a slot card can name the
+        # source of its reused prefix (parked / disk) once the log line has been read.
+        parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        disk = self.pd_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        try:
+            self.engine._restore_events = (
+                disk.get("last_tokens") if disk.get("last_event") == "restored" else None, disk.get("last_at"),
+                parked.get("last_tokens") if parked.get("last_event") == "restored" else None, parked.get("last_at"))
+        except AttributeError:
+            pass                                        # an engine that carries no per-slot state
         par = int(getattr(self.engine, "batch", 0) or 0)
         if par:                                         # #465: the requests running together, slot by slot
             with self.status_lock:
@@ -5569,6 +5634,14 @@ class Service:
             live.update(parallel=par, running=running, slots=slots, outside_slots=max(0, running - in_slots),
                         waiting=int(getattr(self.engine, "waiting", 0) or 0),
                         admitting=int(getattr(self.engine, "admitting", 0) or 0))
+            # P5-5D: the dynamic auto-batch cap and the unified expert pool, for the Monitor's slot cards: K_active
+            # of K_max streams admitted now (the KCAP line's numbers), the pool's live/full expert slots, and the
+            # --min-stream-tps SLA floor the cap flexes under (0.0 = unset/auto).
+            live["k_active"] = int(getattr(self.engine, "k_active", par) or par)
+            live["k_max"] = int(getattr(self.engine, "k_max", par) or par)
+            live["pool_live_slots"] = int(getattr(self.engine, "pool_live_slots", 0) or 0)
+            live["pool_full_slots"] = int(getattr(self.engine, "pool_full_slots", 0) or 0)
+            live["min_stream_tps"] = float(getattr(self.engine, "min_stream_tps", 0.0) or 0.0)
             if running and state == "idle":
                 live["state"] = "generating"
         if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it
@@ -5583,8 +5656,6 @@ class Service:
         if getattr(self.vision, "cpu_note", None):         # the card had no room for the picture reader: the Terminal says so in its summary
             engine["vision_note"] = self.vision.cpu_note
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
-        parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
-        disk = self.pd_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "park_disk": disk,

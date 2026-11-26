@@ -631,6 +631,51 @@ a.st-header__brand:hover { color: var(--st-accent-text); text-decoration: none; 
   box-shadow: 0 0 8px var(--st-warn, #f59e0b);
 }
 
+/* ------------------------------------------------ P5-5D: dynamic slot cards */
+/* detaching: the reply ended, the background BDONE wait still owns the slot */
+.slot-tile.is-detaching {
+  border-color: color-mix(in srgb, var(--st-ink-muted, #94a3b8) 45%, var(--st-line));
+  background: color-mix(in srgb, var(--st-ink-muted, #94a3b8) 7%, var(--st-surface-2));
+}
+
+.slot-tile__badge.tone-detaching {
+  background: color-mix(in srgb, var(--st-ink-muted, #94a3b8) 22%, transparent);
+  color: var(--st-ink-muted);
+  font-weight: var(--st-fw-bold);
+}
+
+.slot-tile__badges {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+/* parked-restore pill: this request's prompt came back from the engine's cache, it was not read again */
+.slot-tile__badge.tone-restored {
+  background: color-mix(in srgb, var(--st-info) 16%, transparent);
+  color: var(--st-info-text, var(--st-info));
+}
+
+/* restored-vs-generated: two stacked segments in one track (restored first, then generated) */
+.slot-tile__bar-track.is-split {
+  display: flex;
+}
+
+.slot-tile__bar-fill.is-restored {
+  background: linear-gradient(90deg, var(--st-info), color-mix(in srgb, var(--st-info) 60%, white));
+}
+
+.slot-tile__bar-fill.is-generated {
+  background: linear-gradient(90deg, var(--st-accent), color-mix(in srgb, var(--st-accent) 70%, white));
+  box-shadow: 0 0 8px var(--st-accent);
+}
+
+/* the compact summary shown while every slot is on standby */
+.slot-tile.slot-tile--idle-summary {
+  justify-content: center;
+  opacity: 0.92;
+}
+
 /* ------------------------------------------------ Queued Metric Card Highlight */
 .metric-card.has-queue {
   border-color: color-mix(in srgb, var(--st-warn, #f59e0b) 60%, var(--st-line));
