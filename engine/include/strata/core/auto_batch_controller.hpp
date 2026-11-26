@@ -16,6 +16,9 @@
 //     mode the band [min_stream_tps, sla_up_margin * min_stream_tps) is dead: hold.
 //   - mem_refused is a hard clamp, not a vote: a refusal while K exceeds the rows actually running
 //     means K is above the real VRAM ceiling, so K drops to those rows at once.
+//   - rows <= 1 never steps down (P5-5C.3, unless mem_refused): a 1-row tail cannot prove
+//     multi-stream contention; in SLA mode a solo stream at/above the up line with pool headroom
+//     opens the step up from K 1 on its raw rate (the EMA may still carry the old crowded samples).
 //
 // Two modes: min_stream_tps > 0 keeps every stream fluent (step down below the floor, step up only
 // with margin AND pool headroom); min_stream_tps == 0 maximizes aggregate throughput (step up while
@@ -30,14 +33,16 @@
 namespace strata::core {
 
 /// The controller's configuration (the shipped defaults are the 12 GiB mech box's: K in [1, 8],
-/// start at 2, auto mode, the 85% hit knee the §240-§243 runs showed).
+/// start at 2, auto mode, the 74% hit knee the §244 p5c2 runs calibrated: ms01's peak-throughput
+/// band sits at 75-78% routed-expert VRAM hit, real thrash below ~65%, so the step-down line at
+/// 70% holds the peak band while still catching a collapsing cache).
 struct AutoBatchConfig {
     int min_k = 1;                  // the smallest K the controller may hold
     int max_k = 8;                  // the boot --batch carve: the largest K
     int initial_k = 2;              // where K starts (clamped into [min_k, max_k])
     double min_stream_tps = 0.0;    // 0.0 = auto max-aggregate mode; > 0 = per-stream fluency SLA floor
-    double knee_hit_pct = 85.0;     // routed-expert VRAM hit% knee: step-up wants the EMAd hit at/above this
-    double hit_hysteresis_pct = 3.0;   // step-down threshold = knee_hit_pct - hit_hysteresis_pct
+    double knee_hit_pct = 74.0;     // routed-expert VRAM hit% knee: step-up wants the EMAd hit at/above this
+    double hit_hysteresis_pct = 4.0;   // step-down threshold = knee_hit_pct - hit_hysteresis_pct
     double sla_up_margin = 1.15;    // SLA mode: step up needs per-stream >= sla_up_margin * min_stream_tps
     double agg_regress_ratio = 0.92;   // auto mode: step down if agg tok/s drops below this * best_agg_at_prev_k
     double ema_alpha = 0.35;        // EMA weight on the newest observation
@@ -95,18 +100,26 @@ public:
         if (cooldown_left_ > 0) { --cooldown_left_; return k_active_; }   // damped: no decision this boundary
 
         bool good = false, bad = false;
+        // P5-5C.3: a 1-row tail cannot prove multi-stream contention: unless the driver refused
+        // memory (a fact, not a sample), rows <= 1 never votes the system down.
+        const bool rows_prove = obs.mem_refused || obs.active_rows >= 2;
         if (cfg_.min_stream_tps > 0.0) {
             // SLA mode: below the floor is bad; the step-up needs margin AND pool headroom; the band
-            // between is dead (hold) so K never chases noise around the floor.
-            bad = ema_stream_ < cfg_.min_stream_tps;
-            good = !bad && ema_stream_ >= cfg_.sla_up_margin * cfg_.min_stream_tps && obs.pool_has_headroom;
+            // between is dead (hold) so K never chases noise around the floor.  At K 1 the solo
+            // stream's RAW rate opens the step up: the EMA may still carry the crowded samples that
+            // clamped K down, and a fluent solo stream with headroom is exactly the evidence that
+            // admitting one more pays.
+            bad = rows_prove && ema_stream_ < cfg_.min_stream_tps;
+            good = !bad && obs.pool_has_headroom &&
+                   (ema_stream_ >= cfg_.sla_up_margin * cfg_.min_stream_tps ||
+                    (k_active_ == 1 && obs.per_stream_tps >= cfg_.sla_up_margin * cfg_.min_stream_tps));
         } else {
             // auto mode: the hit knee opens the step-up (with headroom and an aggregate that is not
             // below its best at this K); a collapsed hit, or an aggregate below the ratio of the
             // best the previous K achieved, closes it.
             good = ema_hit_ >= cfg_.knee_hit_pct && obs.pool_has_headroom && ema_agg_ >= best_agg_at_k_;
-            bad = ema_hit_ < cfg_.knee_hit_pct - cfg_.hit_hysteresis_pct ||
-                  (prev_best_agg_ > 0.0 && ema_agg_ < cfg_.agg_regress_ratio * prev_best_agg_);
+            bad = rows_prove && (ema_hit_ < cfg_.knee_hit_pct - cfg_.hit_hysteresis_pct ||
+                                 (prev_best_agg_ > 0.0 && ema_agg_ < cfg_.agg_regress_ratio * prev_best_agg_));
         }
 
         if (bad) {

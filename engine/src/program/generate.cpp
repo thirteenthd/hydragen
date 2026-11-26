@@ -17376,39 +17376,49 @@ int main(int argc, char** argv) {
                          decode_gov.config().initial_width, decode_gov.config().cohort_quantum_ms,
                          decode_gov.config().grace_windows, decode_gov.config().affinity ? 1 : 0,
                          decode_gov.config().affinity_max_wait);
-        // P5-5C.2: the controller's boundary feed.  One observation per batch completion (BDONE): the rows
-        // advanced and the routed-expert entries served since the last boundary, the slots still active, and
-        // whether the unified pool could still lend.  K moves only through the controller's damping; a K
-        // change is said on stderr and re-published with emit_kcap().  A BGEN memory-limit refusal feeds
-        // mem_refused: the controller clamps K to the rows actually running at once.
-        int64_t ab_rows = 0;   // rows advanced since the last boundary (monotonic feed, never reset)
-        Clock::time_point ab_t0 = Clock::now();
-        uint64_t ab_hits0 = drive.d.cache_hits, ab_off0 = drive.d.offload_entries, ab_cpu0 = drive.d.multi_entries;
+        // P5-5C.3: the controller's boundary feed reads a PURE batch-decode window accumulator, never
+        // the wall clock since the last boundary: the §244 p5c2 run fed prefill-contaminated tails
+        // (1.9-18.3 tok/s over idle/prefill stretches) into the controller and ratcheted every arm to
+        // K_active 1.  Each completed batch-decode window adds its rows, its decode ms (run_slot_rows
+        // only: no prefill, no admission, no idle) and its routed-expert entries; a BDONE boundary
+        // votes only when >= 8 completed windows back it, then the accumulator resets.  A BGEN
+        // memory-limit refusal still feeds at once: the clamp is a fact, not a sample.
+        int64_t ab_win_count = 0, ab_rows_sum = 0;   // completed decode windows since the last boundary
+        double ab_decode_ms = 0.0;
+        uint64_t ab_vram_hits = 0, ab_routed_total = 0;
+        uint64_t ab_wh0 = drive.d.cache_hits, ab_wo0 = drive.d.offload_entries, ab_wc0 = drive.d.multi_entries;
         int ab_k = auto_batch.k_active();
         if (auto_batch_on)
             std::fprintf(stderr, "strata serve: auto-batch: on (K_active %d of max %d, min-stream-tps %.1f, "
                                  "STRATA_AUTO_BATCH=0 turns it off)\n", ab_k, o.batch, o.min_stream_tps);
+        auto ab_window = [&](int rows, double win_ms) {   // one completed batch-decode window
+            if (!auto_batch_on || rows < 1) return;
+            const uint64_t d_hits = drive.d.cache_hits - ab_wh0;
+            const uint64_t d_off = drive.d.offload_entries - ab_wo0;
+            const uint64_t d_cpu = drive.d.multi_entries - ab_wc0;
+            ab_wh0 = drive.d.cache_hits; ab_wo0 = drive.d.offload_entries; ab_wc0 = drive.d.multi_entries;
+            ++ab_win_count; ab_rows_sum += rows; ab_decode_ms += win_ms;
+            ab_vram_hits += d_hits; ab_routed_total += d_hits + d_off + d_cpu;
+        };
         auto ab_note = [&](bool mem_refused) {
             if (!auto_batch_on) return;
-            const Clock::time_point now = Clock::now();
-            const double ms = std::chrono::duration<double, std::milli>(now - ab_t0).count();
             int active_rows = 0;
             for (const BSlot& s : bs) if (s.active) ++active_rows;
+            if (!mem_refused && (ab_win_count < 8 || ab_decode_ms <= 1.0))
+                return;   // a short tail of windows proves nothing: no boundary, no vote
             strata::core::AutoBatchObs obs;
             obs.active_rows = active_rows;
-            obs.agg_tps = ms > 0.5 ? 1000.0 * (double) ab_rows / ms : 0.0;
-            obs.per_stream_tps = active_rows > 0 ? obs.agg_tps / (double) active_rows : 0.0;
-            const uint64_t d_hits = drive.d.cache_hits - ab_hits0;
-            const uint64_t d_off = drive.d.offload_entries - ab_off0;
-            const uint64_t d_cpu = drive.d.multi_entries - ab_cpu0;
-            const uint64_t d_tot = d_hits + d_off + d_cpu;
-            obs.expert_hit_pct = d_tot > 0 ? 100.0 * (double) d_hits / (double) d_tot : 100.0;
+            if (ab_win_count > 0 && ab_decode_ms > 1.0) {
+                const int avg_rows = std::max(1, (int) std::lround((double) ab_rows_sum / (double) ab_win_count));
+                obs.agg_tps = (double) ab_rows_sum * 1000.0 / ab_decode_ms;
+                obs.per_stream_tps = obs.agg_tps / (double) avg_rows;
+                obs.expert_hit_pct = ab_routed_total > 0
+                    ? 100.0 * (double) ab_vram_hits / (double) ab_routed_total : 100.0;
+            }
             obs.pool_has_headroom = cow_pool.on ? (xcache.slots() > cow_pool.floor) : true;
             obs.mem_refused = mem_refused;
             const int k = auto_batch.observe_boundary(obs);
-            ab_rows = 0;
-            ab_t0 = now;
-            ab_hits0 = drive.d.cache_hits; ab_off0 = drive.d.offload_entries; ab_cpu0 = drive.d.multi_entries;
+            ab_win_count = 0; ab_rows_sum = 0; ab_decode_ms = 0.0; ab_vram_hits = 0; ab_routed_total = 0;
             if (k != ab_k) {
                 std::fprintf(stderr, "strata serve: auto-batch: K_active %d -> %d (rows=%d agg=%.1f tok/s "
                                      "stream=%.1f tok/s hit=%.1f%% headroom=%d ups=%d downs=%d)\n",
@@ -18090,6 +18100,10 @@ int main(int argc, char** argv) {
             const uint64_t gov_hits0 = drive.d.cache_hits;
             const uint64_t gov_off0 = drive.d.offload_entries;
             const uint64_t gov_cpu0 = drive.d.multi_entries;
+            // P5-5C.3: the auto-batch window accumulator's routing snapshot at the window's start: the
+            // delta at its end is exactly this window's routed-expert entries (prefill chunks run
+            // BETWEEN windows and must not leak into the window's hit%).
+            ab_wh0 = drive.d.cache_hits; ab_wo0 = drive.d.offload_entries; ab_wc0 = drive.d.multi_entries;
             const Clock::time_point w0 = Clock::now();
             if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : (err.empty() ? "a batch window failed without a reason" : err.c_str()));
@@ -18138,7 +18152,6 @@ int main(int argc, char** argv) {
             for (int a = 0; a < A; ++a) {
                 gov_win_tokens += keep[active[a]];
                 bt_rows += keep[active[a]];
-                ab_rows += keep[active[a]];   // P5-5C.2: the auto-batch controller's row feed
                 bt_accepted += keep[active[a]] - 1;
                 if (batch_mtp) {   // #5890: the slot's own counters, for its BDONE (the response's draft_n / draft_n_accepted)
                     bs[(size_t) active[a]].drafts_off += nrow[a] - 1;
@@ -18344,6 +18357,7 @@ int main(int argc, char** argv) {
                                  (unsigned long long) decode_gov.affinity_deferrals());
                 }
             }
+            ab_window(S, msd(w0, w1));   // P5-5C.3: the pure decode window: rows, run ms, its routing
             report_batch_window(S, A, !batch_on(), w0);
             pc.window(S, A);
             if (!batch_on() && bt_windows > 0) {
@@ -18801,7 +18815,6 @@ int main(int argc, char** argv) {
                     std::printf("BT %d %d\n", blk.b, (int) y);
                     ++sl.produced;
                     ++bt_rows;
-                    ++ab_rows;   // P5-5C.2
                     ++pipe_rows;
                     const char* fin = is_eos(y) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
                                     : sl.p + 1 > o.max_context ? "length" : nullptr;
@@ -18818,7 +18831,6 @@ int main(int argc, char** argv) {
                     std::printf("BT %d %d\n", blk.b, (int) y);
                     ++sl.produced;
                     ++bt_rows;
-                    ++ab_rows;   // P5-5C.2
                     ++pipe_rows;
                     strata::core::slot_hold_emitted(sl.hold, (int64_t) y);
                     const char* fin = is_eos(y) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
@@ -18973,7 +18985,6 @@ int main(int argc, char** argv) {
                     std::printf("BT %d %d\n", gi * GS + t, (int) y);
                     ++sl.produced;
                     ++bt_rows;
-                    ++ab_rows;   // P5-5C.2
                     ++pipe_rows;
                     strata::core::slot_hold_emitted(sl.hold, (int64_t) y);
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
@@ -19006,6 +19017,10 @@ int main(int argc, char** argv) {
                 ++bt_windows;
                 ++pa_windows;
                 G.inflight = false;
+                // P5-5C.3: the pipelined window: rows and launch-to-completion ms; its routing delta is
+                // the entries since the last window completed (groups overlap, so the ratio stays right
+                // even though per-window attribution cannot).
+                ab_window(G.S, std::chrono::duration<double, std::milli>(Clock::now() - G.started).count());
                 report_batch_window(G.S, G.active, !pipe_inflight() && !batch_on(), G.started);
                 pc.window(G.S, G.active);
             }
@@ -19151,7 +19166,7 @@ int main(int argc, char** argv) {
                     }
                     G.inflight = true;
                     G.stage = 0;
-                    if (batch_telemetry_enabled) G.started = Clock::now();
+                    if (batch_telemetry_enabled || auto_batch_on) G.started = Clock::now();
                     // (with the doorbells on their own thread, a failure it set for a window that left this stage is
                     // not cleared unseen)
                     if (conc_serving && drive.d.failed) {
