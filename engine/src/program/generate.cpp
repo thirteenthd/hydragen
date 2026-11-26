@@ -11966,17 +11966,26 @@ int main(int argc, char** argv) {
         int64_t reserve_bytes = 0;        // fresh chunks only while free VRAM stays above this
         int64_t lends = 0, reclaims = 0, evicted = 0, moved = 0, refilled = 0;
     } cow_pool;
-    {
+    // P5-5B.4: the pool is armed where the prompt path's plan is known (beside kvg_start, below): the
+    // cache's last slots ARE the prompt path's loan region [lend_first, slots), and arming at the cache's
+    // end let cow_lend unmap chunks inside the loan - the next prefill then wrote into unmapped VRAM
+    // ("verify: layer 2/12 never rang (an illegal memory access)", the arms2 B/C logs).  The lendable
+    // band is anchored strictly below the loan: top is the loan's first slot (or the cache's end when
+    // the prompt path borrows nothing), and the floor is the profile's total minus what the loan region
+    // already keeps mapped above top, so the kept live slots lo + (slots - top) never drop below it.
+    auto cow_pool_start = [&](int64_t top) {
         const char* up = hg_getenv("STRATA_UNIFIED_POOL");
         if ((up == nullptr || up[0] != '0') && strata::core::qsa_cow_arena_elastic() &&
             !strata::core::qsa_kv_elastic() && xcache.vmm_range() != nullptr && d_res != nullptr &&
             !host_res.empty() && srcp != nullptr && xcache.slots() > 1) {
-            cow_pool.top = cow_pool.lo = xcache.slots();
+            cow_pool.top = cow_pool.lo = top;
             const char* kp = hg_getenv("STRATA_EXPERT_KNEE_PCT");
             const char* fs = hg_getenv("STRATA_EXPERT_FLOOR_SLOTS");
-            cow_pool.floor = strata::core::expert_floor_from_weights(
+            const int64_t total_floor = strata::core::expert_floor_from_weights(
                 {}, xcache.slots(), 1, kp != nullptr ? std::atof(kp) : 86.0,
                 fs != nullptr ? std::atoll(fs) : 0);
+            cow_pool.floor = std::clamp<int64_t>(total_floor - (xcache.slots() - cow_pool.top), 1,
+                                                 cow_pool.top);
             if (cow_pool.floor < cow_pool.top) {
                 cow_pool.on = true;
                 cow_pool.reserve_bytes = ((int64_t) o.vram_reserve_mib + 64) << 20;
@@ -12004,15 +12013,16 @@ int main(int argc, char** argv) {
                         (int64_t) fb - ((int64_t) o.vram_reserve_mib << 20), flex, slot_vram,
                         o.batch > 0 ? o.batch : 1);
                     std::fprintf(stderr, "strata generate: unified pool: the expert cache (%lld slots) may lend down "
-                                         "to slot %lld (floor override %s); flex %.0f MiB, slot %.2f MiB, initial "
-                                         "K_active %d of %d, min-stream-tps %.1f\n",
-                                 (long long) cow_pool.top, (long long) cow_pool.floor, fs != nullptr ? fs : "0",
+                                         "to slot %lld (the prompt loan starts at %lld; floor override %s); flex "
+                                         "%.0f MiB, slot %.2f MiB, initial K_active %d of %d, min-stream-tps %.1f\n",
+                                 (long long) xcache.slots(), (long long) cow_pool.floor, (long long) cow_pool.top,
+                                 fs != nullptr ? fs : "0",
                                  (double) flex / 1048576.0, (double) slot_vram / 1048576.0, kcap,
                                  o.batch > 0 ? o.batch : 1, o.min_stream_tps);
                 }
             }
         }
-    }
+    };
     // Lend whole chunks to cover a `deficit_bytes` ask: parked in the arena's bank (to_cow_bank: the arena
     // draws them back itself) or freed straight back to the driver (a deferred session's cudaMalloc).
     // `quiesce` must leave nothing running on the device (kvg_ensure's invariant, kept strict).  Returns
@@ -12048,16 +12058,19 @@ int main(int argc, char** argv) {
                 rank.assign(host_res.size(), (int32_t) profile.size());
                 for (size_t p = 0; p < profile.size(); ++p)
                     rank[(size_t) profile[p].first * (size_t) g.n_expert + (size_t) profile[p].second] = (int32_t) p;
-                // the cache fills in profile order, so the loan region is already the coldest; only an adaptive
-                // swap can leave a hot expert down there, and its alternative is the coldest kept slot's resident
+                // the kept slots are [0, lo) plus the protected loan region [top, slots): a hot expert the
+                // adaptive tier left in the given-up band moves into the coldest kept slot of either (the
+                // elastic K/V's trick, kvg_ensure) - the loan region's slots hold experts between prompts
                 for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] >= 0 && host_res[i] < cow_pool.top) cold.emplace_back(heat((int32_t) i), (int32_t) i);
+                    if (host_res[i] >= 0 && (host_res[i] < cow_pool.lo || host_res[i] >= cow_pool.top))
+                        cold.emplace_back(heat((int32_t) i), (int32_t) i);
                 std::sort(cold.begin(), cold.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
             }
             --cow_pool.lo;
             ++gave;
             while (!cold.empty() && (host_res[(size_t) cold.back().second] < 0 ||
-                                     host_res[(size_t) cold.back().second] >= cow_pool.lo))
+                                     (host_res[(size_t) cold.back().second] >= cow_pool.lo &&
+                                      host_res[(size_t) cold.back().second] < cow_pool.top)))
                 cold.pop_back();   // given up or moved already
             if (const int32_t oi = owner[(size_t) cow_pool.lo]; oi >= 0) {
                 const int64_t layer = oi / g.n_expert;
@@ -12123,8 +12136,9 @@ int main(int argc, char** argv) {
         quiesce();
         strata::core::VmmRange& r = *xcache.vmm_range();
         const uint64_t G = strata::core::vmm_granularity();
-        const int64_t c_lo = (int64_t) (xcache.slot_offset(cow_pool.lo) / G);
-        const int64_t c_top = (int64_t) (xcache.slot_offset(cow_pool.top) / G);
+        const int64_t c_lo = (int64_t) ((xcache.slot_offset(cow_pool.lo) + G - 1) / G);   // P5-5B.4: align up like
+        const int64_t c_top = (int64_t) (xcache.slot_offset(cow_pool.top) / G);           // cow_lend's c0: a boundary
+        // chunk shared with a kept slot (or with the loan region) was never unmapped - don't count or re-map it
         int64_t want = 0;
         for (int64_t c = c_lo; c < c_top; ++c) if (!r.mapped(c)) ++want;
         std::vector<strata::core::VmmChunk> spare;
@@ -13659,6 +13673,9 @@ int main(int argc, char** argv) {
             }
         }
         kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots());
+        // P5-5B.4: the expert pool anchors at the same line: its lendable band stops where the prompt
+        // path's loan begins, so a lend can never unmap a slot the next prefill will write into
+        cow_pool_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots());
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
         // `penalty_last_n` tokens that row's pick follows, -1 padded in front.  Allocated once at the cap for
         // the widest window; a request without penalties gets a null buffer and takes the byte-for-byte
