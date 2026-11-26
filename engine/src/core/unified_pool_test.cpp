@@ -58,6 +58,27 @@ int main() {
     CHECK(initial_active_cap(1 << 20, 0, 0, 6) == 6);
     CHECK(initial_active_cap(1 << 20, 0, 131072, 0) == 1);
 
+    // ---- initial_active_cap_with_host (P5-5C.5) -------------------------------------------------
+    // the §245 ms01 shape: VRAM would fund the whole 8-slot carve, but 1.6 GiB of host RAM sits
+    // below the 2,048 MiB floor (nothing above it) and one slot's pinned host K/V takes 1,584 MiB
+    // -> only the one stream that always fits
+    const int64_t Mib = 1048576, Gib = 1073741824;
+    CHECK(initial_active_cap(8 * Gib, 0, 450 * Mib, 8) == 8);            // VRAM alone: 8
+    CHECK(initial_active_cap_with_host(8 * Gib, 0, 450 * Mib, 0, 1584 * Mib, 8) == 1);
+    // 3,584 MiB above the floor: two more 1,584 MiB slots fit -> host cap 3, under the VRAM cap of 8
+    CHECK(initial_active_cap_with_host(8 * Gib, 0, 450 * Mib, 3584 * Mib, 1584 * Mib, 8) == 3);
+    // exactly one slot's worth above the floor: cap 2 (the one that always fits plus one)
+    CHECK(initial_active_cap_with_host(8 * Gib, 0, 450 * Mib, 1584 * Mib, 1584 * Mib, 8) == 2);
+    // host RAM ample: the VRAM cap stands (1 GiB free buys 3 of 450 MiB, host funds far more)
+    CHECK(initial_active_cap_with_host(1 * Gib, 0, 450 * Mib, 64 * Gib, 1584 * Mib, 8) == 3);
+    // no host price (host RAM unreadable, or no pinned host K/V): exactly the VRAM cap
+    CHECK(initial_active_cap_with_host(1 * Gib, 0, 450 * Mib, 0, 0, 8) == 3);
+    CHECK(initial_active_cap_with_host(1 * Gib, 0, 450 * Mib, -1, 0, 8) == 3);
+    // one stream always fits, even with the floor already eaten (negative headroom reads as 0)
+    CHECK(initial_active_cap_with_host(8 * Gib, 0, 450 * Mib, -100 * Gib, 1584 * Mib, 8) == 1);
+    // the host cap never exceeds the boot carve
+    CHECK(initial_active_cap_with_host(64 * Gib, 0, 10 * Mib, 64 * Gib, 10 * Mib, 4) == 4);
+
     // ---- chunk_deficit -------------------------------------------------------------------------
     CHECK(chunk_deficit(0, 0, 2097152) == 0);
     CHECK(chunk_deficit(1024, 1024, 2097152) == 0);         // not short

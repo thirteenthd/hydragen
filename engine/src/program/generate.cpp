@@ -12002,16 +12002,46 @@ int main(int argc, char** argv) {
                         g, o.max_context, K, stages.empty() ? (int64_t) 0 : stages[0]->lb,
                         stages.empty() ? (int64_t) -1 : stages[0]->le, cow_with_rope);
                     const int64_t slot_vram = cow_sess + (cow_deferred > 0 ? cow_win / cow_deferred : 0);
-                    const int kcap = strata::core::initial_active_cap(
-                        (int64_t) fb - ((int64_t) o.vram_reserve_mib << 20), flex, slot_vram,
-                        o.batch > 0 ? o.batch : 1);
-                    cow_pool.initial_k = kcap;   // P5-5C.2: the auto-batch controller starts here
+                    const int cow_maxb = o.batch > 0 ? o.batch : 1;
+                    const int64_t cow_free_vram = (int64_t) fb - ((int64_t) o.vram_reserve_mib << 20);
+                    // P5-5C.5: price the HOST side too.  An unattached slot pays its pinned host K/V
+                    // (qsa_kv_host_bytes(): the figure the --batch carve guard above uses) before it can attach,
+                    // and ensure_slot_session refuses an attach that would leave less than
+                    // --conversation-cache-min-free-mib free beside it.  The §245 ms01 burst: 1.6 GiB available,
+                    // 1,584 MiB host K/V + 2,048 MiB floor per slot - the VRAM-only cap started 8 streams active
+                    // and every attach died on that guard.  Where host RAM cannot be read there is no host
+                    // price and the VRAM cap stands, as before.
+                    const int64_t slot_host_kv = (int64_t) strata::core::qsa_kv_host_bytes();
+                    int64_t host_above_floor = 0;
+                    int host_cap = cow_maxb;
+                    bool host_priced = false;
+                    {
+                        // available_host_bytes(): the same reading ensure_slot_session's host-RAM guard takes
+                        // (meminfo/cgroup cap on Linux, GlobalMemoryStatusEx on Windows; nullopt: unknown - no price)
+                        const auto host_avail = strata::core::available_host_bytes();
+                        if (slot_host_kv > 0 && host_avail.has_value()) {
+                            host_above_floor = (int64_t) *host_avail -
+                                               ((int64_t) o.conversation_cache_min_free_mib << 20);
+                            host_cap = std::clamp<int>(
+                                1 + (int) (std::max<int64_t>(0, host_above_floor) / slot_host_kv), 1, cow_maxb);
+                            host_priced = true;
+                        }
+                    }
+                    const int vram_cap = strata::core::initial_active_cap(cow_free_vram, flex, slot_vram, cow_maxb);
+                    const int kcap = strata::core::initial_active_cap_with_host(
+                        cow_free_vram, flex, slot_vram,
+                        host_priced ? host_above_floor : 0, host_priced ? slot_host_kv : 0, cow_maxb);
+                    cow_pool.initial_k = kcap;   // P5-5C.2/5: the auto-batch controller starts here
                     std::fprintf(stderr, "strata generate: unified pool: the expert cache (%lld slots) may lend down "
                                          "to slot %lld (floor override %s); flex %.0f MiB, slot %.2f MiB, initial "
-                                         "K_active %d of %d, min-stream-tps %.1f\n",
+                                         "K_active %d of %d (vram_cap %d, host_cap %d: %.1f GiB host above the %lld "
+                                         "MiB floor, %.2f GiB host K/V per slot), min-stream-tps %.1f\n",
                                  (long long) xcache.full_slots(), (long long) cow_pool.floor, fs != nullptr ? fs : "0",
-                                 (double) flex / 1048576.0, (double) slot_vram / 1048576.0, kcap,
-                                 o.batch > 0 ? o.batch : 1, o.min_stream_tps);
+                                 (double) flex / 1048576.0, (double) slot_vram / 1048576.0, kcap, cow_maxb,
+                                 vram_cap, host_cap,
+                                 (double) host_above_floor / 1073741824.0,
+                                 (long long) o.conversation_cache_min_free_mib,
+                                 (double) slot_host_kv / 1073741824.0, o.min_stream_tps);
                 }
             }
         }
@@ -19410,7 +19440,11 @@ int main(int argc, char** argv) {
                     std::printf("ERR BGEN: slot %ld session unavailable (memory limit)\n", b);
                     std::fflush(stdout);
                     ab_note(true);   // P5-5C.2/4: a memory-limit refusal is the controller's hard signal: K
-                                     // clamps at once to the slots attached in VRAM (never below 1)
+                                     // clamps at once to the slots attached in VRAM (never below 1).  Both refusal
+                                     // reasons land here - the host-RAM guard at the top of ensure_slot_session and
+                                     // a failed VRAM re-carve at its bottom - so the clamp covers both (P5-5C.5).
+                    emit_kcap();     // P5-5C.5: publish the clamped K right away, vote moved or not: a queueing
+                                     // wrapper re-reads K_active and the pool's live slots at the refusal itself
                     continue;
                 }
                 admit_slot = (int) b;

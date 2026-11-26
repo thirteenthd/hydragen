@@ -71,6 +71,28 @@ inline int initial_active_cap(int64_t free_above_reserve_bytes, int64_t flex_byt
     return std::clamp<int>(1 + (int) (avail / slot_vram_bytes), 1, max_batch);
 }
 
+/// P5-5C.5: the same boot cap priced against HOST RAM as well as VRAM.  An unattached batch slot pays
+/// its pinned host K/V (`slot_host_kv_bytes` - the figure the --batch carve guard uses) before it can
+/// attach, and the serve guard refuses an attach that would leave less than the
+/// --conversation-cache-min-free-mib floor free.  The §245 ms01 burst: 1.6 GiB available, 1,584 MiB
+/// host K/V + 2,048 MiB floor per slot - a VRAM-only cap started streams the host-RAM guard then
+/// refused, slot after slot, in under a second.  `host_avail_above_floor_bytes` is free host RAM minus
+/// that floor; where host RAM cannot be read (no /proc/meminfo), pass `slot_host_kv_bytes` 0: no host
+/// price, the VRAM cap stands.  Never below 1, never above `max_batch`.
+inline int initial_active_cap_with_host(int64_t free_vram_above_reserve, int64_t flex_bytes,
+                                        int64_t slot_vram_bytes,
+                                        int64_t host_avail_above_floor_bytes,
+                                        int64_t slot_host_kv_bytes, int max_batch) {
+    const int vram_cap = initial_active_cap(free_vram_above_reserve, flex_bytes, slot_vram_bytes, max_batch);
+    if (slot_host_kv_bytes > 0) {
+        if (max_batch < 1) max_batch = 1;
+        const int host_cap = std::clamp<int>(
+            1 + (int) (std::max<int64_t>(0, host_avail_above_floor_bytes) / slot_host_kv_bytes), 1, max_batch);
+        return std::min(vram_cap, host_cap);
+    }
+    return vram_cap;
+}
+
 /// Whole chunks the pool must lend to cover a byte deficit (0 when nothing is short, or the
 /// granularity is unknown - a caller with no VMM has no chunks to lend).
 inline int64_t chunk_deficit(int64_t need_bytes, int64_t avail_bytes, int64_t chunk_granularity) {

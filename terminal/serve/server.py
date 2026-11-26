@@ -1128,6 +1128,12 @@ class StrataEngine:
         # (its flag leaked) and would keep every later request waiting for a slot that nothing will free.
         self.slot_claims: set[int] = set()
         self.slot_releasing: set[int] = set()
+        # P5-5C.5: slots the engine has taken a session for this boot (a BGEN admission completed without a
+        # memory refusal).  Reusing one costs 0 new host RAM and 0 new VRAM - the session is already attached -
+        # so under memory backoff pick_slot prefers them and a memory refusal queues instead of burning the
+        # refusal budget across unattached slots.  Reset with the rest of the admission state when the engine
+        # restarts: the new process has attached nothing.
+        self._slot_attached: set[int] = set()
         self._orphan_seen: dict[int, float] = {}
         # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
         # the slot that has its start (the engine checks it again); when the slot was last used
@@ -2525,13 +2531,44 @@ class StrataEngine:
                                 self.slot_busy[slot] = False
                                 self.slot_t_free[slot] = time.time()
                                 self.__dict__.setdefault("_mem_backoff", {})[slot] = time.monotonic() + self.SLOT_MEM_BACKOFF_S
-                                others_busy = any(self.slot_busy)
                                 self.slot_cv.notify_all()
-                            if not others_busy:
+                            # P5-5C.5: a memory refusal on an unattached slot is not this request's failure while
+                            # anything is in flight or some slot is already attached: a busy/releasing slot frees
+                            # on its own, and re-admitting into an attached slot costs 0 new host RAM and 0 new
+                            # VRAM (its session is already there).  Sleep on slot_cv and retry - pick_slot prefers
+                            # the attached slots while the backoff is live - instead of burning BGEN_REFUSALS_MAX
+                            # across the unattached slots inside a second: the §245 ms01 burst did exactly that and
+                            # answered 503 with attached slots idle.  Only a machine where nothing runs and nothing
+                            # is attached can truly fit zero slots: that, and only that, counts against the budget.
+                            any_in_flight = (any(self.slot_busy) or bool(self.slot_releasing) or
+                                             bool(self.slot_claims) or getattr(self, "_busy", False))
+                            if any_in_flight or getattr(self, "_slot_attached", None):
+                                if holding:
+                                    self.ctl.release()
+                                    holding = False
+                                q_deadline = getattr(cancel, "_strata_queue_deadline", None)
+                                nap = 1.0 if q_deadline is None else max(0.0, min(1.0, q_deadline - time.monotonic()))
+                                with self.slot_cv:
+                                    self.slot_cv.wait(timeout=nap)   # woken by a slot freeing, a K rising, a restart
+                                if cancel.is_set():
+                                    return
+                                print(f"[strata] parallel: slot {slot} refused for memory limit ({e}); waiting for "
+                                      f"a free or attached slot (refusals={refused}/{self.BGEN_REFUSALS_MAX})",
+                                      flush=True)
+                                # the pick loop below assumes the control lines are held when it finds a slot on its
+                                # first pass (it only re-takes them after a wait of its own): take them back here,
+                                # against the queue deadline, before the retry
+                                ok = yield from self._take_control(cancel, len(prompt),
+                                                                   prompt=prompt if not embeddings else None)
+                                if not ok:
+                                    return
+                                holding, born = True, self.gen
+                                lines_q, sq = self.lines, self.slot_q   # (a restart during the nap made new ones)
+                            else:
                                 refused += 1
-                            print(f"[strata] parallel: slot {slot} refused for memory limit ({e}); backing off "
-                                  f"{self.SLOT_MEM_BACKOFF_S:.0f}s (refusals={refused}/{self.BGEN_REFUSALS_MAX})",
-                                  flush=True)
+                                print(f"[strata] parallel: slot {slot} refused for memory limit ({e}); backing off "
+                                      f"{self.SLOT_MEM_BACKOFF_S:.0f}s (refusals={refused}/{self.BGEN_REFUSALS_MAX})",
+                                      flush=True)
                         else:
                             refused += 1
                             print(f"[strata] parallel: the engine refused slot {slot} ({e}); trying another slot "
@@ -2547,6 +2584,9 @@ class StrataEngine:
                             self._park_slot(slot)
                         slot = None
                         continue
+                    # P5-5C.5: the engine took this slot's session without a memory refusal: it is ATTACHED now,
+                    # and a later request may reuse it for 0 new host RAM and 0 new VRAM (see pick_slot).
+                    self._slot_attached.add(slot)
                     cont = bool(self._ctl_result and self._ctl_result[1])
                     admission_pending = cont
                     phase = "slot" if cont else "none"
@@ -2833,6 +2873,15 @@ class StrataEngine:
             free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
+        # P5-5C.5: while a memory backoff is live, an already-ATTACHED free slot goes first: the engine
+        # holds its session, so reusing it costs 0 new host RAM and 0 new VRAM, while an unattached empty
+        # slot pays a full session the guard may refuse again (the §245 burst refused slot after slot while
+        # attached slots sat idle).  Only while the backoff is active: otherwise the prefix/empty/LRU order stands.
+        attached = getattr(self, "_slot_attached", None)
+        if attached and any(t > now for t in backoff.values()):
+            att = [b for b in free if b in attached]
+            if att:
+                free = att
         gs = getattr(self, "slot_gs", 0)
         if gs > 1:
             # pipelined groups of several slots: the engine keeps no idle slot below a busy one as a conversation cache
