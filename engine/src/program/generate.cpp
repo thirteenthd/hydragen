@@ -11986,7 +11986,17 @@ int main(int argc, char** argv) {
                     int64_t lendable = 0;
                     for (int64_t c = c0; c < c1; ++c) lendable += r.mapped(c) ? 1 : 0;
                     const int64_t flex = (lendable + strata::core::qsa_cow_arena_bank()) * (int64_t) G;
-                    const int64_t slot_vram = (int64_t) xcache.slot_room(0);
+                    // P5-5B.3: what attaching one more conversation slot actually costs: its session buffers
+                    // plus its share of the arena window the boot left unattached.  (xcache.slot_room(0) is
+                    // an expert slot's ~2-3 MiB room - pricing K_active with it clamped the cap to --batch.)
+                    const int64_t cow_deferred = strata::core::qsa_cow_arena_deferred();
+                    const int64_t cow_win = strata::core::qsa_cow_arena_deferred_bytes();
+                    const strata::core::SessionState& cow_primary = stages.empty() ? ss : stages[0]->ss;
+                    const bool cow_with_rope = !(cow_primary.qsa_alloc > 0 && cow_primary.qsa_states != nullptr);
+                    const int64_t cow_sess = (int64_t) strata::core::session_bytes(
+                        g, o.max_context, K, stages.empty() ? (int64_t) 0 : stages[0]->lb,
+                        stages.empty() ? (int64_t) -1 : stages[0]->le, cow_with_rope);
+                    const int64_t slot_vram = cow_sess + (cow_deferred > 0 ? cow_win / cow_deferred : 0);
                     const int kcap = strata::core::initial_active_cap(
                         (int64_t) fb - ((int64_t) o.vram_reserve_mib << 20), flex, slot_vram,
                         o.batch > 0 ? o.batch : 1);
@@ -12125,7 +12135,8 @@ int main(int argc, char** argv) {
             if (h == 0) break;
             spare.push_back(h);
         }
-        if (!spare.empty()) {   // one run from the lowest unmapped chunk, as long as the chunks in hand reach
+        if (spare.empty()) return 0;   // P5-5B.3: nothing to take back: no table upload, no "0 slots back" log
+        {   // one run from the lowest unmapped chunk, as long as the chunks in hand reach
             int64_t cend = c_lo, need = (int64_t) spare.size();
             while (cend < c_top && need > 0) need -= r.mapped(cend++) ? 0 : 1;
             if (!r.map_range(c_lo, cend, [&]() -> strata::core::VmmChunk {
@@ -17558,6 +17569,17 @@ int main(int argc, char** argv) {
                 mem_mark("a deferred slot's turn to attach");
                 if (need <= budget && cudaMalloc(&buf, need) == cudaSuccess) {
                     strata::core::SessionState& su = *bslot_ss[0][(size_t) b];
+                    // P5-5B.3: feed the arena's bank before session_init's admission grow: the chunks the
+                    // next session's window still wants (need minus what the bank already parks).  With the
+                    // bank full, qsa_cow_arena_grow (layer.cpp) maps from g_cow_bank with zero driver
+                    // round-trip and its min-free line sees no fresh ask at all.
+                    if (cow_pool.on) {
+                        const int64_t deficit_chunks = strata::core::qsa_cow_arena_need(
+                            strata::core::qsa_cow_arena_demand(cand)) - strata::core::qsa_cow_arena_bank();
+                        if (deficit_chunks > 0)
+                            cow_lend(deficit_chunks * (int64_t) strata::core::vmm_granularity(), true,
+                                     adapt_quiesce);
+                    }
                     if (strata::core::session_init(g, o.max_context, K, buf, su, lo0, hi0, main_rope0) != 0) {
                         strata::core::session_zero(su, g, nullptr, nullptr);
                         bslot_arena[0][(size_t) b] = buf;

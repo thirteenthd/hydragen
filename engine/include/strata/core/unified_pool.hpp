@@ -24,7 +24,7 @@ struct UnifiedPoolConfig {
     int64_t min_slots = 1;              // the smallest floor the policy may pick
     double knee_pct = 86.0;             // the floor covers this % of the routed mass
     int64_t floor_override = 0;         // > 0: the floor, whatever the weights say
-    int64_t slot_vram_bytes = 0;        // one expert-cache slot's VRAM room
+    int64_t slot_vram_bytes = 0;        // one deferred conversation slot's VRAM cost: session buffers + CoW arena window
     int64_t free_above_reserve_bytes = 0;  // free VRAM above the serve reserve, at boot
     int64_t flex_bytes = 0;             // bytes the pool can move without evicting (parked chunks, slack)
     int max_batch = 1;                  // the boot --batch carve: how many streams may be active
@@ -60,8 +60,9 @@ inline int64_t expert_floor_from_weights(const std::vector<double>& sorted_desc_
 }
 
 /// How many streams the boot may start active: one always fits (its own buffers were priced), each
-/// further one costs a slot's worth of lendable VRAM (a slot's expert moves out, its room is the
-/// session's).  Never above `max_batch`, never below 1.
+/// further one costs a deferred conversation slot's VRAM (`slot_vram_bytes`: its session buffers plus
+/// its CoW arena window, paid for by chunks the expert cache lends).  Never above `max_batch`, never
+/// below 1.
 inline int initial_active_cap(int64_t free_above_reserve_bytes, int64_t flex_bytes,
                               int64_t slot_vram_bytes, int max_batch) {
     if (max_batch < 1) max_batch = 1;
