@@ -2537,6 +2537,14 @@ class StrataEngine:
                         if not (self._ctl_erred and str(e).startswith("BGEN:") and left >= 1 and not cancel.is_set()):
                             raise
                         mem_refused = "session unavailable" in str(e)
+                        # P5-5D.9: the BGEN was refused and nothing was read: drop this admission's live card
+                        # (set to state "reading", prompt_read 0 just before the BGEN) NOW, under slot_cv,
+                        # before the backoff / slot_cv nap / control re-take below.  While it stood, /metrics
+                        # showed the refused slot as a ghost "Reading (0%)" card and the header counted it
+                        # Active (the "6 / 3 Active" burst); the clear at the retry tail comes too late for
+                        # the nap path, which can wait there for as long as the request lives.
+                        with self.slot_cv:
+                            self.slot_live[slot] = None
                         if mem_refused:
                             with self.slot_cv:
                                 self.slot_claims.discard(slot)

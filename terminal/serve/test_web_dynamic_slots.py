@@ -28,6 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.server import ByteTokenizer, Service, StrataEngine  # noqa: E402
+from serve.test_kcap_admission import batched_engine  # noqa: E402  (the fake BGEN-answering engine)
 
 ROOT = Path(__file__).resolve().parents[1]
 WEB = ROOT / "serve" / "web"
@@ -190,6 +191,46 @@ class MetricsLiveTest(unittest.TestCase):
             self.assertNotIn(key, live)                 # the panel only exists for a batch engine
 
 
+class BgenRefusalGhostTest(unittest.TestCase):
+    """P5-5D.9: a refused BGEN must not leave its live card behind.  The admission sets slot_live[slot] to
+    state "reading", prompt_read 0 just before sending the BGEN; while the request backs off or naps on
+    slot_cv after a memory refusal, that ghost showed in /metrics as a "Reading (0%)" card and inflated
+    the Active count (the "6 / 3 Active" burst)."""
+
+    def test_memory_refusal_clears_slot_live_before_the_nap(self):
+        e = batched_engine(8, attached={0})
+        e.slot_busy[0] = True                       # one slot in flight: the request naps, never burns the budget
+        e.slot_releasing = {0}
+        cancel = threading.Event()
+        err = []
+
+        def drive():
+            try:
+                for _ in e.generate_batched([1, 2, 3], 10, None, cancel):
+                    pass
+            except BaseException as ex:             # noqa: BLE001 - the test reads it
+                err.append(ex)
+
+        t = threading.Thread(target=drive, daemon=True)
+        t.start()
+        deadline = time.time() + 10.0
+        while time.time() < deadline and not e.proc.refused:
+            time.sleep(0.02)
+        self.assertTrue(e.proc.refused, "the fake engine never refused a BGEN")
+        refused = e.proc.refused[0]
+        time.sleep(0.3)                             # the handler sits in its 1 s slot_cv nap: the ghost window
+        self.assertIsNone(e.slot_live[refused])     # cleared before the nap, not only at the retry tail
+        svc = Service(e, ByteTokenizer(), ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        ghosts = [s for s in svc.metrics()["live"]["slots"] if s["state"] == "reading"]
+        self.assertEqual(ghosts, [])                # no ghost "Reading (0%)" card in /metrics
+        cancel.set()
+        with e.slot_cv:
+            e.slot_cv.notify_all()
+        t.join(timeout=10.0)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(err, [])                   # the cancelled wait ends clean, no GpuBusy
+
+
 JS_HARNESS = r"""
 const fs = require("fs");
 const src = fs.readFileSync(process.argv[2], "utf8");
@@ -335,6 +376,38 @@ class WebDynamicSlots(unittest.TestCase):
         out = self.run_scenarios({"s": {"frames": [[live, ENG, {}]]}})["s"]
         self.assertEqual(out["els"]["slot-restored-badge-0"]["text"], "Restored · Storage")
 
+    def test_a_cache_restore_reads_as_ram(self):
+        # P5-5D.9: warm in-slot reuse (restored_from "cache") is KV already in RAM like a parked restore:
+        # the badge must read "Restored · RAM", not a bare "Restored" (the slot-0 report that looked unlabelled).
+        live = base_live(state="generating", running=1,
+                         slots=slots([("decoding", {"state": "decoding", "generated": 30,
+                                                    "restored_tokens": 1200, "restored_from": "cache"}),
+                                      ("idle", {}), ("idle", {}), ("idle", {})]))
+        out = self.run_scenarios({"s": {"frames": [[live, ENG, {}]]}})["s"]
+        self.assertEqual(out["els"]["slot-restored-badge-0"]["text"], "Restored · RAM")
+
+    def test_a_waiting_reading_slot_shows_no_prefill_rate(self):
+        # P5-5D.9: slot 1 waits at 0 / 900 toks while slot 0 prefills: the waiting card shows "–", never
+        # the other slot's live rate (live.prefill_tok_s_mean mirrored onto every reading card).
+        live = base_live(state="reading", running=2, prefill_tok_s_mean=800,
+                         slots=slots([("reading", {"state": "reading", "prompt_tokens": 900, "prompt_read": 450}),
+                                      ("reading", {"state": "reading", "prompt_tokens": 900, "prompt_read": 0}),
+                                      ("idle", {}), ("idle", {})]))
+        out = self.run_scenarios({"s": {"frames": [[live, ENG, {}]]}})["s"]
+        self.assertEqual(out["els"]["slot-prefill-1"]["text"], "–")
+        self.assertIn("800", out["els"]["slot-prefill-0"]["html"])   # the slot that IS reading still shows the rate
+
+    def test_the_active_badge_never_shows_a_smaller_denominator(self):
+        # P5-5D.9: K_active stepped down to 3 while four admitted streams are still finishing: the badge
+        # must never read "4 / 3 Active" - the denominator is at least the streams shown.
+        live = base_live(state="generating", running=4, k_active=3,
+                         slots=slots([("decoding", {"state": "decoding", "generated": 10}),
+                                      ("decoding", {"state": "decoding", "generated": 20}),
+                                      ("decoding", {"state": "decoding", "generated": 30}),
+                                      ("decoding", {"state": "decoding", "generated": 40})]))
+        out = self.run_scenarios({"s": {"frames": [[live, ENG, {}]]}})["s"]
+        self.assertEqual(out["els"]["slots-active-badge"]["text"], "4 / 4 Active (Max 8) · SLA 25 t/s")
+
     def test_a_burst_past_k_active_queues(self):
         live = base_live(state="generating", running=2, waiting=3,
                          slots=slots([("decoding", {"state": "decoding", "generated": 10}),
@@ -368,7 +441,7 @@ class WebDynamicSlots(unittest.TestCase):
         self.assertEqual(out["els"]["st-badge-solo"]["text"], "Decoding")
         self.assertIn("42.5", out["els"]["slot-decode-solo"]["html"])
         self.assertEqual(out["els"]["slot-tokens-solo"]["text"], "900 restored · 17 generated")
-        self.assertEqual(out["els"]["slot-restored-badge-solo"]["text"], "Restored")
+        self.assertEqual(out["els"]["slot-restored-badge-solo"]["text"], "Restored · RAM")   # P5-5D.9: in-RAM reuse
         self.assertIn("Slot 1", out["html"][0])               # P5-5D.7: the card is named Slot 1, not "Solo"
 
     def test_a_solo_read_shows_its_prompt_progress(self):
@@ -672,7 +745,9 @@ class PageSource(unittest.TestCase):
     def test_the_k_active_header(self):
         self.assertIn("const kActive = (live && live.k_active > 0) ? live.k_active : maxSlots;", self.app)
         self.assertIn("const kMax = (live && live.k_max > 0) ? live.k_max : maxSlots;", self.app)
-        self.assertIn("${curConcurrency} / ${kActive} Active (Max ${kMax})", self.app)
+        # P5-5D.9: the denominator is at least the streams shown (never "4 / 3 Active")
+        self.assertIn("const capShown = Math.max(kActive, curConcurrency);", self.app)
+        self.assertIn("${curConcurrency} / ${capShown} Active (Max ${kMax})", self.app)
 
     def test_the_restored_breakdown_rendering(self):
         self.assertIn('"Restored · RAM"', self.app)

@@ -678,8 +678,11 @@ function renderConcurrency(live, eng, hw) {
     }
     const prefEl = $(`slot-prefill-${i}`);
     if (prefEl) {
-      if (sState === "reading" && sInfo.prefill_tok_s) prefEl.innerHTML = `${fmt(sInfo.prefill_tok_s)}<small>t/s</small>`;
-      else if (sState === "reading" && live.prefill_tok_s_mean) prefEl.innerHTML = `${fmt(live.prefill_tok_s_mean)}<small>t/s</small>`;
+      // P5-5D.9: a slot still waiting at 0 / N toks must not mirror another slot's prefill rate: the live
+      // rate shows only while THIS slot has actually read prompt tokens (or carries its own rate, the solo card).
+      const readingLive = sState === "reading" && ((sInfo.prompt_read || 0) > 0 || sInfo.prefill_tok_s > 0);
+      if (readingLive && sInfo.prefill_tok_s) prefEl.innerHTML = `${fmt(sInfo.prefill_tok_s)}<small>t/s</small>`;
+      else if (readingLive && live.prefill_tok_s_mean) prefEl.innerHTML = `${fmt(live.prefill_tok_s_mean)}<small>t/s</small>`;
       else prefEl.textContent = "–";
     }
     const trackEl = $(`slot-track-${i}`);
@@ -714,7 +717,10 @@ function renderConcurrency(live, eng, hw) {
       if (rt > 0) {
         const from = sInfo.restored_from;
         restBadgeEl.hidden = false;
-        restBadgeEl.textContent = from === "parked" ? "Restored · RAM" : from === "disk" ? "Restored · Storage" : "Restored";
+        // P5-5D.9: "cache" is warm in-slot reuse - KV already in RAM like a parked restore - so it reads
+        // "Restored · RAM" too; only a bare (source-less) restore keeps the plain label.
+        restBadgeEl.textContent = (from === "parked" || from === "cache") ? "Restored · RAM"
+          : from === "disk" ? "Restored · Storage" : "Restored";
       } else {
         restBadgeEl.hidden = true;
       }
@@ -789,7 +795,10 @@ function renderConcurrency(live, eng, hw) {
   if (activeBadge) {
     // P5-5D: the dynamic cap: K_active streams admitted now of the K_max the pool can lend (Max), plus the
     // --min-stream-tps SLA floor the governor flexes K under when one is configured
-    activeBadge.textContent = `${curConcurrency} / ${kActive} Active (Max ${kMax})` +
+    // P5-5D.9: K_active can step down while admitted streams are still finishing: the denominator never
+    // reads smaller than the streams shown, so the badge cannot say "4 / 3 Active".
+    const capShown = Math.max(kActive, curConcurrency);
+    activeBadge.textContent = `${curConcurrency} / ${capShown} Active (Max ${kMax})` +
       (minTps > 0 ? ` · SLA ${fmt(minTps, minTps % 1 ? 1 : 0)} t/s` : "");
     activeBadge.className = curConcurrency > 0 ? "st-badge st-badge--generating" : "st-badge";
   }
