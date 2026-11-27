@@ -431,6 +431,8 @@ void ParkDisk::init(const Options& o, IdentityFn identity, LimitsFn limits) {
             en.file_bytes = v2bytes;
             en.bytes = v2bytes;
             en.blob_keys = std::move(v2keys);
+            en.ckpt_lens = ckpt_lengths(v2img.checkpoints);   // P5-5C.11: resumable depths from the file's chain
+            en.live_has_imgs = !v2img.live.imgs.empty();
             en.ids = std::move(v2img.live.ids);
             en.view_parents = v2vf.parents_seen;   // M-C6b: boot derives the pins from the table itself.
                        // Without this an INHERITED parent carries zero protection: view_refs only ever
@@ -488,6 +490,8 @@ void ParkDisk::init(const Options& o, IdentityFn identity, LimitsFn limits) {
         if (en.serial >= next_serial_) next_serial_ = en.serial + 1;
         en.path = path;
         en.bytes = bytes;
+        en.ckpt_lens = ckpt_lengths(image.checkpoints);   // P5-5C.11: resumable depths from the file's chain
+        en.live_has_imgs = !image.live.imgs.empty();
         en.ids = std::move(image.live.ids);
         en.cvec = image.cvec;
         en.done = true;
@@ -579,6 +583,8 @@ void ParkDisk::spill(SavedConversation&& image, int64_t cache_serial) {
     en.serial = next_serial_++;
     en.path = pd_tier_path(dir_, en.serial);
     en.bytes = n;
+    en.ckpt_lens = ckpt_lengths(image.checkpoints);   // P5-5C.11: BEFORE the image moves to the writer
+    en.live_has_imgs = !image.live.imgs.empty();
     en.ids = image.live.ids;      // the key stays serve-side; the worker owns its own copy of the image
     en.cvec = image.cvec;
     en.spilled_at = std::chrono::steady_clock::now();

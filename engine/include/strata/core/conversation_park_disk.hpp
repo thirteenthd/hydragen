@@ -113,6 +113,46 @@ public:
         return best;
     }
 
+    // P5-5C.11: the deepest RESUMABLE start the tier can give this prompt. A hybrid GDN+QSA session can
+    // only continue at a conversation's live end (its whole chain restored, and STRICTLY shorter than
+    // the prompt: the last prompt token always starts the next verify window) or at one of its
+    // checkpoints - exactly ConversationCache::best()'s rule for the RAM tier. best()'s raw token
+    // overlap is NOT resumable: a 74K entry sharing 33,140 tokens with no checkpoint at 33,140 would pay
+    // a multi-second read to resume at 0, and a 40-token system-prompt overlap would pay a 1.5 GiB read
+    // for nothing. Ties prefer the newer entry, like ConversationCache::best().
+    struct ResumableMatch {
+        uint64_t serial = 0;
+        int64_t tokens = 0;
+        bool live = false;
+    };
+
+    template<class Token>
+    ResumableMatch best_resumable(const std::vector<Token>& prompt,
+                                  const std::vector<ConversationImageKey>& images, bool cvec) {
+        ResumableMatch best;
+        drain_finished();
+        if (dir_.empty() || prompt.empty() || !images.empty()) return best;   // pictures: fail closed
+        for (const auto& e : entries_) {
+            if (!e.done || e.cvec != cvec) continue;
+            const size_t m = std::min(e.ids.size(), prompt.size());
+            int64_t n = 0;
+            while (n < (int64_t) m && (int64_t) e.ids[(size_t) n] == (int64_t) prompt[(size_t) n]) ++n;
+            int64_t r = 0;
+            bool is_live = false;
+            if (!e.live_has_imgs && !e.ids.empty() && e.ids.size() < prompt.size() && n == (int64_t) e.ids.size()) {
+                r = (int64_t) e.ids.size();
+                is_live = true;
+            } else {
+                for (int64_t L : e.ckpt_lens) {
+                    if (L > n || L >= (int64_t) prompt.size()) break;   // sorted ascending
+                    r = L;
+                }
+            }
+            if (r > best.tokens || (r > 0 && r == best.tokens)) best = {e.serial, r, is_live};
+        }
+        return best;
+    }
+
     // Re-reads the matched file (identity, limits, payload hash - all of it). Null on any failure; a file that
     // fails VALIDATION is deleted from the tier, a file that merely could not be read (RAM preflight, io) is
     // kept for a later turn. The caller restores the image through conversation_snapshot_validate/restore.
@@ -153,6 +193,12 @@ private:
         size_t bytes = 0;
         std::vector<int32_t> ids;   // the spilled live state's tokens: the prefix-match key
         bool cvec = true;
+        // P5-5C.11: what best_resumable() can actually mount: the image's resumable checkpoint depths
+        // (picture-free, non-empty, sorted ascending, deduplicated) and whether its live state carries
+        // pictures (then it is never resumable). Rebuilt from the file's own chain at every Entry
+        // creation: init()'s v2/v1 boot walk and spill().
+        std::vector<int64_t> ckpt_lens;
+        bool live_has_imgs = false;
         std::vector<PdKey> blob_keys;   // v2: the file's blob blocks with duplicates (one refcount step per occurrence)
         size_t file_bytes = 0;          // v2: the real .ses footprint once written (the spill estimate is RAM-sized)
         bool done = false;          // the rename landed: matchable
@@ -207,6 +253,15 @@ private:
     static bool file_is_v2(const std::string& path);
     std::string blob_path(const PdKey& k) const;
     void release_entry(const Entry& e);   // drop this entry's chunk refs (unlink at the last holder)
+    // P5-5C.11: the resumable checkpoint depths of an image (see Entry::ckpt_lens).
+    static std::vector<int64_t> ckpt_lengths(const std::vector<ConversationCheckpoint>& cks) {
+        std::vector<int64_t> out;
+        for (const auto& c : cks)
+            if (c.imgs.empty() && !c.ids.empty()) out.push_back((int64_t) c.ids.size());
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
+    }
     void drain_finished();          // mark done / drop failed, at the top of every serve-thread call
     void writer();                  // one file at a time; serialized for LRU truth and disk bandwidth
     bool free_guard_ok(size_t incoming) const;   // statvfs against min_free

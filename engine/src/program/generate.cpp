@@ -20549,9 +20549,9 @@ int main(int argc, char** argv) {
             // every RAM entry is read back (the session RESTORE's limits and RAM check); one that does not read back is dropped
             // and the RAM tier's choice stands.  Never borrowed from (it comes back whole).
             static const bool deep_resume = hg_getenv("STRATA_RESUME_DEEPEST") != nullptr;
-            decltype(park_disk.best(ids, req_imgs, want_cvec)) disk_best;
+            decltype(park_disk.best_resumable(ids, req_imgs, want_cvec)) disk_best;
             if (deep_resume && park_disk.enabled())
-                disk_best = park_disk.best(ids, req_imgs, want_cvec);
+                disk_best = park_disk.best_resumable(ids, req_imgs, want_cvec);
             bool from_ssd = false;
             strata::core::ConversationCache::Match taken = parked;   // the match whose image is restored: RAM's, or the SSD tier's
             // 2c: a conversation the background writer still holds is still in RAM: when it serves this prompt best it is taken
@@ -20632,8 +20632,12 @@ int main(int argc, char** argv) {
                 }
             }
             const int64_t ram_or_slot = std::max(resume, slot_tokens);
-            const bool disk_wins = !from_ssd && deep_resume && disk_best.tokens > parked.tokens &&
-                                   disk_best.tokens > ram_or_slot;   // M-C9
+            // P5-5C.11: a synchronous NVMe read on the serve thread must PAY for itself: require a real
+            // gain over the RAM/slot start before loading a disk image (the RAM cache's own park floor,
+            // min 1: --conversation-cache-min-tokens 0 keeps the tier alive for tiny conversations).
+            const int64_t min_disk_gain = std::max<int64_t>(1, o.conversation_cache_min_tokens);
+            const bool disk_wins = !from_ssd && deep_resume &&
+                                   disk_best.tokens >= std::max(parked.tokens, ram_or_slot) + min_disk_gain;   // M-C9
             bool borrow = !from_ssd && stages.empty() && parked.tokens > ram_or_slot && !disk_wins &&
                           conversations.borrows(parked);
             if (!from_ssd && parked.tokens > ram_or_slot && !borrow && !disk_wins)
@@ -20641,8 +20645,8 @@ int main(int argc, char** argv) {
             bool from_disk = false;
             const int64_t disk_gate = deep_resume ? std::max(ram_or_slot, parked.tokens) : ram_or_slot;
             if (!incoming && !borrow && !from_ssd && (deep_resume || parked.tokens <= ram_or_slot) && park_disk.enabled()) {
-                const auto d = deep_resume ? disk_best : park_disk.best(ids, req_imgs, want_cvec);
-                if (d.tokens > disk_gate) {
+                const auto d = deep_resume ? disk_best : park_disk.best_resumable(ids, req_imgs, want_cvec);
+                if (d.tokens > disk_gate && d.tokens - disk_gate >= min_disk_gain) {   // P5-5C.11: minimum gain
                     std::string derr;
                     static const bool pd_delta = [] {
                         const char* v = hg_getenv("STRATA_PARK_DELTA");
@@ -20659,7 +20663,8 @@ int main(int argc, char** argv) {
                                 dn_list.push_back(dn2);
                             }
                     }
-                    auto img = park_disk.load(d, derr, dn_list.empty() ? nullptr : &dn_list);
+                    auto img = park_disk.load(strata::core::ParkDisk::Match{d.serial, d.tokens}, derr,
+                                              dn_list.empty() ? nullptr : &dn_list);
                     if (dn_guarded) conversations.unguard();
                     if (img) {
                         static const bool pd_cow = [] {
@@ -21181,14 +21186,29 @@ int main(int argc, char** argv) {
                 cvec_cached = incoming->cvec;
                 resume = taken.tokens;   // (parked.tokens unless the image came from the SSD tier)
                 from_live = taken.live;
-                if (deep_resume && from_disk) {
-                    // The disk image's own chain is the only one its restored K/V backs: mount strictly
-                    // at its depths (a RAM match's depth may sit between two of them, and the live
-                    // label belongs to a copy that was never taken).
+                if (from_disk) {
+                    // P5-5C.11: the disk image's own chain is the only one its restored K/V backs: mount
+                    // strictly at its depths, whatever STRATA_RESUME_DEEPEST says (it is OFF by default,
+                    // and taken.tokens was the RAM match's - 0 on a RAM miss - so the old code resumed
+                    // every disk restore at 0, session_zero'd below and re-prefilled the whole prompt:
+                    // 228 s of synchronous reads thrown away). Recompute the resume point from the
+                    // restored image itself: its live end first, then its deepest matching checkpoint.
                     resume = 0;
                     from_live = false;
+                    strata::core::ConversationCheckpoint live_ck;
+                    live_ck.ids = live;
+                    live_ck.imgs = live_imgs;
+                    const int64_t lv = strata::core::conversation_prefix(live_ck, ids, req_imgs);
+                    if (lv > 0) {
+                        resume = lv;
+                        from_live = true;
+                    }
+                    for (const ConvCheckpoint& k : checks) {
+                        const int64_t ck = strata::core::conversation_prefix(k, ids, req_imgs);
+                        if (ck > resume) { resume = ck; from_live = false; }
+                    }
                 }
-                if (deep_resume && !from_live) {
+                if (deep_resume && !from_live && !from_disk) {
                     int64_t best_d = resume;
                     for (ConvCheckpoint& k : checks) {
                         const int64_t L = (int64_t) k.ids.size();

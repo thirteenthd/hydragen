@@ -754,6 +754,75 @@ check(imgA.has_value() && same(*imgA, Lcopy), "s5c: RAM-twin restore is byte-ide
     }
     fs::remove_all(dir8);
 
+    // ================= P5-5C.11: checkpoint-aware best_resumable =================
+    // A hybrid GDN+QSA session can only continue at the live end (STRICTLY shorter than the prompt:
+    // the last prompt token must start the verify window) or at one of its checkpoints. best()'s raw
+    // token overlap overpromises: the read is paid and the restore resumes at 0. Entry E: live =
+    // 10,000 tokens, checkpoints at 2,048 and 4,096 (checkpoint()'s ids are 1000+i, a prefix of
+    // make_image's live ids - the seed only changes the state bytes).
+    const fs::path dir11 = fs::temp_directory_path() / "mc5_boot_test_store_5c11";
+    std::vector<int32_t> p_eq, p_ext, p_div, p_short;
+    for (int32_t i = 0; i < 10000; ++i) p_ext.push_back(int32_t(1000 + i));
+    p_eq = p_ext;
+    for (int32_t t = 0; t < 2000; ++t) p_ext.push_back(int32_t(700000 + t));   // 12,000: extends live
+    p_div = p_eq;
+    p_div.resize(8000);
+    for (size_t i = 4500; i < p_div.size(); ++i) p_div[i] = int32_t(900000 + (int32_t) i);   // diverge at 4,500
+    for (size_t i = 0; i < 600; ++i) p_short.push_back(i < 500 ? int32_t(1000 + (int32_t) i) : int32_t(900000 + (int32_t) i));
+    const auto check_5c11 = [&](ParkDisk& pd, const char* arm) {
+        auto r = pd.best_resumable(p_eq, {}, false);
+        check(r.tokens == 4096 && !r.live, (std::string(arm) + ": equal-length prompt resumes at the 4096 checkpoint, not live").c_str());
+        r = pd.best_resumable(p_ext, {}, false);
+        check(r.tokens == 10000 && r.live, (std::string(arm) + ": prompt past live resumes at live (10,000)").c_str());
+        r = pd.best_resumable(p_div, {}, false);
+        check(r.tokens == 4096 && !r.live, (std::string(arm) + ": divergence at 4,500 falls back to the 4,096 checkpoint").c_str());
+        check(pd.best(p_div, {}, false).tokens == 4500, (std::string(arm) + ": best() unchanged: raw overlap still 4,500").c_str());
+        r = pd.best_resumable(p_short, {}, false);
+        check(r.tokens == 0, (std::string(arm) + ": 500 shared tokens below the first checkpoint: zero resumable").c_str());
+        r = pd.best_resumable(p_ext, {ConversationImageKey{0, 1234}}, false);
+        check(r.tokens == 0, (std::string(arm) + ": picture-carrying request never matches the tier").c_str());
+    };
+    fs::remove_all(dir11);
+    fs::create_directories(dir11);
+    {
+        SavedConversation E = make_image(91, 10000);
+        E.checkpoints.push_back(checkpoint(2048, 92));
+        E.checkpoints.push_back(checkpoint(4096, 93));
+        ParkDisk pd;
+        pd.init(ParkDisk::Options{dir11.string(), 0, 0, true}, ident(M1, C1), ok_limits());
+        g_pd = &pd;
+        pd.spill(SavedConversation(E), -1);
+        wait_for([&] { return list_ses(dir11).size() == 1; }, "5c11 v2: E published");
+        check_5c11(pd, "5c11 v2 in-boot");
+        g_pd = nullptr;
+    }
+    {   // cross-boot reopen: ckpt_lens and live_has_imgs rebuilt from the file's own chain (v2)
+        ParkDisk pd;
+        pd.init(ParkDisk::Options{dir11.string(), 0, 0, true}, ident(M1, C1), ok_limits());
+        check(pd.entries() == 1, "5c11 v2: the entry re-indexed on boot");
+        check_5c11(pd, "5c11 v2 cross-boot");
+    }
+    fs::remove_all(dir11);
+    fs::create_directories(dir11);
+    {
+        SavedConversation E = make_image(95, 10000);
+        E.checkpoints.push_back(checkpoint(2048, 96));
+        E.checkpoints.push_back(checkpoint(4096, 97));
+        ParkDisk pd;
+        pd.init(ParkDisk::Options{dir11.string(), 0, 0, false}, ident(M1, C1), ok_limits());
+        g_pd = &pd;
+        pd.spill(SavedConversation(E), -1);
+        wait_for([&] { return list_ses(dir11).size() == 1; }, "5c11 v1: E published");
+        g_pd = nullptr;
+    }
+    {   // the same through the v1 boot walk
+        ParkDisk pd;
+        pd.init(ParkDisk::Options{dir11.string(), 0, 0, false}, ident(M1, C1), ok_limits());
+        check(pd.entries() == 1, "5c11 v1: the entry re-indexed on boot");
+        check_5c11(pd, "5c11 v1 cross-boot");
+    }
+    fs::remove_all(dir11);
+
     std::printf("park_disk_boot_test: %d checks passed\n", checks);
     fs::remove_all(dir);
     fs::remove_all(dir1);
