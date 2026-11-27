@@ -1113,6 +1113,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   if (ramPct > 92) $("ram-progress").dataset.tone = "danger"; else delete $("ram-progress").dataset.tone;
   $("temp-text").textContent = hw.gpu_temp == null ? "–" : `${fmt(hw.gpu_temp)} °C`;
   $("temp-bar").style.width = hw.gpu_temp == null ? "0%" : `${Math.min(100, hw.gpu_temp)}%`;
+  renderResFacts(live, eng);
 
   // recent requests
   const body = $("req-body");
@@ -1146,6 +1147,23 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   all.textContent = reqShowAll ? "Show fewer" : `Show all (${kept})`;
   $("req-wrap").classList.toggle("all", reqShowAll);
   $("req-totals").textContent = renderTotals(totals);
+}
+
+// P5-5D.8: the active runtime config under the Resource Stats bars: the window every stream shares, the
+// SLA floor the DecodeGovernor flexes K under (0 = auto), and the cap itself - the engine's dynamic
+// K_active of k_max once it has said KCAP, else the static slot count. KV quant comes from the engine's
+// own INFO line (m.engine), so no server change is needed for it.
+function renderResFacts(live, eng) {
+  if (!$("res-facts")) return;
+  const minTps = (live && live.min_stream_tps) || 0;
+  const capSlots = eng.batch_slots || eng.parallel || (live && live.parallel) || 0;
+  facts($("res-facts"), [
+    ["Context window", eng.max_context ? `${ctxfmt(eng.max_context)} (${fmt(eng.max_context)} tok)` : null],
+    ["Decode floor", minTps > 0 ? `${fmt(minTps, minTps % 1 ? 1 : 0)} tok/s` : "Auto (0 tok/s)"],
+    ["Concurrency cap", live && live.k_active && live.k_max ? `K=${fmt(live.k_active)} / ${fmt(live.k_max)} slots`
+                         : capSlots ? `${fmt(capSlots)} slots` : null],
+    ["KV quant", eng.kv ? ({int8: "8-bit", q4_0: "4-bit", fp16: "16-bit"})[eng.kv] || eng.kv : null],
+  ]);
 }
 
 function facts(el, rows) {

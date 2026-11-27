@@ -136,6 +136,7 @@ main { flex: 1; min-height: 0; display: flex; }
 /* the RAM and disk cache cards pair up when there is room (disk card hidden = RAM keeps the row) */
 .cache-pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(430px, 100%), 1fr)); gap: var(--st-s-4); }
 .ctx-card { display: flex; flex-direction: column; gap: var(--st-s-2); }
+#res-facts { margin-top: var(--st-s-2); }   /* P5-5D.8: the config strip sits clear of the temperature bar */
 .ctx-gauge { position: relative; width: 150px; max-width: 100%; aspect-ratio: 1; height: auto; margin: var(--st-s-2) auto var(--st-s-3); }
 .ctx-gauge .st-gauge { width: 100%; height: 100%; }
 .ctx-gauge .st-gauge__fill { transition: stroke-dasharray 400ms var(--st-ease), stroke-dashoffset 400ms var(--st-ease); }

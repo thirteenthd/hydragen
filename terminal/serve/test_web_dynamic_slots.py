@@ -471,6 +471,87 @@ class WebParkDiskBar(unittest.TestCase):
         self.assertEqual(out["text"], "2.0 / 4.0 GB")
 
 
+JS_HARNESS_RES = r"""
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[2], "utf8");
+const start = src.indexOf("function renderResFacts(live, eng) {");
+const end = src.indexOf("function facts(el, rows) {");
+if (start < 0 || end < 0) { console.error("markers not found"); process.exit(2); }
+const fmt = (n, d = 0) => (n == null || Number.isNaN(n) ? "\u2013" : Number(n).toLocaleString(undefined, {maximumFractionDigits: d, minimumFractionDigits: d}));
+const kfmt = (n) => (n == null ? "\u2013" : n >= 1000 ? `${fmt(n / 1000, n >= 10000 ? 0 : 1)}k` : fmt(n));
+const ctxfmt = (n) => (n && n % 1024 === 0 ? `${fmt(n / 1024)}K` : kfmt(n));
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const facts = (el, rows) => { el.innerHTML = rows.filter((r) => r[1] != null && r[1] !== "").map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join(""); };
+const scenarios = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+const out = {};
+for (const [name, sc] of Object.entries(scenarios)) {
+  const els = {};
+  function mkEl(tag) {
+    let html = "";
+    return { tag, id: "", className: "", hidden: false, style: {}, dataset: {}, children: [],
+      get innerHTML() { return html; },
+      set innerHTML(v) { html = v; this.children.length = 0; },
+      appendChild(c) { this.children.push(c); return c; } };
+  }
+  const $ = (id) => (els[id] ||= Object.assign(mkEl("div"), {id}));
+  const document = { createElement: (t) => mkEl(t) };
+  const f = new Function("fmt", "ctxfmt", "facts", "$", "document",
+    src.slice(start, end) + "; return {renderResFacts};");
+  f(fmt, ctxfmt, facts, $, document).renderResFacts(sc.live, sc.eng);
+  out[name] = {html: $("res-facts").innerHTML};
+}
+console.log(JSON.stringify(out));
+"""
+
+
+def res_frame(live, eng):
+    return {"live": live, "eng": eng}
+
+
+@unittest.skipUnless(NODE, "node is needed to run the page's own code")
+class WebResFactsStrip(unittest.TestCase):
+    """P5-5D.8: the Resource Stats card's config strip - context window, decode floor, concurrency cap."""
+
+    def run_res(self, scenarios):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(scenarios, f)
+            path = f.name
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as f:
+            f.write(JS_HARNESS_RES)
+            harness = f.name
+        try:
+            done = subprocess.run([NODE, harness, str(WEB / "app.js"), path],
+                                  capture_output=True, text=True, encoding="utf-8", timeout=60, check=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+            Path(harness).unlink(missing_ok=True)
+        return json.loads(done.stdout)
+
+    def test_the_strip_shows_the_active_config(self):
+        out = self.run_res({"s": res_frame(
+            {"min_stream_tps": 0.0, "k_active": 3, "k_max": 8},
+            {"max_context": 131072, "batch_slots": 8, "kv": "q4_0"})})["s"]
+        html = out["html"]
+        self.assertIn("Context window", html)
+        self.assertIn("128K (131,072 tok)", html)
+        self.assertIn("Auto (0 tok/s)", html)          # the default floor reads as auto, not as a bare 0
+        self.assertIn("K=3 / 8 slots", html)
+        self.assertIn("4-bit", html)
+
+    def test_a_configured_floor_shows_its_number(self):
+        out = self.run_res({"s": res_frame(
+            {"min_stream_tps": 25.0, "k_active": 3, "k_max": 8},
+            {"max_context": 131072})})["s"]
+        self.assertIn("25 tok/s", out["html"])
+        self.assertNotIn("Auto", out["html"])
+
+    def test_no_dynamic_cap_falls_back_to_the_static_slots(self):
+        out = self.run_res({"s": res_frame({"min_stream_tps": 0.0}, {"max_context": 8192, "batch_slots": 4})})["s"]
+        self.assertIn("8K (8,192 tok)", out["html"])
+        self.assertIn("4 slots", out["html"])
+        self.assertNotIn("K=", out["html"])
+
+
 class ParkDiskAvailTest(unittest.TestCase):
     """P5-5D.3: /metrics' park_disk carries disk_avail_bytes: the filesystem's free space minus the
     keep-free floor, plus what the tier already holds (the bar's denominator)."""
@@ -552,6 +633,14 @@ class PageSource(unittest.TestCase):
         self.assertIn('["Parked / restored"', self.app)
         self.assertIn('["Read back"', self.app)
 
+    def test_the_resource_facts_strip_is_wired_into_render_monitor(self):
+        # P5-5D.8: renderMonitor populates the strip; the strip's own rendering is exercised under node
+        # (WebResFactsStrip), so here only the wiring and the row labels need to hold in the source.
+        self.assertIn("renderResFacts(live, eng);", self.app)
+        self.assertIn('["Context window"', self.app)
+        self.assertIn('"Auto (0 tok/s)"', self.app)
+        self.assertIn("`K=${fmt(live.k_active)} / ${fmt(live.k_max)} slots`", self.app)
+
 
 class PageStyles(unittest.TestCase):
     """P5-5D.4: one colour per stream state across every graph and badge, the bar track flex in every
@@ -589,6 +678,18 @@ class PageStyles(unittest.TestCase):
         self.assertIn('<span class="card-title">Resource Stats</span>', self.html)
         for gone in ("ctx-gauge", "ctx-legend", "ctx-note"):
             self.assertNotIn(gone, self.html)
+
+    def test_the_resource_facts_strip_sits_in_the_card(self):
+        # P5-5D.8: #res-facts lives inside the Resource Stats card, below the three bars and before the
+        # next card, and the CSS keeps it clear of the temperature bar.
+        title = self.html.index('<span class="card-title">Resource Stats</span>')
+        facts = self.html.index('<dl class="facts" id="res-facts"></dl>')
+        temp = self.html.index('id="temp-bar"')
+        next_card = self.html.index('class="st-card req-card"')
+        self.assertLess(temp, facts)
+        self.assertLess(facts, next_card)
+        self.assertLess(title, facts)
+        self.assertIn("margin-top", self.rule("#res-facts {"))
 
 
 if __name__ == "__main__":
