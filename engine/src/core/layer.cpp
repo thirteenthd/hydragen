@@ -816,7 +816,7 @@ int64_t g_cow_slot_b[5] = {0};    // (dyn-conc P2) per-slot bytes of the window 
 // (dyn-conc P2 stage B) the window follows the streams actually attached: grow at admission, trim on detach.
 bool g_cow_elastic = false;        // STRATA_COW_ARENA_ELASTIC
 int64_t g_cow_floor_slots = 0;     // the boot floor: a trim never maps less than this
-int64_t g_cow_bank_mib = 0;        // STRATA_COW_ARENA_BANK_MIB: cap on parked chunks (0: no cap)
+int64_t g_cow_bank_mib = 0;        // STRATA_COW_ARENA_BANK_MIB: cap on parked chunks (0: no cap, <0: no bank at all)
 int64_t g_cow_min_free_mib = 512;  // STRATA_COW_ARENA_MIN_FREE_MIB: an elastic grow stops above this line
 int64_t g_cow_declines = 0;        // grows the line refused
 int64_t g_cow_budget_bytes = 0;    // (dyn-conc P2 stage B) the deferred sessions' reservation, priced at cache sizing
@@ -1189,15 +1189,19 @@ int64_t qsa_cow_arena_demand(int64_t cells) {
 int64_t qsa_cow_arena_bank() { return (int64_t) g_cow_bank.size(); }
 void qsa_set_cow_arena_elastic(bool on, int64_t bank_mib) {
     g_cow_elastic = on;
-    g_cow_bank_mib = bank_mib > 0 ? bank_mib : 0;
+    // P5-5B.2: >0 caps the bank in MiB; 0 keeps the legacy uncapped bank; <0 means NO bank - every freed
+    // chunk goes straight back to the driver, so a trim's VRAM reaches cudaMemGetInfo and the unified
+    // pool's cow_reclaim can take it back for the expert cache.
+    g_cow_bank_mib = bank_mib;
 }
 // (dyn-conc P2) bank park + failure counter the refusal line quotes (Stage C funder pruned).
 static int64_t g_cow_grow_fails = 0;
 void qsa_cow_arena_bank_give(strata::core::VmmChunk h) {
     const int64_t G = (int64_t) strata::core::vmm_granularity();
-    if (g_cow_bank_mib > 0 && ((int64_t) g_cow_bank.size() + 1) * G > g_cow_bank_mib * 1048576) {
+    if (g_cow_bank_mib < 0 ||
+        (g_cow_bank_mib > 0 && ((int64_t) g_cow_bank.size() + 1) * G > g_cow_bank_mib * 1048576)) {
         ++g_cow_bank_out;
-        strata::core::vmm_chunk_free(h);   // the bank is full: the driver takes the VRAM back
+        strata::core::vmm_chunk_free(h);   // the bank is off or full: the driver takes the VRAM back
         return;
     }
     g_cow_bank.push_back(h);

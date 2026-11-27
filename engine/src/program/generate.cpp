@@ -5092,12 +5092,30 @@ int main(int argc, char** argv) {
                 const char* bm = hg_getenv("STRATA_COW_ARENA_BANK_MIB");
                 const char* mf = hg_getenv("STRATA_COW_ARENA_MIN_FREE_MIB");
                 if (el != nullptr && el[0] == '1') {
-                    strata::core::qsa_set_cow_arena_elastic(true, bm != nullptr ? std::atoll(bm) : 0);
+                    // P5-5B.2: under the unified pool a parked chunk is VRAM the expert cache can never
+                    // take back (cudaMemGetInfo never sees it, so cow_reclaim starves), so with
+                    // HG_UNIFIED_POOL=1 the bank defaults OFF (-1: qsa_cow_arena_bank_give hands every
+                    // freed chunk straight to the driver).  An explicit STRATA_COW_ARENA_BANK_MIB keeps
+                    // its cap; an explicit 0 means the zero bank too - nobody sets 0 wanting an unbounded
+                    // bank; the legacy 0 = unbounded only survives when the var is unset WITHOUT
+                    // HG_UNIFIED_POOL=1.
+                    const char* up_env = hg_getenv("STRATA_UNIFIED_POOL");   // reads HG_UNIFIED_POOL first
+                    const bool unified_pool_env = up_env != nullptr && up_env[0] == '1';
+                    int64_t bank_mib = 0;
+                    if (bm != nullptr) {
+                        bank_mib = std::atoll(bm);
+                        if (bank_mib == 0) bank_mib = -1;
+                    } else if (unified_pool_env) {
+                        bank_mib = -1;
+                    }
+                    strata::core::qsa_set_cow_arena_elastic(true, bank_mib);
                     strata::core::qsa_set_cow_arena_min_free_mib(mf != nullptr ? std::atoll(mf) : 512);
                     const char* td = hg_getenv("STRATA_COW_ARENA_TRIM_DEBUG");
                     strata::core::qsa_set_cow_arena_trim_debug(td != nullptr && td[0] == '1');
                     std::fprintf(stderr, "strata generate: cow: elastic arena windows on (bank %s, grows stop above %s MiB free)\n",
-                                 bm != nullptr ? bm : "unbounded", mf != nullptr ? mf : "512");
+                                 bank_mib < 0 ? "off: freed chunks go back to the driver"
+                                              : (bm != nullptr ? bm : "unbounded"),
+                                 mf != nullptr ? mf : "512");
                     const char* cf = hg_getenv("STRATA_COW_CACHE_FUND");
                     g_cow_cache_fund = cf != nullptr && cf[0] == '1';
                     if (g_cow_cache_fund) {
@@ -16381,6 +16399,54 @@ int main(int argc, char** argv) {
                         (long long) xcache.slots(), (long long) xcache.full_slots());
             std::fflush(stdout);
         };
+    // P5-5B.2: the prompt path's loan re-fit, hoisted above cow_lend/cow_reclaim so a pool lend or
+    // reclaim re-anchors the loan with the cache's new live slots (the VRAM command's protocol:
+    // shrink/grow -> evict/refill -> relend -> residency upload).  chunk_full snapshots the chunk the
+    // loan starts from with the whole cache; relend halves it until every part's buffers fit.
+        const int64_t chunk_full = o.prefill_chunk;              // the loan's chunk with the whole cache
+        auto relend = [&]() {   // the prompt path's loan: one chunk that fits every card, each part ending at its own slots left.
+            if (pf_parts.empty()) return;
+            bool any_loan = false;
+            for (const PfPart& p : pf_parts) if (p.first >= 0) any_loan = true;
+            if (!any_loan) return;
+            auto fits_all = [&](int64_t c) {
+                for (const PfPart& p : pf_parts) {
+                    if (!p.cache || p.first < 0) continue;
+                    const int64_t live = p.cache->slots();
+                    // #6417: when an elastic grow falls at most one segment short of full_slots(), judge the soft kAutoLendPct
+                    // cap against full_slots() so --prefill auto:32768 does not stick at 16384; the hard floor still protects live.
+                    const int64_t cap_slots =
+                        (p.cache->segmented() && p.cache->segment_bytes() > 0 && p.cache->full_bytes() - p.cache->mapped_bytes() <= p.cache->segment_bytes())
+                            ? p.cache->full_slots()
+                            : live;
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+                    const int64_t k = part_slots(p, c, o.prefill_auto ? pf_fit_tail : -1);
+                    const int64_t k_floor = part_slots(p, c);
+#else
+                    const int64_t k = part_slots(p, c);
+                    const int64_t k_floor = k;
+#endif
+                    if (k <= 0 || k_floor <= 0) return false;
+                    if (g_lend_keep + k_floor > live) return false;
+                    if (o.prefill_auto && k * 100 > kAutoLendPct * cap_slots) return false;
+                }
+                return true;
+            };
+            int64_t c = chunk_full;
+            while (c > 256 && !fits_all(c)) c = std::max<int64_t>(256, c / 2 / 256 * 256);
+            o.prefill_chunk = c;
+            for (PfPart& p : pf_parts) {
+                if (!p.cache || p.first < 0) continue;
+                const int64_t live = p.cache->slots();
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+                const int64_t k = part_slots(p, c, o.prefill_auto ? pf_fit_tail : -1);
+#else
+                const int64_t k = part_slots(p, c);
+#endif
+                p.first = (int32_t) std::max<int64_t>(0, live - std::max<int64_t>(k, 0));
+                p.first_now = -1;   // laid out again at the next loan
+            }
+        };
     // P5-5B: the unified pool's lend/reclaim, placed after the prompt path's plan is known: the cache's
     // tail slots ARE the prompt path's loan buffers, so a lend floor must clear them (the serve VRAM
     // command's protocol, #533: quiesce, shrink/grow in whole segments, evict/refill the residency
@@ -16407,6 +16473,7 @@ int main(int argc, char** argv) {
         const bool shrunk = xcache.shrink(keep, e);
         cow_pool.evicted += strata::core::evict_slots_past(host_res, xcache.slots(), 0, (int64_t) g.n_layers,
                                                            g.n_expert, cow_evicted);
+        relend();   // P5-5B.2: the loan's tail moves with the cache's new live slots (the VRAM command's order)
         if (res_put(d_res) != cudaSuccess)
             std::fprintf(stderr, "strata: the residency table upload failed (unified pool lend): %s\n",
                          cudaGetErrorString(cudaGetLastError()));
@@ -16419,10 +16486,12 @@ int main(int argc, char** argv) {
         cow_pool.lent_bytes += gave;
         ++cow_pool.lends;
         std::fprintf(stderr, "strata: unified pool: the expert cache gave up %lld slots (%.2f GiB back to the "
-                             "driver for a %.2f GiB ask, %lld experts evicted to CPU; %lld of %lld slots left)\n",
+                             "driver for a %.2f GiB ask, %lld experts evicted to CPU; %lld of %lld slots left, "
+                             "prompt chunk %lld)\n",
                      (long long) (before - xcache.slots()), (double) gave / 1073741824.0,
                      (double) want_bytes / 1073741824.0, (long long) cow_pool.evicted,
-                     (long long) xcache.slots(), (long long) xcache.full_slots());
+                     (long long) xcache.slots(), (long long) xcache.full_slots(),
+                     (long long) o.prefill_chunk);
         emit_kcap();   // P5-5C.2: the pool's live slots just moved; the wrapper re-reads them
         return gave;
     };
@@ -16473,15 +16542,17 @@ int main(int argc, char** argv) {
         cow_evicted.swap(keep_out);
         if (!xcache.sync_queued(e))
             std::fprintf(stderr, "strata: the unified pool's refill failed: %s\n", e.c_str());
+        relend();   // P5-5B.2: the slots came back: the prompt chunk snaps back toward its full size
         if (res_put(d_res) != cudaSuccess)
             std::fprintf(stderr, "strata: the residency table upload failed (unified pool reclaim): %s\n",
                          cudaGetErrorString(cudaGetLastError()));
         cow_pool.refilled += refilled;
         ++cow_pool.reclaims;
         std::fprintf(stderr, "strata: unified pool: %lld slots back to the expert cache (%lld experts refilled "
-                             "from the profile), %lld of %lld slots mapped (live of full)%s\n",
+                             "from the profile), %lld of %lld slots mapped (live of full), prompt chunk %lld%s\n",
                      (long long) (live - before), (long long) refilled,
-                     (long long) live, (long long) xcache.full_slots(), grew ? "" : " (the driver had no more)");
+                     (long long) live, (long long) xcache.full_slots(),
+                     (long long) o.prefill_chunk, grew ? "" : " (the driver had no more)");
         emit_kcap();   // P5-5C.2: the pool's live slots just moved; the wrapper re-reads them
         return live - before;
     };
@@ -17099,50 +17170,6 @@ int main(int argc, char** argv) {
         // again and puts each slot's expert back (or, when the adaptive tier already brought that one back, the
         // most-routed missing expert of the same layer); the adaptive tier carries on from there.
         std::vector<std::pair<int32_t, int32_t>> vram_evicted;   // (residency index, slot) the shrinks took
-        const int64_t chunk_full = o.prefill_chunk;              // the loan's chunk with the whole cache
-        auto relend = [&]() {   // the prompt path's loan: one chunk that fits every card, each part ending at its own slots left.
-            if (pf_parts.empty()) return;
-            bool any_loan = false;
-            for (const PfPart& p : pf_parts) if (p.first >= 0) any_loan = true;
-            if (!any_loan) return;
-            auto fits_all = [&](int64_t c) {
-                for (const PfPart& p : pf_parts) {
-                    if (!p.cache || p.first < 0) continue;
-                    const int64_t live = p.cache->slots();
-                    // #6417: when an elastic grow falls at most one segment short of full_slots(), judge the soft kAutoLendPct
-                    // cap against full_slots() so --prefill auto:32768 does not stick at 16384; the hard floor still protects live.
-                    const int64_t cap_slots =
-                        (p.cache->segmented() && p.cache->segment_bytes() > 0 && p.cache->full_bytes() - p.cache->mapped_bytes() <= p.cache->segment_bytes())
-                            ? p.cache->full_slots()
-                            : live;
-#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
-                    const int64_t k = part_slots(p, c, o.prefill_auto ? pf_fit_tail : -1);
-                    const int64_t k_floor = part_slots(p, c);
-#else
-                    const int64_t k = part_slots(p, c);
-                    const int64_t k_floor = k;
-#endif
-                    if (k <= 0 || k_floor <= 0) return false;
-                    if (g_lend_keep + k_floor > live) return false;
-                    if (o.prefill_auto && k * 100 > kAutoLendPct * cap_slots) return false;
-                }
-                return true;
-            };
-            int64_t c = chunk_full;
-            while (c > 256 && !fits_all(c)) c = std::max<int64_t>(256, c / 2 / 256 * 256);
-            o.prefill_chunk = c;
-            for (PfPart& p : pf_parts) {
-                if (!p.cache || p.first < 0) continue;
-                const int64_t live = p.cache->slots();
-#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
-                const int64_t k = part_slots(p, c, o.prefill_auto ? pf_fit_tail : -1);
-#else
-                const int64_t k = part_slots(p, c);
-#endif
-                p.first = (int32_t) std::max<int64_t>(0, live - std::max<int64_t>(k, 0));
-                p.first_now = -1;   // laid out again at the next loan
-            }
-        };
         auto vram_command = [&](const std::string& cmd, std::string& e) -> bool {
             // Grammar (back-compat kept): `VRAM` = every card to start reserve; `VRAM <reserve_mib>` = every card;
             // `VRAM <reserve_mib> <dev>` = ONE card only (CUDA device id).

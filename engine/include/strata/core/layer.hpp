@@ -338,7 +338,7 @@ void qsa_cow_arena_note_deferred(int64_t demand_observed);
 int64_t qsa_cow_arena_deferred();
 int64_t qsa_cow_arena_deferred_bytes();
 bool qsa_cow_arena_elastic();
-void qsa_set_cow_arena_elastic(bool on, int64_t bank_mib);
+void qsa_set_cow_arena_elastic(bool on, int64_t bank_mib);   // bank_mib: >0 MiB cap, 0 uncapped (legacy), <0 no bank (freed chunks return to the driver)
 void qsa_cow_arena_bank_give(strata::core::VmmChunk h);   // the funder's parking route (honours the bank cap)
 strata::core::VmmChunk qsa_cow_arena_bank_take();         // the reverse leg: the cache takes a parked chunk back
 int64_t qsa_cow_arena_grow_fails();                       // grow attempts the driver could not satisfy
