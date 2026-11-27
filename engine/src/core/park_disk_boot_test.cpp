@@ -262,8 +262,11 @@ int main() {
     const ParkDisk::Options opt{dir.string(), 0, 0, true};
 
     // ---- boot 1 (identity 1): three spills; A and B identical (all chunks deduped), C a longer, different
-    // conversation (its own chunk set, sharing the identical head bytes)
+    // conversation (its own chunk set, sharing the identical head bytes). P5-5C.8: C's ids diverge at
+    // position 0 - a STRICT id-extension would now supersede-drop A and B the moment C publishes, and
+    // this arm needs three coexisting entries for the M-C5 quarantine story.
     SavedConversation origA = make_image(1, 1000), origB = make_image(1, 1000), origC = make_image(5, 1200);
+    origC.live.ids[0] = 999999;
     {
         ParkDisk pd;
         pd.init(opt, ident(M1, C1), ok_limits());
@@ -469,6 +472,8 @@ int main() {
         const SavedConversation Pcopy(P);
         SavedConversation C = make_image(22, 1000);
         C.live.ids.push_back(2000);   // a distinct child conversation over the shared head bytes
+        C.live.ids[0] = 4242;         // P5-5C.8: diverge at position 0 - a strict id-extension would
+                                      // supersede-drop the parent; this arm pins TWO coexisting entries
         for (size_t i = 0; i < C.kv.size(); ++i) {
             const size_t n = P.kv[i].k.size();
             check(C.kv[i].k.adopt_shared(P.kv[i].k, n), "v3lin: adopt_shared parent k prefix");
@@ -507,6 +512,8 @@ int main() {
         // blamed, and the restored bytes are exactly the ones that were written.
         {
             SavedConversation L = make_live_image(27, 200000);
+            L.live.ids[0] = 888888;   // P5-5C.8: not a strict extension of P's ids (that would
+                                      // supersede-drop P and break the file-count checks below)
             const SavedConversation Lcopy(L);
             pd.spill(SavedConversation(L), -1);
             wait_for([&] { return list_ses(dirv).size() == 3; }, "s5c: L published");
@@ -571,6 +578,181 @@ check(imgA.has_value() && same(*imgA, Lcopy), "s5c: RAM-twin restore is byte-ide
         g_pd = nullptr;
     }
     fs::remove_all(dirv);
+
+    // ================= P5-5C.8: housekeeping arms =================
+    // (1) from_env default budget, (2) boot-time budget trim, (3) true LRU promotion on load,
+    // (4) superseded-prefix drop on drain, (5) oversize spill guard.
+#ifdef _WIN32
+    const auto pd_setenv = [](const char* k, const char* v) { _putenv_s(k, v); };
+    const auto pd_unsetenv = [](const char* k) { _putenv_s(k, ""); };
+#else
+    const auto pd_setenv = [](const char* k, const char* v) { ::setenv(k, v, 1); };
+    const auto pd_unsetenv = [](const char* k) { ::unsetenv(k); };
+#endif
+    {
+        const fs::path envdir = fs::temp_directory_path() / "mc5_5c8_env_dir_never_touched";
+        pd_setenv("STRATA_PARK_DISK", envdir.string().c_str());
+        pd_unsetenv("STRATA_PARK_DISK_MIB");
+        auto o = ParkDisk::from_env();
+        check(o.has_value() && o->budget == (size_t) 16384 * 1024 * 1024, "5c8: unset MIB defaults to 16384 MiB");
+        pd_setenv("STRATA_PARK_DISK_MIB", "0");
+        o = ParkDisk::from_env();
+        check(o.has_value() && o->budget == 0, "5c8: explicit MIB=0 stays free-space-only");
+        pd_setenv("STRATA_PARK_DISK_MIB", "4096");
+        o = ParkDisk::from_env();
+        check(o.has_value() && o->budget == (size_t) 4096 * 1024 * 1024, "5c8: explicit MIB=4096 honored");
+        pd_unsetenv("STRATA_PARK_DISK_MIB");
+        pd_unsetenv("STRATA_PARK_DISK");
+    }
+
+    const fs::path dir8 = fs::temp_directory_path() / "mc5_boot_test_store_5c8";
+    fs::remove_all(dir8);
+    fs::create_directories(dir8);
+
+    // ---- (2) boot-time budget trim: three entries land under budget 0; a reopen whose budget fits
+    // only one entry drops the two oldest at init(), unlinks their .ses and their unreferenced chunks,
+    // and the newest entry still restores byte-identically.
+    {
+        SavedConversation A = make_image(51, 1000), B = make_image(53, 1000), C = make_image(55, 1000);
+        size_t total = 0;
+        {
+            ParkDisk pd;
+            pd.init(ParkDisk::Options{dir8.string(), 0, 0, true}, ident(M1, C1), ok_limits());
+            g_pd = &pd;
+            pd.spill(SavedConversation(A), -1);
+            wait_for([&] { return list_ses(dir8).size() == 1; }, "5c8 trim: A published");
+            pd.spill(SavedConversation(B), -1);
+            wait_for([&] { return list_ses(dir8).size() == 2; }, "5c8 trim: B published");
+            pd.spill(SavedConversation(C), -1);
+            wait_for([&] { return list_ses(dir8).size() == 3; }, "5c8 trim: C published");
+            pd.spill(SavedConversation{}, -1);   // one more drain: C's real footprint is indexed
+            total = pd.bytes();
+            g_pd = nullptr;
+        }
+        check(total > 3u * (1u << 20), "5c8 trim: three entries on disk");
+        const size_t chunks3 = list_chunks(dir8).size();
+        {
+            ParkDisk pd;
+            pd.init(ParkDisk::Options{dir8.string(), total / 2, 0, true}, ident(M1, C1), ok_limits());
+            g_pd = &pd;
+            check(pd.entries() == 1, "5c8 trim: the boot budget trim kept only the newest entry");
+            check(pd.bytes() <= total / 2, "5c8 trim: the store sits under the boot budget");
+            const std::vector<std::string> ses = list_ses(dir8);
+            check(ses.size() == 1 && ses[0] == "park-000000003.ses",
+                  "5c8 trim: the two oldest .ses unlinked, the newest survived");
+            check(list_chunks(dir8).size() < chunks3, "5c8 trim: the dropped entries' unreferenced chunks unlinked");
+            std::string error;
+            const auto m = pd.best(C.live.ids, {}, false);
+            const auto img = pd.load(m, error);
+            check(img && same(*img, C), "5c8 trim: the surviving entry restores byte-identically");
+            if (!img) std::printf("5c8 trim load error: %s\n", error.c_str());
+            g_pd = nullptr;
+        }
+    }
+
+    // ---- (3) true LRU: spill A, spill B, RESTORE A (promotion), then spill C under a budget that
+    // fits exactly two: the room loop must evict B (least recently USED), not A (first spilled).
+    // The budget is fixed at init, so boot 1 measures the footprints and boot 2 reopens with the
+    // budget: the boot trim leaves A+B alone (bytes == budget), the promotion and the eviction then
+    // happen in one boot. Distinct ids[0]: no prefix relation between the three (arm 4 must not fire).
+    fs::remove_all(dir8);
+    fs::create_directories(dir8);
+    {
+        SavedConversation A = make_image(61, 1000), B = make_image(63, 1000), C = make_image(65, 1000);
+        A.live.ids[0] = 5000;
+        C.live.ids[0] = 7000;
+        size_t estA = 0, total2 = 0;
+        {
+            ParkDisk pd;
+            pd.init(ParkDisk::Options{dir8.string(), 0, 0, true}, ident(M1, C1), ok_limits());
+            g_pd = &pd;
+            pd.spill(SavedConversation(A), -1);
+            wait_for([&] { return list_ses(dir8).size() == 1; }, "5c8 lru: A published (boot 1)");
+            estA = pd.bytes();
+            pd.spill(SavedConversation(B), -1);
+            wait_for([&] { return list_ses(dir8).size() == 2; }, "5c8 lru: B published (boot 1)");
+            pd.spill(SavedConversation{}, -1);
+            total2 = pd.bytes();
+            g_pd = nullptr;
+        }
+        ParkDisk pd;
+        pd.init(ParkDisk::Options{dir8.string(), total2 + estA / 2, 0, true}, ident(M1, C1), ok_limits());
+        g_pd = &pd;
+        check(pd.entries() == 2, "5c8 lru: the boot trim leaves A+B (bytes == budget)");
+        std::string error;
+        const auto mA = pd.best(A.live.ids, {}, false);
+        check(mA.serial == 1, "5c8 lru: A matches its own ids");
+        const auto imgA = pd.load(mA, error);
+        check(imgA && same(*imgA, A), "5c8 lru: A restores (and is promoted to MRU)");
+        pd.spill(SavedConversation(C), -1);
+        wait_for([&] { return list_ses(dir8).size() == 2; }, "5c8 lru: C published (B's .ses already unlinked)");
+        check(pd.entries() == 2, "5c8 lru: the room loop evicted exactly one entry");
+        check(pd.ids(2).empty(), "5c8 lru: TRUE LRU evicted B (never re-read), not A (restored this boot)");
+        const std::vector<std::string> ses = list_ses(dir8);
+        check(ses.size() == 2 && ses[0] == "park-000000001.ses" && ses[1] == "park-000000003.ses",
+              "5c8 lru: A and C on disk, B's .ses unlinked");
+        const auto imgA2 = pd.load(mA, error);
+        check(imgA2 && same(*imgA2, A), "5c8 lru: A still restores after the eviction");
+        const auto mC = pd.best(C.live.ids, {}, false);
+        const auto imgC = pd.load(mC, error);
+        check(imgC && same(*imgC, C), "5c8 lru: C restores byte-identically");
+        g_pd = nullptr;
+    }
+
+    // ---- (4) superseded-prefix drop: turn 1 (N tokens) publishes; turn 2 (N + delta, exact prefix,
+    // same seed so the shared head dedups) publishes; turn 1 is then dropped AUTOMATICALLY by
+    // drain_finished - no budget involved - its .ses unlinks, shared chunks stay (the byte-identical
+    // superset restore reads through them), and only turn 1's unique tail bytes leave the store.
+    fs::remove_all(dir8);
+    fs::create_directories(dir8);
+    {
+        SavedConversation T1 = make_image(71, 1000);
+        SavedConversation T2 = make_image(71, 1200);
+        const SavedConversation T2copy(T2);
+        ParkDisk pd;
+        pd.init(ParkDisk::Options{dir8.string(), 0, 0, true}, ident(M1, C1), ok_limits());
+        g_pd = &pd;
+        pd.spill(SavedConversation(T1), -1);
+        wait_for([&] { return list_ses(dir8).size() == 1; }, "5c8 sup: turn 1 published");
+        const size_t chunks_t1 = list_chunks(dir8).size();
+        check(chunks_t1 > 0, "5c8 sup: turn 1 wrote chunk files");
+        pd.spill(SavedConversation(T2), -1);
+        wait_for([&] { return pd.entries() == 1 && pd.ids(1).empty() && pd.ids(2).size() == 1200; },
+                 "5c8 sup: turn 1 auto-dropped once turn 2 published");
+        check(pd.drops() == 1, "5c8 sup: exactly one superseded drop");
+        const std::vector<std::string> ses = list_ses(dir8);
+        check(ses.size() == 1 && ses[0] == "park-000000002.ses", "5c8 sup: the superseded .ses unlinked");
+        std::string error;
+        const auto m = pd.best(T2.live.ids, {}, false);
+        check(m.tokens == (int64_t) T2.live.ids.size(), "5c8 sup: the superset matches");
+        const auto img = pd.load(m, error);
+        check(img && same(*img, T2copy), "5c8 sup: the superset restores byte-identically (shared chunks intact)");
+        if (!img) std::printf("5c8 sup load error: %s\n", error.c_str());
+        g_pd = nullptr;
+    }
+
+    // ---- (5) oversize guard: an image alone above the budget is SKIPPED (skip line for
+    // server.py's ParkDiskLog.SKIP) and the existing entries survive untouched.
+    fs::remove_all(dir8);
+    fs::create_directories(dir8);
+    {
+        SavedConversation S = make_image(81, 1000);
+        SavedConversation Big = make_live_image(83, 200000);   // ~160 MiB: far over the 20 MiB budget
+        ParkDisk pd;
+        pd.init(ParkDisk::Options{dir8.string(), 20ull << 20, 0, true}, ident(M1, C1), ok_limits());
+        g_pd = &pd;
+        pd.spill(SavedConversation(S), -1);
+        wait_for([&] { return list_ses(dir8).size() == 1; }, "5c8 big: the fitting spill landed");
+        pd.spill(SavedConversation(Big), -1);
+        check(pd.entries() == 1 && pd.ids(1).size() == 1000, "5c8 big: oversize spill skipped, entry kept");
+        check(list_ses(dir8).size() == 1, "5c8 big: no file published for the oversize image");
+        std::string error;
+        const auto m = pd.best(S.live.ids, {}, false);
+        const auto img = pd.load(m, error);
+        check(img && same(*img, S), "5c8 big: the preserved entry still restores");
+        g_pd = nullptr;
+    }
+    fs::remove_all(dir8);
 
     std::printf("park_disk_boot_test: %d checks passed\n", checks);
     fs::remove_all(dir);

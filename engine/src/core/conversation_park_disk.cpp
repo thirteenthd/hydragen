@@ -300,7 +300,11 @@ std::optional<ParkDisk::Options> ParkDisk::from_env() {
     if (!dir || !*dir) return std::nullopt;
     Options o;
     o.dir = dir;
-    o.budget = (size_t) pd_env_u64("STRATA_PARK_DISK_MIB").value_or(0) * 1024 * 1024;
+    // P5-5C.8: the env default is a 16 GiB budget. An unset knob meant free-space-only, and the tier
+    // filled ms01's /home to 91% (79 GiB, 124 files) while never evicting: the boot walk alone ran
+    // 108 s. Free-space-only must be a choice (STRATA_PARK_DISK_MIB=0), not the accident of an unset
+    // variable. The Options struct default stays 0 so direct unit tests keep the old semantics.
+    o.budget = (size_t) pd_env_u64("STRATA_PARK_DISK_MIB").value_or(16384) * 1024 * 1024;
     o.min_free = pd_env_u64("STRATA_PARK_DISK_MIN_FREE_MIB").value_or(4096) * 1024ull * 1024ull;
     o.v2 = pd_env_u64("STRATA_PARK_DISK_V2").value_or(0) != 0;
     return o;
@@ -500,11 +504,22 @@ void ParkDisk::init(const Options& o, IdentityFn identity, LimitsFn limits) {
                                          [&](const Entry& x) { return x.serial == vp; });
             if (pe != entries_.end()) pe->view_refs += 1;   // serials are unique: self-reference impossible
         }
+    // P5-5C.8: boot-time housekeeping. An oversized store (a budget lowered between boots, the new
+    // default landing on a pile that grew under the old free-space-only rule, or free space that
+    // dropped below the keep-free floor while the engine was down) is trimmed NOW, not at some future
+    // spill: the walk already knows every byte, and Pass 2 sweeps whatever the trim leaves unreferenced.
+    // Only when the walk COMPLETED: with files left unvisited bytes_ is not the store's true size and
+    // dropping on it could eat live data. The drop lines land before the ON line, and ON reports the
+    // post-trim entries_/bytes_, so server.py's ParkDiskLog reads the same absolute counts either way.
+    if (walk_ok) {
+        while (budget_ != 0 && bytes_ > budget_ && !entries_.empty()) drop_oldest();
+        while (!entries_.empty() && !free_guard_ok(0)) drop_oldest();
+    }
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     const std::string budget_note = budget_ ? std::to_string(budget_ >> 20) + " MiB" : std::string("free-space only");
     std::fprintf(stderr, "strata serve: park disk: ON %s (index %zu files, %.1f GiB, %zu refused, %zu quarantined, rebuilt in "
                          "%.0f ms; budget %s, keep-free %llu MiB)%s\n",
-                 dir_.c_str(), found, (double) bytes_ / (1024.0 * 1024.0 * 1024.0), refused, quarantined, ms,
+                 dir_.c_str(), entries_.size(), (double) bytes_ / (1024.0 * 1024.0 * 1024.0), refused, quarantined, ms,
                  budget_note.c_str(),
                  (unsigned long long) (min_free_ >> 20),
                  walk_ok ? "" : " [walk stopped early]");
@@ -544,6 +559,13 @@ void ParkDisk::spill(SavedConversation&& image, int64_t cache_serial) {
     drain_finished();
     const size_t n = image.bytes();
     if (n == 0) return;
+    // P5-5C.8: oversize guard. An image that ALONE exceeds the budget can never fit: skip the spill
+    // instead of letting the room loop below wipe the whole disk cache chasing it (and still not fit).
+    if (budget_ != 0 && n > budget_) {
+        std::fprintf(stderr, "strata serve: park disk: skip spill of %zu tokens, %.1f MiB: exceeds the %zu MiB budget\n",
+                     image.live.ids.size(), (double) n / (1024.0 * 1024.0), budget_ >> 20);
+        return;
+    }
     // Room on disk: budget first, then the keep-free guard (oldest entries leave until the incoming fits).
     while (budget_ != 0 && bytes_ + n > budget_ && !entries_.empty()) drop_oldest();
     while (!entries_.empty() && !free_guard_ok(n)) drop_oldest();
@@ -653,6 +675,10 @@ std::optional<SavedConversation> ParkDisk::load(Match m, std::string& error,
         bytes_ += bytes - it->bytes;
         it->bytes = bytes;
     }
+    // P5-5C.8: true LRU. A restored entry was just USED: rotate it to the back (MRU) of entries_ so
+    // drop_oldest() evicts the least-recently-USED entry, not the first-spilled one. Every use of
+    // `it` is above this line: the rotate leaves it dangling on purpose, nothing may touch it after.
+    std::rotate(it, it + 1, entries_.end());
     const std::string dstat = rs.ram_blocks
         ? " delta: " + std::to_string(rs.ram_bytes >> 20) + " MiB from RAM"
           + " / " + std::to_string(rs.disk_bytes >> 20) + " MiB from store"
@@ -717,6 +743,33 @@ void ParkDisk::drain_finished() {
                                      "(store %zu chunks, %.1f GiB)\n",
                              (double) f.saved / (1024.0 * 1024.0 * 1024.0), blobs_.size(),
                              (double) blob_bytes_ / (1024.0 * 1024.0 * 1024.0));
+            // P5-5C.8: superseded-prefix drop. A growing conversation re-parks every turn; the RAM
+            // cache drops the stale shorter copy (drop_superseded) and the disk tier must not keep
+            // every intermediate forever. SAFE ORDER: this runs AFTER the superset published above
+            // and took its chunk refs, so write_v2 deduped against the older turn's chunks (zero
+            // wasted writes) and every shared chunk now holds refs >= 2: release_entry leaves those
+            // >= 1 untouched, and only the superseded turn's unique tail bytes hit refs 0 and unlink
+            // now. The standard drop line keeps server.py's ParkDiskLog counting entries/bytes/drops.
+            // (Dropping BEFORE the publish would unlink the shared chunks out from under the write.)
+            const uint64_t sup_serial = it->serial;
+            const bool sup_cvec = it->cvec;
+            const std::vector<int32_t> sup_ids = it->ids;   // copy: erasing shifts entries_ under `it`
+            for (size_t i = 0; i < entries_.size(); ) {
+                const Entry& x = entries_[i];
+                const bool superseded = x.serial != sup_serial && x.done && x.cvec == sup_cvec &&
+                                        x.view_refs == 0 && x.ids.size() < sup_ids.size() &&
+                                        std::equal(x.ids.begin(), x.ids.end(), sup_ids.begin());
+                if (!superseded) { ++i; continue; }
+                Entry old = std::move(entries_[i]);
+                entries_.erase(entries_.begin() + (long long) i);   // next element shifts into slot i
+                release_entry(old);
+                bytes_ -= old.bytes;
+                ++drops_;
+                pd_unlink(old.path);
+                std::fprintf(stderr, "strata serve: park disk: drop %s (%.1f MiB, %zu entries, %.1f GiB on disk)\n",
+                             old.path.c_str(), (double) old.bytes / (1024.0 * 1024.0), entries_.size(),
+                             (double) bytes_ / (1024.0 * 1024.0 * 1024.0));
+            }
         } else {
             std::fprintf(stderr, "strata serve: park disk: spill failed for %zu tokens (%s)\n",
                          it->ids.size(), f.error.c_str());
