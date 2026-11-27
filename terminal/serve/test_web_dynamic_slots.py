@@ -552,6 +552,70 @@ class WebResFactsStrip(unittest.TestCase):
         self.assertNotIn("K=", out["html"])
 
 
+class IdleDetachHeldTokensTest(unittest.TestCase):
+    """P5-5C.9: the engine's `slot N detached idle` log line clears that slot's stale held_tokens (and its
+    releasing flag) in /metrics: the engine freed the slot's KV, so the wrapper must stop naming the old
+    conversation as held (the stuck 73,809 on a freed slot)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log = Path(self.tmp.name) / "engine.log"
+        self.log.write_text("", encoding="utf-8")
+        self.e = batch_engine(n=4)
+        self.e.log_path, self.e.log_start = str(self.log), 0
+        self.svc = Service(self.e, ByteTokenizer(), ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def slots(self):
+        return {s["slot"]: s for s in self.svc.metrics()["live"]["slots"]}
+
+    def write(self, line):
+        with self.log.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+    def test_an_idle_detach_clears_the_stale_held_tokens(self):
+        self.e.slot_held[1] = list(range(73809))
+        self.e.slot_releasing = {1}
+        s = self.slots()[1]
+        self.assertEqual(s["held_tokens"], 73809)              # before: the stale number on a freed slot
+        self.write("strata serve: conversation cache: slot 1 detached idle (73809 tokens to the parked tier)")
+        s = self.slots()[1]
+        self.assertEqual(s["held_tokens"], 0)
+        self.assertFalse(s["releasing"])
+        self.assertEqual(s["state"], "idle")
+
+    def test_a_busy_slots_held_stands(self):
+        # a fresh admission re-took the slot between the engine's detach and this poll: its held is not stale
+        self.e.slot_held[2] = list(range(500))
+        self.e.slot_busy[2] = True
+        self.write("strata serve: conversation cache: slot 2 detached idle (500 tokens dropped (not parked))")
+        self.assertEqual(self.slots()[2]["held_tokens"], 500)
+
+    def test_a_detach_is_applied_once(self):
+        self.e.slot_held[3] = list(range(100))
+        self.write("strata serve: conversation cache: slot 3 detached idle (100 tokens dropped (not parked))")
+        self.assertEqual(self.slots()[3]["held_tokens"], 0)
+        self.e.slot_held[3] = list(range(40))                  # a new conversation lands after the detach
+        self.assertEqual(self.slots()[3]["held_tokens"], 40)   # later polls must not clear it again
+
+    def test_a_park_line_is_not_a_detach(self):
+        self.e.slot_held[0] = list(range(1024))
+        self.write("strata serve: conversation cache: parked 1024 tokens (slot 0 idle 30 s); parked=1 bytes=4096 evictions=0")
+        self.assertEqual(self.slots()[0]["held_tokens"], 1024)
+
+    def test_the_arena_returned_line_is_the_same_detach_not_a_second_one(self):
+        # the engine writes both lines per detach; only the first counts, so a held set after the
+        # event's second line is never cleared by a later poll
+        self.e.slot_held[1] = list(range(100))
+        self.write("strata serve: conversation cache: slot 1 detached idle (100 tokens dropped (not parked))")
+        self.assertEqual(self.slots()[1]["held_tokens"], 0)
+        self.write("strata serve: conversation cache: slot 1 detached idle: session arena returned (0.31 GiB back)")
+        self.e.slot_held[1] = list(range(60))                  # a new conversation lands after the event
+        self.assertEqual(self.slots()[1]["held_tokens"], 60)
+
+
 class ParkDiskAvailTest(unittest.TestCase):
     """P5-5D.3: /metrics' park_disk carries disk_avail_bytes: the filesystem's free space minus the
     keep-free floor, plus what the tier already holds (the bar's denominator)."""

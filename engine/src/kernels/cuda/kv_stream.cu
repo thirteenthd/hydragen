@@ -386,6 +386,11 @@ struct KvCopyGroups {
     int32_t* ctl[kKvResolveMaxGroups];
     int32_t* miss_block[kKvResolveMaxGroups];
     int32_t* miss_slot[kKvResolveMaxGroups];
+    // P5-5C.9: the copy must land at (sl + slot_base) in the shared CowArena and publish the entry the
+    // grouped resolve left at -2 (CLAIMED): without these, a C>=2 batch decode overwrote slot_base = 0
+    // (main_ss's pinned forked pages) with another slot's tail KV bytes and left missed blocks stuck at -2.
+    int32_t* page_table[kKvResolveMaxGroups];
+    int64_t slot_base[kKvResolveMaxGroups];
     Runs runs[kKvResolveMaxGroups];
     int ng;
 };
@@ -403,6 +408,12 @@ __global__ void __launch_bounds__(RT) resolve_groups_kernel(KvResolveMapGroups m
 }
 
 // One block-row per distinct streamed slot (blockIdx.y = g): copies that slot's missed blocks from host into VRAM.
+// P5-5C.9: mirrors copy_kernel's three arena duties (the grouped resolve never claims region fetches -
+// resolve_body suppresses them when grouped - so only the normal misses (need = ctl[g][2]) are copied here):
+//   * skip an aborted victim (miss_slot[k] = -1: its slot went back to a foreign owner),
+//   * land at (sl + slot_base) in the shared CowArena, never at the local sl,
+//   * publish page_table[b] = sl + slot_base AFTER the bytes: resolve_body left the entry at -2 (CLAIMED)
+//     when slot_use != nullptr, and no sibling may join a half-copied page.
 __global__ void copy_groups_kernel(KvCopyGroups cg) {
     const unsigned g = blockIdx.y;
     if ((int) g >= cg.ng) return;
@@ -410,14 +421,21 @@ __global__ void copy_groups_kernel(KvCopyGroups cg) {
     if (need <= 0) return;
     const int32_t* miss_block = cg.miss_block[g];
     const int32_t* miss_slot = cg.miss_slot[g];
+    int32_t* page_table = cg.page_table[g];
+    const long long slot_base = cg.slot_base[g];
     const Runs r = cg.runs[g];
     for (int k = blockIdx.x; k < need; k += gridDim.x) {
         const long long b = miss_block[k], sl = miss_slot[k];
+        if (b < 0 || sl < 0) continue;   // cow-m1d: an aborted victim must not have its (now foreign-owned) slot overwritten
         for (int a = 0; a < r.n; ++a) {
             const uint4* src = reinterpret_cast<const uint4*>(r.src[a] + b * r.len[a]);
-            uint4* dst = reinterpret_cast<uint4*>(r.dst[a] + sl * r.len[a]);
+            uint4* dst = reinterpret_cast<uint4*>(r.dst[a] + (sl + slot_base) * r.len[a]);   // cow-m1
             for (int i = threadIdx.x; i < r.len[a] / 16; i += blockDim.x) dst[i] = src[i];
         }
+        // cow-m1d: publish AFTER the bytes: the arena map left the entry at -2 (claimed); a legacy map
+        // published the same value in resolve, so this store is idempotent there.
+        __syncthreads();
+        if (threadIdx.x == 0) page_table[b] = (int32_t) (sl + slot_base);
     }
 }
 
@@ -588,6 +606,8 @@ void kv_stream_resolve_groups(const KvResolveGroups& g, const int32_t* ids, cons
         cg.ctl[i] = g.map[i].ctl;
         cg.miss_block[i] = g.map[i].miss_block;
         cg.miss_slot[i] = g.map[i].miss_slot;
+        cg.page_table[i] = g.map[i].page_table;   // P5-5C.9: the copy kernel publishes the claimed entries
+        cg.slot_base[i] = g.map[i].slot_base;     // P5-5C.9: and lands them in this map's arena range
         cg.runs[i] = runs_of(g.slots[i], g.host[i], g.fmt[i], s);
     }
     const cudaStream_t cs = (cudaStream_t) stream;

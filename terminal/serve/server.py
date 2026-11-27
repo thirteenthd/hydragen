@@ -626,6 +626,11 @@ class ConvCacheLog:
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
+    # P5-5C.9: the engine's idle-detach line ("slot N detached idle (T tokens to the parked tier)" or
+    # "(T tokens dropped (not parked))"): the slot's KV is gone, so the wrapper's held-prefix record
+    # for it is stale. Counted per slot (cumulative for this engine run); the Service applies each
+    # seen detach once, clearing that slot's held_tokens / releasing in /metrics' slots view.
+    DETACHED = re.compile(r"conversation cache: slot (\d+) detached idle \(")
     # #6081: a park the cache refused, by reason (the engine's "skip parking (...)" / "allocation failed" lines; a
     # "skipped N tokens" line is put()'s refusal).  The first match names the reason; any other text is the size
     # estimate's own error ("estimate").
@@ -642,7 +647,8 @@ class ConvCacheLog:
 
     def reset(self):
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
-                      "last_tokens": None, "last_at": None, "refused": {}, "refused_total": 0, "last_refused": None}
+                      "last_tokens": None, "last_at": None, "refused": {}, "refused_total": 0, "last_refused": None,
+                      "detaches": {}}
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it.  One poll at a
@@ -650,6 +656,7 @@ class ConvCacheLog:
         with self.lock:
             st = self._poll(path, start)
             st["refused"] = dict(st["refused"])         # a copy: the caller's view does not move with later polls
+            st["detaches"] = dict(st["detaches"])       # P5-5C.9: likewise the per-slot idle-detach counts
             return st
 
     def _refused(self, reason: str) -> None:
@@ -698,6 +705,11 @@ class ConvCacheLog:
             m = self.DROPPED.search(line)
             if m:
                 self.state["parked"] = int(m.group(1))
+                continue
+            m = self.DETACHED.search(line)
+            if m:
+                b = int(m.group(1))
+                self.state["detaches"][b] = self.state["detaches"].get(b, 0) + 1
                 continue
             m = self.SKIP.search(line)
             if m:
@@ -5628,6 +5640,33 @@ class Service:
                     | {"wallclock_s": r.get("wallclock_s", round(time.perf_counter() - r["_clock"], 3))}
                     for r in reversed(records)]
 
+    def _apply_idle_detaches(self, parked: dict) -> None:
+        """P5-5C.9: the engine's `slot N detached idle` lines are authoritative: that slot's KV (and its parked
+        copy) is gone, but the wrapper's slot_held[N] still names the old conversation - /metrics showed e.g.
+        73,809 held_tokens on a freed slot, and prefix routing kept steering turns to a slot the engine had
+        emptied. Apply each detach the log poll has newly seen exactly once: clear that slot's held_tokens and
+        its releasing flag, but only while no request owns the slot (a fresh admission's held stands)."""
+        det = parked.get("detaches") or {}
+        if not det:
+            return
+        try:
+            held, releasing = self.engine.slot_held, self.engine.slot_releasing
+            busy, claims = self.engine.slot_busy, self.engine.slot_claims
+            gen = self.engine.gen
+        except AttributeError:
+            return                                     # a solo / non-batch engine carries no per-slot state
+        applied = getattr(self, "_detach_applied", None)
+        if applied is None or getattr(self, "_detach_applied_gen", None) != gen:
+            applied = self._detach_applied = {}        # another engine process: its detaches count from zero
+            self._detach_applied_gen = gen
+        for b, n in det.items():
+            if n <= applied.get(b, 0):
+                continue                               # this detach was already applied (every poll re-reads it)
+            applied[b] = n
+            if 0 <= b < len(held) and not busy[b] and b not in claims:
+                held[b] = []
+                releasing.discard(b)
+
     def metrics(self, all_requests=False) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
         the hardware (with a minute of history per series)."""
@@ -5665,6 +5704,7 @@ class Service:
         # source of its reused prefix (parked / disk) once the log line has been read.
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         disk = self.pd_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        self._apply_idle_detaches(parked)              # P5-5C.9: before slots_view: the view must not name dead KV
         try:
             self.engine._restore_events = (
                 disk.get("last_tokens") if disk.get("last_event") == "restored" else None, disk.get("last_at"),
