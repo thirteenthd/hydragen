@@ -462,6 +462,19 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
                                                     st.idx_dead, (int64_t) g.idx_key_dim, ps);
             } else if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error)) return false;
         }
+        // P5-5C.10: an in-place rewind replaces the conversation this streamed state was holding, and a CoW
+        // fork of the OUTGOING one leaves two hazards behind. The state's CowPeer still names the old
+        // lineage: resolve's joins-at-fetch (cow-m1d/cow-m1e) treat the NEW conversation as a member of it
+        // and serve a sibling slot's tail pages (the 9k C=8 cross-talk: stream 7 joined stream 6's tail).
+        // And the page table still names the pinned fork pages (slot_use > 1): the new conversation's
+        // appends would overwrite a live sibling's VRAM in place. Release the lineage and empty the
+        // residency, exactly the pair refresh_residency runs after a K/V restore: the pins live in
+        // slot_use, which kv_stream_reset never touches, so the sibling's fork stays protected by
+        // cow_hold while this state refills its window from its host copy.
+        if (st.kv_mode == 1 && st.map.slot_use != nullptr) {
+            qsa_cow_release(const_cast<QsaState&>(st));
+            strata::kernels::kv_stream_reset(st.map, nullptr);
+        }
     }
     const size_t tokens = c.ids.size();
     ss.ple_prev[0] = tokens >= 2 ? c.ids[tokens - 2] : -1;

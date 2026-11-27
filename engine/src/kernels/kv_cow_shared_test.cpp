@@ -29,6 +29,10 @@
 // P5-5C.9 adds a second, independent arm (grouped_arm): kv_stream_resolve_groups() over three CowArena
 // windows - the C>=2 batch-decode path whose copy kernel forgot the + slot_base offset, the page_table
 // publish, and the aborted-victim guard (prompt-canary cross-talk at 9k/22k C>=4, never at C=1 or 3k).
+// P5-5C.10 adds a third (restore_rewind_arm): an in-place conversation_checkpoint_restore over a
+// CoW-forked main state - the restore must release the lineage (conv=-1: no joins-at-fetch for the
+// new conversation) and reset the streamed page table, while the sibling slot's fork pins (slot_use
+// > 1) and pages survive untouched (the 9k C=8 stream-7 <- stream-6 cross-talk shape).
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -248,6 +252,294 @@ int grouped_arm() {
         }
     }
     std::printf("  grouped arm: %s\n", bad ? "FAILED" : "ok");
+    return bad;
+}
+
+// P5-5C.10 regression arm: an IN-PLACE conversation_checkpoint_restore over a CoW-forked main state.
+// Shape (the 9k C=8 cross-talk, stream 7 <- stream 6): main (M0) holds conversation A - blocks
+// [0, P+T) resident in its own window. Slot 1 (M1) is admitted with qsa_cow_fork(main, slot1,
+// upto = A): M1's table names M0's pages (kv_stream_cow_fork_join: slot_use 1 -> 2 on [0, P+T))
+// and BOTH registry entries carry conv = lineage_A, floor = P + T. Slot 1 then decodes A's reply:
+// blocks [P+T, P+2T) resident in M1's OWN slots. Conversation B rewinds M0 IN PLACE (it shares
+// only A's first P blocks; its tail [P, P+T) diverges). Pre-fix, the restore left M0's stale table
+// (hits naming the pinned pages: B attends to A's tail bytes, and B's appends overwrite them) and
+// M0's stale conv (a cleared table would JOIN M1's spliced entries - joins-at-fetch). The fix runs
+// the release pair inside the restore (exactly what qsa_cow_release + kv_stream_reset do):
+//   1. after the rewind: M0's table is all -1 and its registry entry reads conv=-1 / floor=max,
+//   2. slot 1's fork pins survive: slot_use stays 2 on [0, P+T) and every pinned page's bytes are
+//      bit-for-bit intact, as are M1's own reply pages,
+//   3. B's re-resolve NEVER joins (the join counter stays flat: conv=-1 gates joins-at-fetch),
+//      NEVER names a pinned slot (cow_hold keeps use>1 out of the victim sweep), names only its
+//      own range, and every fetched page matches B's OWN host copy - A's tail bytes never appear.
+int restore_rewind_arm() {
+    std::printf("  rewind arm: in-place checkpoint restore over a CoW fork (P5-5C.10)\n");
+    const k::QsaShapes s = k::qsa_real_shapes();
+    const int64_t H = s.n_head_kv, D = s.head_dim, PS = s.page_size;
+    const int64_t n_blocks = 600, n_win = 1024;
+    const int64_t n_arena = 2 * n_win;
+    const int64_t P = 400, T = 100;   // A: prefix [0,P) shared with B, tail [P,P+T) diverges, reply [P+T,P+2T)
+    const size_t GS = (size_t) (D / k::KV_Q8_GROUP);
+    const size_t hrows = (size_t) n_blocks * H * PS, arows = (size_t) n_arena * H * PS;
+    int bad = 0;
+
+    // Host copies: A's bytes, and B's - blocks [0,P) identical (the shared prefix), [P, n_blocks) distinct.
+    k::KvHostPools hostA{}, hostB{};
+    {
+        void *ak, *av, *aks, *avs, *bk, *bv, *bks, *bvs;
+        ck(cudaHostAlloc(&ak, hrows * D, cudaHostAllocMapped), "rw hostA k");
+        ck(cudaHostAlloc(&av, hrows * D, cudaHostAllocMapped), "rw hostA v");
+        ck(cudaHostAlloc(&aks, hrows * GS * 2, cudaHostAllocMapped), "rw hostA ks");
+        ck(cudaHostAlloc(&avs, hrows * GS * 2, cudaHostAllocMapped), "rw hostA vs");
+        ck(cudaHostAlloc(&bk, hrows * D, cudaHostAllocMapped), "rw hostB k");
+        ck(cudaHostAlloc(&bv, hrows * D, cudaHostAllocMapped), "rw hostB v");
+        ck(cudaHostAlloc(&bks, hrows * GS * 2, cudaHostAllocMapped), "rw hostB ks");
+        ck(cudaHostAlloc(&bvs, hrows * GS * 2, cudaHostAllocMapped), "rw hostB vs");
+        hostA.k_q = (int8_t*) ak; hostA.v_q = (int8_t*) av; hostA.k_scale = (uint16_t*) aks; hostA.v_scale = (uint16_t*) avs;
+        hostB.k_q = (int8_t*) bk; hostB.v_q = (int8_t*) bv; hostB.k_scale = (uint16_t*) bks; hostB.v_scale = (uint16_t*) bvs;
+        std::mt19937 ra(509), rb(1010);
+        std::uniform_int_distribution<int> byte_d(1, 255);   // never all-zero
+        auto fill = [&](k::KvHostPools& h, std::mt19937& r) {
+            for (size_t i = 0; i < hrows * D; ++i) { h.k_q[i] = (int8_t) byte_d(r); h.v_q[i] = (int8_t) byte_d(r); }
+            for (size_t i = 0; i < hrows * GS; ++i) { h.k_scale[i] = (uint16_t) byte_d(r); h.v_scale[i] = (uint16_t) byte_d(r); }
+        };
+        fill(hostA, ra); fill(hostB, rb);
+        const size_t pc = (size_t) P * H * PS;   // the shared prefix: byte-identical across A and B
+        std::memcpy(hostB.k_q, hostA.k_q, pc * D); std::memcpy(hostB.v_q, hostA.v_q, pc * D);
+        std::memcpy(hostB.k_scale, hostA.k_scale, pc * GS); std::memcpy(hostB.v_scale, hostA.v_scale, pc * GS);
+    }
+
+    // One arena, one slot_use, two maps: M0 = main (range [0, n_win)), M1 = slot 1 (range [n_win, 2*n_win)).
+    k::QsaAttnPools arena{};
+    int8_t *ark = nullptr, *arv = nullptr; uint16_t *arks = nullptr, *arvs = nullptr;
+    ck(cudaMalloc(&ark, arows * D), "rw arena k");
+    ck(cudaMalloc(&arv, arows * D), "rw arena v");
+    ck(cudaMalloc(&arks, arows * GS * 2), "rw arena ks");
+    ck(cudaMalloc(&arvs, arows * GS * 2), "rw arena vs");
+    ck(cudaMemset(ark, 0xA5, arows * D), "rw arena k0");
+    ck(cudaMemset(arv, 0xA5, arows * D), "rw arena v0");
+    ck(cudaMemset(arks, 0xA5, arows * GS * 2), "rw arena ks0");
+    ck(cudaMemset(arvs, 0xA5, arows * GS * 2), "rw arena vs0");
+    arena.k_q = ark; arena.v_q = arv; arena.k_scale = arks; arena.v_scale = arvs;
+    int32_t* slot_use = nullptr;
+    ck(cudaMalloc(&slot_use, n_arena * 4), "rw use");
+    ck(cudaMemset(slot_use, 0, n_arena * 4), "rw use0");
+    auto dalloc = [](size_t n, bool ones) {
+        int32_t* p = nullptr;
+        ck(cudaMalloc(&p, n * 4), "rw alloc");
+        ck(cudaMemset(p, ones ? 0xFF : 0, n * 4), "rw init");
+        return p;
+    };
+    k::KvStreamMap M[2];
+    for (int i = 0; i < 2; ++i) {
+        k::KvStreamMap& m = M[i];
+        m.page_table = dalloc(n_blocks, true);
+        m.slot_block = dalloc(n_win, true); m.slot_stamp = dalloc(n_win, true); m.slot_ref = dalloc(n_win, false);
+        m.miss_block = dalloc(n_win, false); m.miss_slot = dalloc(n_win, false);
+        m.miss_sh = dalloc(n_win, false); m.miss_sh_slot = dalloc(n_win, false);
+        m.ctl = dalloc(k::kKvCtlInts, false);
+        m.n_blocks = n_blocks; m.n_slots = n_win; m.slot_base = i * n_win;
+        m.slot_use = slot_use;
+        std::vector<int32_t> u((size_t) n_win, 1);   // the admission seed: each owner holds its range
+        ck(cudaMemcpy(slot_use + i * n_win, u.data(), (size_t) n_win * 4, cudaMemcpyHostToDevice), "rw seed");
+    }
+    // The registry: both states in lineage 5 (conv), floor = P+T (the fork's complete pages), same ord.
+    std::vector<k::CowPeer> regh(2);
+    regh[0] = {5, 64, 0, 0, (int32_t) n_win, (int32_t) n_blocks, M[0].page_table, (int32_t) (P + T)};
+    regh[1] = {5, 64, 0, (int32_t) n_win, (int32_t) n_win, (int32_t) n_blocks, M[1].page_table, (int32_t) (P + T)};
+    k::CowPeer* dreg = nullptr;
+    ck(cudaMalloc(&dreg, 2 * sizeof(k::CowPeer)), "rw reg");
+    ck(cudaMemcpy(dreg, regh.data(), 2 * sizeof(k::CowPeer), cudaMemcpyHostToDevice), "rw reg0");
+    for (int i = 0; i < 2; ++i) { M[i].reg = dreg; M[i].reg_n = 2; }
+    unsigned long long* join_ctr = nullptr;
+    ck(cudaMalloc(&join_ctr, 8), "rw jctr"); ck(cudaMemset(join_ctr, 0, 8), "rw jctr0");
+    M[0].join_ctr = join_ctr; M[1].join_ctr = join_ctr;
+
+    // A resident in main: blocks [0, P+T) in slots [0, P+T), bytes = hostA.
+    for (int64_t b = 0; b < P + T; ++b) {
+        const size_t rb = (size_t) b * H * PS, rs = (size_t) b * H * PS;
+        ck(cudaMemcpy(ark + rs * D, hostA.k_q + rb * D, H * PS * D, cudaMemcpyDeviceToDevice), "rw A k");
+        ck(cudaMemcpy(arv + rs * D, hostA.v_q + rb * D, H * PS * D, cudaMemcpyDeviceToDevice), "rw A v");
+        ck(cudaMemcpy(arks + rs * GS, hostA.k_scale + rb * GS, H * PS * GS * 2, cudaMemcpyDeviceToDevice), "rw A ks");
+        ck(cudaMemcpy(arvs + rs * GS, hostA.v_scale + rb * GS, H * PS * GS * 2, cudaMemcpyDeviceToDevice), "rw A vs");
+        const int32_t ptb = (int32_t) b, sbb = (int32_t) b;
+        ck(cudaMemcpy(M[0].page_table + b, &ptb, 4, cudaMemcpyHostToDevice), "rw A pt");
+        ck(cudaMemcpy(M[0].slot_block + b, &sbb, 4, cudaMemcpyHostToDevice), "rw A sb");
+    }
+    // The admission fork: slot 1's table names main's pages; the join kernel revalidates and pins (use 1 -> 2).
+    {
+        std::vector<int32_t> pt1((size_t) n_blocks, -1);
+        for (int64_t b = 0; b < P + T; ++b) pt1[b] = (int32_t) b;
+        ck(cudaMemcpy(M[1].page_table, pt1.data(), (size_t) n_blocks * 4, cudaMemcpyHostToDevice), "rw fork pt");
+        k::kv_stream_cow_fork_join(M[1], M[0], nullptr);
+        ck(cudaGetLastError(), "rw fork join");
+        ck(cudaDeviceSynchronize(), "rw fork sync");
+    }
+    // Slot 1 decodes A's reply: blocks [P+T, P+2T) in M1's own slots, bytes = hostA.
+    for (int64_t b = P + T; b < P + 2 * T; ++b) {
+        const int64_t j = n_win + (b - (P + T));
+        const size_t rb = (size_t) b * H * PS, rs = (size_t) j * H * PS;
+        ck(cudaMemcpy(ark + rs * D, hostA.k_q + rb * D, H * PS * D, cudaMemcpyDeviceToDevice), "rw R k");
+        ck(cudaMemcpy(arv + rs * D, hostA.v_q + rb * D, H * PS * D, cudaMemcpyDeviceToDevice), "rw R v");
+        ck(cudaMemcpy(arks + rs * GS, hostA.k_scale + rb * GS, H * PS * GS * 2, cudaMemcpyDeviceToDevice), "rw R ks");
+        ck(cudaMemcpy(arvs + rs * GS, hostA.v_scale + rb * GS, H * PS * GS * 2, cudaMemcpyDeviceToDevice), "rw R vs");
+        const int32_t ptj = (int32_t) j, sbb = (int32_t) b;
+        ck(cudaMemcpy(M[1].page_table + b, &ptj, 4, cudaMemcpyHostToDevice), "rw R pt");
+        ck(cudaMemcpy(M[1].slot_block + (j - n_win), &sbb, 4, cudaMemcpyHostToDevice), "rw R sb");
+    }
+    ck(cudaDeviceSynchronize(), "rw setup");
+
+    // Snapshot the bytes that must survive: main's pinned range and slot 1's reply range.
+    const size_t span = (size_t) (P + T) * H * PS;
+    std::vector<int8_t> pin_k(span * D), pin_v(span * D);
+    std::vector<uint16_t> pin_ks(span * GS), pin_vs(span * GS);
+    ck(cudaMemcpy(pin_k.data(), ark, pin_k.size(), cudaMemcpyDeviceToHost), "rw snap k");
+    ck(cudaMemcpy(pin_v.data(), arv, pin_v.size(), cudaMemcpyDeviceToHost), "rw snap v");
+    ck(cudaMemcpy(pin_ks.data(), arks, pin_ks.size() * 2, cudaMemcpyDeviceToHost), "rw snap ks");
+    ck(cudaMemcpy(pin_vs.data(), arvs, pin_vs.size() * 2, cudaMemcpyDeviceToHost), "rw snap vs");
+    const size_t rep = (size_t) T * H * PS;
+    std::vector<int8_t> rep_k(rep * D), rep_v(rep * D);
+    std::vector<uint16_t> rep_ks(rep * GS), rep_vs(rep * GS);
+    ck(cudaMemcpy(rep_k.data(), ark + (size_t) n_win * H * PS * D, rep_k.size(), cudaMemcpyDeviceToHost), "rw rsnap k");
+    ck(cudaMemcpy(rep_v.data(), arv + (size_t) n_win * H * PS * D, rep_v.size(), cudaMemcpyDeviceToHost), "rw rsnap v");
+    ck(cudaMemcpy(rep_ks.data(), arks + (size_t) n_win * H * PS * GS, rep_ks.size() * 2, cudaMemcpyDeviceToHost), "rw rsnap ks");
+    ck(cudaMemcpy(rep_vs.data(), arvs + (size_t) n_win * H * PS * GS, rep_vs.size() * 2, cudaMemcpyDeviceToHost), "rw rsnap vs");
+
+    // THE REWIND: the pair conversation_checkpoint_restore now runs (qsa_cow_release's kernel half +
+    // its registry reset, then the map reset). M0's table names only its own slots, so the release
+    // drops no pins here; the registry entry leaves the lineage; the table empties. slot_use - and
+    // with it slot 1's fork pins - is untouched by the reset.
+    k::kv_stream_cow_release(M[0], nullptr);
+    ck(cudaGetLastError(), "rw release");
+    regh[0].conv = -1; regh[0].floor = 0x7FFFFFFF;
+    ck(cudaMemcpy(dreg, &regh[0], sizeof(k::CowPeer), cudaMemcpyHostToDevice), "rw reg-");
+    k::kv_stream_reset(M[0], nullptr);
+    ck(cudaGetLastError(), "rw reset");
+    ck(cudaDeviceSynchronize(), "rw rewind");
+
+    // 1. the rewind cleared main's residency and left the lineage.
+    std::vector<int32_t> pt0(n_blocks);
+    ck(cudaMemcpy(pt0.data(), M[0].page_table, n_blocks * 4, cudaMemcpyDeviceToHost), "rw pt0");
+    for (int64_t b = 0; b < n_blocks; ++b)
+        if (pt0[b] != -1) {
+            std::fprintf(stderr, "  rw: main's page_table[%lld] = %d after the rewind (expected -1)\n",
+                         (long long) b, pt0[b]);
+            ++bad; break;
+        }
+    k::CowPeer reg0[2];
+    ck(cudaMemcpy(reg0, dreg, sizeof reg0, cudaMemcpyDeviceToHost), "rw reg rd");
+    if (reg0[0].conv != -1 || reg0[0].floor != 0x7FFFFFFF) {
+        std::fprintf(stderr, "  rw: main's registry entry after the rewind: conv=%d floor=%d (expected -1 / max)\n",
+                     reg0[0].conv, reg0[0].floor);
+        ++bad;
+    }
+    // 2. slot 1's pins and pages survived the rewind.
+    std::vector<int32_t> use(n_arena);
+    ck(cudaMemcpy(use.data(), slot_use, n_arena * 4, cudaMemcpyDeviceToHost), "rw use rd");
+    for (int64_t b = 0; b < P + T; ++b)
+        if (use[b] != 2) {
+            std::fprintf(stderr, "  rw: slot_use[%lld] = %d after the rewind (slot 1's fork pin lost)\n",
+                         (long long) b, use[b]);
+            ++bad; break;
+        }
+    {
+        std::vector<int8_t> k2(pin_k.size()), v2(pin_v.size());
+        std::vector<uint16_t> ks2(pin_ks.size()), vs2(pin_vs.size());
+        ck(cudaMemcpy(k2.data(), ark, k2.size(), cudaMemcpyDeviceToHost), "rw rd k");
+        ck(cudaMemcpy(v2.data(), arv, v2.size(), cudaMemcpyDeviceToHost), "rw rd v");
+        ck(cudaMemcpy(ks2.data(), arks, ks2.size() * 2, cudaMemcpyDeviceToHost), "rw rd ks");
+        ck(cudaMemcpy(vs2.data(), arvs, vs2.size() * 2, cudaMemcpyDeviceToHost), "rw rd vs");
+        if (k2 != pin_k || v2 != pin_v || ks2 != pin_ks || vs2 != pin_vs) {
+            std::fprintf(stderr, "  rw: main's pinned range changed across the rewind\n");
+            ++bad;
+        }
+    }
+
+    // B's prefill: resolve blocks [0, P+T) from B's OWN host copy. Pre-fix (stale conv + stale table)
+    // this either hit A's tail bytes or joined slot 1's spliced entries; post-fix every block is a
+    // cold fetch into an unpinned slot of main's own range.
+    const int cap = 512;
+    std::vector<int32_t> ids((size_t) cap, 0), steps(k::kStepCount, 0);
+    for (int64_t t = 0; t < P + T; ++t) ids[t] = (int32_t) (PS * t);
+    steps[k::kStepWidth] = (int32_t) (P + T);
+    int32_t *dids = nullptr, *dsteps = nullptr;
+    ck(cudaMalloc(&dids, ids.size() * 4), "rw ids");
+    ck(cudaMalloc(&dsteps, steps.size() * 4), "rw steps");
+    ck(cudaMemcpy(dids, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice), "rw ids0");
+    ck(cudaMemcpy(dsteps, steps.data(), steps.size() * 4, cudaMemcpyHostToDevice), "rw steps0");
+    k::QsaAttnPools ap = arena; ap.page_table = M[0].page_table;
+    k::kv_stream_resolve(M[0], ap, hostB, k::kKvInt8, dids, dsteps, 1, cap, s, nullptr);
+    ck(cudaGetLastError(), "rw resolve");
+    ck(cudaDeviceSynchronize(), "rw resolve sync");
+
+    // 3. no join fired (conv=-1 gated joins-at-fetch), every miss was placed, and the table is clean.
+    unsigned long long jc = 0;
+    ck(cudaMemcpy(&jc, join_ctr, 8, cudaMemcpyDeviceToHost), "rw jctr rd");
+    if (jc != 0) {
+        std::fprintf(stderr, "  rw: B's resolve JOINED %llu lineage pages after the rewind (cross-talk)\n", jc);
+        ++bad;
+    }
+    int32_t ctl[k::kKvCtlInts];
+    ck(cudaMemcpy(ctl, M[0].ctl, sizeof ctl, cudaMemcpyDeviceToHost), "rw ctl");
+    if (ctl[2] != (int32_t) (P + T)) {
+        std::fprintf(stderr, "  rw: B's resolve placed %d misses, expected %lld (the arm proved nothing)\n",
+                     ctl[2], (long long) (P + T));
+        ++bad;
+    }
+    if (ctl[3] != 0) { std::fprintf(stderr, "  rw: B's resolve overflowed\n"); ++bad; }
+    ck(cudaMemcpy(pt0.data(), M[0].page_table, n_blocks * 4, cudaMemcpyDeviceToHost), "rw pt0 rd");
+    ck(cudaMemcpy(use.data(), slot_use, n_arena * 4, cudaMemcpyDeviceToHost), "rw use rd2");
+    std::vector<int8_t> ak(arows * D), av(arows * D);
+    std::vector<uint16_t> aks(arows * GS), avs(arows * GS);
+    ck(cudaMemcpy(ak.data(), ark, ak.size(), cudaMemcpyDeviceToHost), "rw full k");
+    ck(cudaMemcpy(av.data(), arv, av.size(), cudaMemcpyDeviceToHost), "rw full v");
+    ck(cudaMemcpy(aks.data(), arks, aks.size() * 2, cudaMemcpyDeviceToHost), "rw full ks");
+    ck(cudaMemcpy(avs.data(), arvs, avs.size() * 2, cudaMemcpyDeviceToHost), "rw full vs");
+    for (int64_t b = 0; b < P + T && !bad; ++b) {
+        const int32_t sl = pt0[b];
+        if (sl < 0 || sl >= n_win) {
+            std::fprintf(stderr, "  rw: B's block %lld names slot %d (expected inside main's own range)\n",
+                         (long long) b, sl);
+            ++bad; break;
+        }
+        if (use[sl] > 1) {
+            std::fprintf(stderr, "  rw: B's block %lld took a PINNED slot %d (use=%d): cow_hold failed\n",
+                         (long long) b, sl, use[sl]);
+            ++bad; break;
+        }
+        const size_t rb = (size_t) b * H * PS, rs = (size_t) sl * H * PS;
+        if (std::memcmp(ak.data() + rs * D, hostB.k_q + rb * D, H * PS * D) != 0 ||
+            std::memcmp(av.data() + rs * D, hostB.v_q + rb * D, H * PS * D) != 0 ||
+            std::memcmp(aks.data() + rs * GS, hostB.k_scale + rb * GS, H * PS * GS * 2) != 0 ||
+            std::memcmp(avs.data() + rs * GS, hostB.v_scale + rb * GS, H * PS * GS * 2) != 0) {
+            std::fprintf(stderr, "  rw: B's block %lld slot %d holds FOREIGN bytes (A's tail leaked into B)\n",
+                         (long long) b, sl);
+            ++bad; break;
+        }
+    }
+    // Slot 1's reply pages and its table survived B's prefill untouched.
+    {
+        std::vector<int8_t> k2(rep_k.size()), v2(rep_v.size());
+        std::vector<uint16_t> ks2(rep_ks.size()), vs2(rep_vs.size());
+        ck(cudaMemcpy(k2.data(), ark + (size_t) n_win * H * PS * D, k2.size(), cudaMemcpyDeviceToHost), "rw rd R k");
+        ck(cudaMemcpy(v2.data(), arv + (size_t) n_win * H * PS * D, v2.size(), cudaMemcpyDeviceToHost), "rw rd R v");
+        ck(cudaMemcpy(ks2.data(), arks + (size_t) n_win * H * PS * GS, ks2.size() * 2, cudaMemcpyDeviceToHost), "rw rd R ks");
+        ck(cudaMemcpy(vs2.data(), arvs + (size_t) n_win * H * PS * GS, vs2.size() * 2, cudaMemcpyDeviceToHost), "rw rd R vs");
+        if (k2 != rep_k || v2 != rep_v || ks2 != rep_ks || vs2 != rep_vs) {
+            std::fprintf(stderr, "  rw: slot 1's reply range was overwritten by B's prefill\n");
+            ++bad;
+        }
+        std::vector<int32_t> pt1(n_blocks);
+        ck(cudaMemcpy(pt1.data(), M[1].page_table, n_blocks * 4, cudaMemcpyDeviceToHost), "rw pt1 rd");
+        for (int64_t b = 0; b < P + 2 * T && !bad; ++b) {
+            const int32_t want = b < P + T ? (int32_t) b : (int32_t) (n_win + (b - (P + T)));
+            if (pt1[b] != want) {
+                std::fprintf(stderr, "  rw: slot 1's page_table[%lld] = %d, expected %d\n",
+                             (long long) b, pt1[b], want);
+                ++bad; break;
+            }
+        }
+    }
+    std::printf("  rewind arm: %s\n", bad ? "FAILED" : "ok");
     return bad;
 }
 }  // namespace
@@ -566,6 +858,8 @@ int main() {
 
     // P5-5C.9: the grouped-resolve regression arm (its own arena; runs even when the phases above failed).
     bad += grouped_arm();
+    // P5-5C.10: the in-place checkpoint-restore rewind arm (its own arena; runs likewise).
+    bad += restore_rewind_arm();
 
     if (bad) ++g_fail;
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
