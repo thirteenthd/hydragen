@@ -38,10 +38,10 @@ if ($Model -notin @("IQ3_XXS", "IQ3_S")) { Write-Error "install.ps1: -Model must
 $ModelTag = $Model.ToLower()
 
 $ARCH = if ($env:HYDRAGEN_CUDA_ARCH) { $env:HYDRAGEN_CUDA_ARCH } else { "86-real" }
-$RELEASE_TAG = "prebuilt-1"
+$RELEASE_TAG = "v0.0.1"
 
 # ------------------------------------------------- environment sizing (auto-detected; edit hydragen-local.json to override)
-$DetMib = 65536
+$DetMib = 16384
 $smi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
 if (-not $smi) { $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue }
 if ($smi) {
@@ -56,9 +56,9 @@ if ($smi) {
 } else { Write-Warning "install.ps1: nvidia-smi not found - install the NVIDIA driver before serving (skipping GPU sizing)" }
 $ramMib = [int]((Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).TotalPhysicalMemory / 1MB)
 if ($ramMib -gt 0) {
-  $DetMib = [Math]::Min($ramMib, 131072); if ($DetMib -lt 16384) { $DetMib = 16384 }
+  $DetMib = 16384
   if ($ramMib -lt 49152) { Write-Warning "$ramMib MiB RAM detected - the documented floor is 64 GB; expect parked sessions to be re-prefilled more often" }
-  Write-Host "install.ps1: RAM detected: $ramMib MiB -> park-disk tier budget $DetMib MiB (a tier pinned above the RAM class measurably decays steady-state throughput - docs/HOW_IT_WORKS.md)"
+  Write-Host "install.ps1: RAM detected: $ramMib MiB -> park-disk tier budget $DetMib MiB (Phase 5 default cap: a tier pinned above 16 GiB measurably decays steady-state throughput and slows boot - raise it only with several x that cap in system RAM)"
 }
 
 # ------------------------------------------------------------------ prebuilt engine (preferred)
@@ -175,6 +175,7 @@ Write-Host "Building the HydraGen engine from source (CUDA arch: $ARCH) ..."
   -DSTRATA_PORTABLE=ON `
   -DSTRATA_Q6K_EXPERTS=ON `
   -DSTRATA_MMQ_KQUANTS=ON `
+  -DSTRATA_WINDOW_MAX_T=16 `
   "-DCMAKE_CUDA_ARCHITECTURES=$ARCH" `
   "-DCMAKE_CUDA_COMPILER=$CUDA\bin\nvcc.exe" `
   "-DCMAKE_MAKE_PROGRAM=$NINJA"
@@ -219,6 +220,7 @@ if (-not (Test-Path hydragen-local.json)) {
     HG_PARK_COW = "1"; HG_PARK_DISK_V2 = "1"; HG_PARK_DISK_MIB = "$DetMib";
     STRATA_ADMIT_SHORT_FIRST = "8192";
     HG_RESUME_DEEPEST = "1";
+    HG_UNIFIED_POOL = "1"; STRATA_AUTO_BATCH = "1"; CUDA_MODULE_LOADING = "LAZY";
     HG_PARK_DISK = (Join-Path $PWD "park-disk") -replace '\\','/'
   }
   for ($i = 0; $i -lt $cfg.args.Count; $i++) {
@@ -251,6 +253,11 @@ if (-not (Test-Path (Join-Path $ModelDir "packs\$ModelTag\tokenizer\vocab.json")
 }
 Write-Host "  2. .venv\Scripts\python.exe terminal\serve\server.py --engine hydragen --config hydragen-local.json --port 8181"
 Write-Host "  3. dashboard + Monitor: http://127.0.0.1:8181/"
-Write-Host "  4. the canonical stack is pre-wired: STRATA_PARK_COW=1, park-disk v2 tier (park-disk\),"
-Write-Host "     STRATA_RESUME_DEEPEST=1, --prompt-cache-tail (tier budget: STRATA_PARK_DISK_MIB, default 64 GiB -"
-Write-Host "     a pinned bigger cap measurably decays throughput on a 64 GB-RAM host), STRATA_ADMIT_SHORT_FIRST=8192"
+Write-Host "  4. the canonical stack is pre-wired: HG_PARK_COW=1, park-disk v2 tier (park-disk\),"
+Write-Host "     HG_RESUME_DEEPEST=1, --prompt-cache-tail (tier budget: HG_PARK_DISK_MIB, default 16 GiB - the"
+Write-Host "     Phase 5 cap; a pinned bigger cap measurably decays throughput and slows boot), STRATA_ADMIT_SHORT_FIRST=8192,"
+Write-Host "     HG_UNIFIED_POOL=1, STRATA_AUTO_BATCH=1, CUDA_MODULE_LOADING=LAZY; the Phase 5 CoW-arena block"
+Write-Host "     (STRATA_COW_ARENA*, STRATA_COW_FORK, STRATA_COW_JOIN_HH, STRATA_SLOT_*) ships in the configs' env."
+Write-Host "     --mtp is OPTIONAL: the shipped configs run with MTP OFF (lossless suffix drafting via"
+Write-Host "     --spec 4 --coupled-draft stays on); 12 GB cards default to MTP OFF for maximum expert"
+Write-Host "     residency, 16 GB+ cards can add --mtp <model-dir>/mtp/rt for extra decode speed."

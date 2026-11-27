@@ -22,7 +22,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${HYDRAGEN_CUDA_ARCH:-86-real}"
-RELEASE_TAG="prebuilt-1"
+RELEASE_TAG="v0.0.1"
 
 # Model blob location: --model-dir DIR (default: <this repo>/models). The generated
 # config's --pack/--native/--ple-gguf/--mtp paths are rewritten to live under DIR.
@@ -61,10 +61,9 @@ else
 fi
 RAM_MIB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
 if [ "$RAM_MIB" -gt 0 ] 2>/dev/null; then
-  DET_MIB=$(( RAM_MIB > 131072 ? 131072 : RAM_MIB ))
-  [ "$DET_MIB" -lt 16384 ] && DET_MIB=16384
+  DET_MIB=16384
   [ "$RAM_MIB" -lt 49152 ] && echo "install.sh: WARNING: ${RAM_MIB} MiB RAM detected - the documented floor is 64 GB; expect parked sessions to be re-prefilled more often" >&2
-  echo "install.sh: RAM detected: ${RAM_MIB} MiB -> park-disk tier budget ${DET_MIB} MiB (a tier pinned above the RAM class measurably decays steady-state throughput - docs/HOW_IT_WORKS.md)"
+  echo "install.sh: RAM detected: ${RAM_MIB} MiB -> park-disk tier budget ${DET_MIB} MiB (Phase 5 default cap: a tier pinned above 16 GiB measurably decays steady-state throughput and slows boot - raise it only with several x that cap in system RAM)"
 fi
 FREE_MIB=$(df -Pm "$MODEL_DIR" 2>/dev/null | awk 'NR==2{print $4}')
 if [ -n "$FREE_MIB" ] && [ -n "$DET_MIB" ] && [ "$FREE_MIB" -lt $(( DET_MIB + 174080 )) ] 2>/dev/null; then
@@ -153,6 +152,7 @@ echo "Building the HydraGen engine from source (CUDA arch: $ARCH) ..."
   -DSTRATA_PORTABLE=ON \
   -DSTRATA_Q6K_EXPERTS=ON \
   -DSTRATA_MMQ_KQUANTS=ON \
+  -DSTRATA_WINDOW_MAX_T=16 \
   -DCMAKE_CUDA_ARCHITECTURES="$ARCH" \
   -DCMAKE_CUDA_COMPILER="$CUDA/bin/nvcc" \
   -DCMAKE_MAKE_PROGRAM="$PWD/.venv/bin/ninja"
@@ -210,10 +210,13 @@ if os.path.isdir(os.path.join(rt, "lib")):  # prebuilt engine: bundled CUDA runt
     env["LD_LIBRARY_PATH"] = os.path.join(rt, "lib") + ((":" + prev) if prev else "")
 env["HG_PARK_COW"] = "1"
 env["HG_PARK_DISK"] = os.environ["PARK_DISK_DIR"]
-env.setdefault("HG_PARK_DISK_MIB", os.environ.get("DET_MIB") or "65536")
+env.setdefault("HG_PARK_DISK_MIB", os.environ.get("DET_MIB") or "16384")
 env.setdefault("STRATA_ADMIT_SHORT_FIRST", "8192")
 env["HG_PARK_DISK_V2"] = "1"
 env["HG_RESUME_DEEPEST"] = "1"
+env["HG_UNIFIED_POOL"] = "1"
+env["STRATA_AUTO_BATCH"] = "1"
+env["CUDA_MODULE_LOADING"] = "LAZY"
 if "--conversation-cache-min-free-mib" not in args:
     args += ["--conversation-cache-min-free-mib", "512"]
 if "--prompt-cache-tail" not in args:
@@ -237,6 +240,10 @@ Next steps
          bash setup.sh --gguf-dir DIR
      Source table and licenses: docs/MODELS.md. The expert-routing profile is already
      in this repo (terminal/data/expert-profile.bin) - nothing to download for it.
+     --mtp is OPTIONAL: the shipped configs run with MTP OFF (lossless suffix drafting
+     via --spec 4 --coupled-draft stays on). 12 GB cards default to MTP OFF for maximum
+     expert residency; on 16 GB+ cards you can add "--mtp <model-dir>/mtp/rt" to the
+     args for extra decode speed.
   2. Serve:
        .venv/bin/python terminal/serve/server.py --engine hydragen --config hydragen-local.json
      Dashboard + Monitor (concurrency panel): http://127.0.0.1:8181/
@@ -250,18 +257,24 @@ Next steps
                                 parked RAM on agent workloads (docs/FINAL_REPORT.md)
        HG_PARK_DISK=DIR         the cross-boot park-disk tier under it (a park-disk/ dir
                                 was created here); HG_PARK_DISK_MIB caps its budget
-                                (default 65536 = 64 GiB; on a 64 GB-RAM host a tier pinned
-                                at a bigger cap measurably decays steady-state throughput -
-                                raise it only with several x that cap in system RAM)
+                                (default 16384 = 16 GiB, the Phase 5 cap: a tier pinned
+                                above it measurably decays steady-state throughput and
+                                slows boot - raise it only with several x that cap in RAM)
        HG_PARK_DISK_V2=1        v2 writer + lineage-aware two-phase boot rebuild
        HG_RESUME_DEEPEST=1      a parked session resumes at its own deepest checkpoint,
                                 together with the --prompt-cache-tail engine arg now in
                                 the config's args list
+       HG_UNIFIED_POOL=1        one unified host pool for the arena + park tiers (Phase 5)
+       STRATA_AUTO_BATCH=1      the batcher sizes itself from live traffic (Phase 5)
+       CUDA_MODULE_LOADING=LAZY lazy CUDA module loading - faster boot (Phase 5)
        STRATA_ADMIT_SHORT_FIRST=8192  short turns (typical agent follow-ups) take the
                                 prefill lane before big cold prompts; a long prompt that
                                 waited STRATA_ADMIT_MAX_WAIT_S (30 s) counts as short,
                                 so nothing starves  (upstream feature, measured here)
-       HG_COW_JOIN_HH, HG_COW_SHARED are closed-negative experiments; leave off.
+       The Phase 5 CoW-arena block (STRATA_COW_ARENA*, STRATA_COW_FORK, STRATA_COW_JOIN_HH,
+       STRATA_SLOT_*, STRATA_BATCH_YIELD_CHUNKS) ships in the canonical configs' env;
+       STRATA_COW_SHARED=0 and STRATA_ROUTE_TAIL_SKIP=0 stay pinned off there.
+       HG_COW_SHARED is a closed-negative experiment; leave off.
      Merge gates (optional, from this tree): build with -DSTRATA_BUILD_CONVERSATION_TESTS=ON and run
      the conversation_cache_test and park_disk_boot_test targets.
 EON
