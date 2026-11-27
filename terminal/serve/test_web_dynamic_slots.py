@@ -313,6 +313,20 @@ class WebDynamicSlots(unittest.TestCase):
         self.assertIn("has-output", out["els"]["slot-fill-0"]["cls"])          # P5-5D.4: the green tip stays >= 6px
         self.assertEqual(out["els"]["slot-tokens-0"]["text"], "1,200 restored · 30 generated")
 
+    def test_a_restored_read_splits_the_prompt_bar(self):
+        # P5-5D.6: a restored conversation reading its next prompt: [dark-green restored 83%]
+        # [light-blue newly-read 5%] on the prompt's own scale, "33,134 restored · 35,000 / 40,000 read".
+        live = base_live(state="reading", running=1,
+                         slots=slots([("reading", {"state": "reading", "prompt_tokens": 40000, "prompt_read": 35000,
+                                                   "restored_tokens": 33134, "restored_from": "parked"}),
+                                      ("idle", {}), ("idle", {}), ("idle", {})]))
+        out = self.run_scenarios({"s": {"frames": [[live, ENG, {}]]}})["s"]
+        self.assertIn("is-split", out["els"]["slot-track-0"]["cls"])
+        self.assertEqual(out["els"]["slot-restored-fill-0"]["width"], "83%")     # 33,134 of 40,000
+        self.assertEqual(out["els"]["slot-fill-0"]["width"], "5%")               # 1,866 newly read of 40,000
+        self.assertEqual(out["els"]["slot-fill-0"]["cls"], "slot-tile__bar-fill is-reading has-output")
+        self.assertEqual(out["els"]["slot-tokens-0"]["text"], "33,134 restored · 35,000 / 40,000 read")
+
     def test_a_disk_restore_reads_as_disk(self):
         live = base_live(state="generating", running=1,
                          slots=slots([("decoding", {"state": "decoding", "generated": 5,

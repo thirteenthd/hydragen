@@ -144,6 +144,22 @@ public:
         return k_active_;
     }
 
+    /// P5-5C.6: recovery toward a target K once the caller has measured real headroom (a reclaim
+    /// or a finished solo request lifted the pressure that clamped K down).  Not a vote: no
+    /// patience, no EMA — the headroom is a fact the caller read.  One step up per call is the
+    /// damping; without headroom nothing moves, and K never passes the (clamped) target.
+    int recover_toward(int target_k, bool has_headroom) {
+        if (!has_headroom) return k_active_;
+        const int cap = std::clamp(target_k, cfg_.min_k, cfg_.max_k);
+        if (k_active_ >= cap) return k_active_;
+        ++k_active_;
+        ++step_ups_;
+        cooldown_left_ = cfg_.cooldown_events;   // a vote boundary right after a recovery still rests
+        bad_streak_ = 0;
+        good_streak_ = 0;
+        return k_active_;
+    }
+
     int k_active() const { return k_active_; }
     double ema_per_stream_tps() const { return ema_stream_; }
     double ema_agg_tps() const { return ema_agg_; }

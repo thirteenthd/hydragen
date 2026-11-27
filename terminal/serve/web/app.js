@@ -718,18 +718,35 @@ function renderConcurrency(live, eng, hw) {
       }
     }
     if (rt > 0) {
-      const gen = sInfo.generated || 0;
-      const total = rt + gen;
       if (trackEl) trackEl.className = "slot-tile__bar-track is-split";
-      if (restFillEl) restFillEl.style.width = `${Math.min(100, Math.round((100 * rt) / Math.max(1, total)))}%`;
-      if (fillEl) {
-        // P5-5D.4: has-output keeps a non-zero generated segment at least 6px wide, so the light-green tip
-        // stays visible at the right end of the dark-green restored bar however small the share rounds to.
-        fillEl.className = "slot-tile__bar-fill is-generated" + (gen > 0 ? " has-output" : "");
-        fillEl.style.width = `${Math.min(100, Math.round((100 * gen) / Math.max(1, total)))}%`;
+      if (sState === "reading") {
+        // P5-5D.6: a restored conversation that is READING its next prompt shows the prompt's own
+        // scale: [dark-green restored prefix][light-blue newly read] out of the full prompt, so the
+        // reader sees how much of the next turn is already in RAM and how much is still streaming in.
+        const pTotal = Math.max(rt, sInfo.prompt_total || sInfo.prompt_tokens || (live.state === "reading" ? (live.prompt_total || live.prompt_tokens) : 0) || rt);
+        const pRead = sInfo.prompt_read != null ? sInfo.prompt_read : (live.state === "reading" ? (live.prompt_read || 0) : 0);
+        const newRead = Math.min(Math.max(0, pTotal - rt), pRead > rt ? (pRead - rt) : Math.max(0, pRead));
+        const restPct = Math.min(100, Math.round((100 * rt) / Math.max(1, pTotal)));
+        const readPct = Math.min(100 - restPct, Math.round((100 * newRead) / Math.max(1, pTotal)));
+        if (restFillEl) restFillEl.style.width = `${restPct}%`;
+        if (fillEl) {
+          fillEl.className = "slot-tile__bar-fill is-reading" + (newRead > 0 || pTotal > rt ? " has-output" : "");
+          fillEl.style.width = `${readPct}%`;
+        }
+        if (tokensEl) tokensEl.textContent = `${fmt(rt)} restored · ${fmt(Math.min(pTotal, rt + newRead))} / ${fmt(pTotal)} read`;
+      } else {
+        const gen = sInfo.generated || 0;
+        const total = rt + gen;
+        if (restFillEl) restFillEl.style.width = `${Math.min(100, Math.round((100 * rt) / Math.max(1, total)))}%`;
+        if (fillEl) {
+          // P5-5D.4: has-output keeps a non-zero generated segment at least 6px wide, so the light-green tip
+          // stays visible at the right end of the dark-green restored bar however small the share rounds to.
+          fillEl.className = "slot-tile__bar-fill is-generated" + (gen > 0 ? " has-output" : "");
+          fillEl.style.width = `${Math.min(100, Math.round((100 * gen) / Math.max(1, total)))}%`;
+        }
+        if (tokensEl) tokensEl.textContent = `${fmt(rt)} restored · ${fmt(gen)} generated`;
       }
       if (phaseEl) phaseEl.textContent = phaseText;
-      if (tokensEl) tokensEl.textContent = `${fmt(rt)} restored · ${fmt(gen)} generated`;
     } else {
       if (trackEl) trackEl.className = "slot-tile__bar-track";
       if (restFillEl) restFillEl.style.width = "0%";

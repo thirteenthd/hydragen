@@ -218,6 +218,31 @@ int main() {
         CHECK(m.step_ups() == 0);
     }
 
+    // ---- P5-5C.6: recover_toward steps one per call toward the target and stops there ---------------
+    // (after a reclaim / solo request restores headroom, a clamped K walks back to the initial K;
+    // without headroom nothing moves)
+    {
+        AutoBatchConfig c; c.min_k = 1; c.max_k = 8; c.initial_k = 1;
+        AutoBatchController k(c);
+        CHECK(k.recover_toward(3, true) == 2);    // 1 -> 2
+        CHECK(k.recover_toward(3, true) == 3);    // 2 -> 3
+        CHECK(k.recover_toward(3, true) == 3);    // stops at the target
+        CHECK(k.step_ups() == 2);
+        CHECK(k.recover_toward(8, false) == 3);   // no headroom: k_active does not change
+        CHECK(k.recover_toward(8, false) == 3);
+        CHECK(k.step_ups() == 2);
+        // the target clamps into [min_k, max_k]: never past the boot carve
+        AutoBatchConfig d; d.min_k = 1; d.max_k = 2; d.initial_k = 1;
+        AutoBatchController m(d);
+        CHECK(m.recover_toward(9, true) == 2);
+        CHECK(m.recover_toward(9, true) == 2);
+        // a K already at/above the target never moves
+        AutoBatchConfig e; e.min_k = 1; e.max_k = 8; e.initial_k = 4;
+        AutoBatchController n(e);
+        CHECK(n.recover_toward(3, true) == 4);
+        CHECK(n.step_ups() == 0);
+    }
+
     if (fails) { std::printf("auto_batch_controller_test: %d FAILURES\n", fails); return 1; }
     std::printf("auto_batch_controller_test: all checks pass\n");
     return 0;

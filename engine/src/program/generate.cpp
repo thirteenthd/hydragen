@@ -17471,6 +17471,30 @@ int main(int argc, char** argv) {
                 emit_kcap();
             }
         };
+        // P5-5C.6: K_active recovery after a reclaim / a finished solo request.  A mem_refused clamp
+        // or a vote can leave K below the boot's initial K long after the pressure passed; when a
+        // sweep has just returned session arenas (or a solo GEN has just ended) and the real
+        // headroom is back — expert-cache slots above the pool floor AND host RAM above the
+        // attach floor (the same qsa_kv_host_bytes / available_host_bytes pair the boot priced
+        // host_cap with) — step K one back toward the initial K.  One step per event is the damping.
+        auto ab_recover = [&]() {
+            if (!auto_batch_on || auto_batch.k_active() >= ab_cfg.initial_k) return;
+            const bool vram_ok = !cow_pool.on || xcache.slots() > cow_pool.floor;
+            const int64_t slot_host_kv_bytes = (int64_t) strata::core::qsa_kv_host_bytes();
+            const auto host_avail = strata::core::available_host_bytes();
+            const int64_t available_host_bytes_above_floor = host_avail
+                ? (int64_t) *host_avail - ((int64_t) o.conversation_cache_min_free_mib << 20) : 0;
+            const bool host_ok = slot_host_kv_bytes <= 0 || !host_avail.has_value() ||
+                                 available_host_bytes_above_floor >= slot_host_kv_bytes;
+            const int before = auto_batch.k_active();
+            const int after = auto_batch.recover_toward(ab_cfg.initial_k, vram_ok && host_ok);
+            if (after != before) {
+                std::fprintf(stderr, "strata serve: auto-batch: K_active %d -> %d (recovered on headroom)\n",
+                             before, after);
+                ab_k = after;
+                emit_kcap();
+            }
+        };
         auto pc_ex = [&]() {
             strata::program::ParCounters::Ex e;
             e.misses = drive.d.multi_misses; e.entries = drive.d.multi_entries; e.hits = drive.d.cache_hits;
@@ -17903,13 +17927,23 @@ int main(int argc, char** argv) {
         };
         auto detach_slot = [&](int b) -> bool {
             BSlot& sl = bs[(size_t) b];
-            if (!park_slot(b)) return false;
+            // P5-5C.6: parking is best-effort here too, as it already is before an overwrite (#3350).
+            // Aborting the detach when park_slot declines (a conversation under
+            // --conversation-cache-min-tokens, a physical-RAM-admission skip, a richer parked copy)
+            // pinned the idle slot's ~1.55 GiB host K/V and its 0.31 GiB session arena for 21+
+            // minutes on ms01: the sweep retried, park declined again, and the memory never came
+            // back.  The conversation may go; the slot's memory must not.
+            const bool parked = park_slot(b);
             const size_t ndet = sl.ids.size();
+            // park_slot's skips (below --conversation-cache-min-tokens, the physical-RAM floor) answer
+            // true as a non-error "safe to proceed"; holds() says whether this slot's copy really made
+            // it into the parked tier, which is what the label below tells the reader.
+            const bool in_parked_tier = parked && conversations.holds(sl.ids, {}, sl.cvec);
             for (ConvCheckpoint& c : sl.checks)
                 if (ckpt_pool.on()) ckpt_pool.give(std::move(c));
             sl = BSlot{};
-            std::fprintf(stderr, "strata serve: conversation cache: slot %d detached idle (%zu tokens to the parked tier)\n",
-                         b, ndet);
+            std::fprintf(stderr, "strata serve: conversation cache: slot %d detached idle (%zu tokens %s)\n",
+                         b, ndet, in_parked_tier ? "to the parked tier" : "dropped (not parked)");
             if (kv_grow) {
                 ver.drop_batch_graphs();
                 strata::core::SessionState& su = *bslot_ss[0][(size_t) b];
@@ -17949,6 +17983,7 @@ int main(int argc, char** argv) {
             // the whole freed region in view (solo N=1 snaps toward full_slots in one step, not one slot
             // at a time).
             if (nsw > 0 && cow_pool.on) cow_reclaim(adapt_quiesce);
+            if (nsw > 0) ab_recover();   // P5-5C.6: the arenas are back and the cache grew — K may step up
             size_t ncache = 0;
             for (const BSlot& s2 : bs) if (s2.cached && !s2.active) ++ncache;
             mem_mark("a request completed (the serve's steady state)");
@@ -24745,6 +24780,10 @@ int main(int argc, char** argv) {
                         (long long) req_offload, chain_txt, (long long) req_chunk,
                         (long long) (sp.chain_experts_streamed() - streamed0));
             std::fflush(stdout);
+            // P5-5C.6: a solo GEN (no BADM admission) ending with every batch slot idle is the
+            // returning-solo's second recovery door: the sweep at its start may have found nothing
+            // to detach (nsw 0) while K still sat clamped below the initial K.
+            if (admit_slot < 0 && !batch_on()) ab_recover();
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
