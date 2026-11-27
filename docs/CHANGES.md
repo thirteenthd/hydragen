@@ -2979,3 +2979,56 @@ the next stage header appearing.
 Gates: engine binary unchanged from §242 (all gates green there); this change is docs +
 bench script only. Production `:8181` restored after the matrix (`PROD_RESTORED`).
 counter 196.
+
+## §244 — Phase 5 (Tracks 5B–5D) closure & hydragen v0.0.1 release verification (2026-11-27)
+
+Phase 5 closes on `phase5/v0.0.1` (tip `c1e4dbf`). README rewritten for v0.0.1
+(unified-pool positioning, `0/300` isolation badge, MTP-off-on-12 GB note, refreshed
+benchmark tables); this section notarizes the three tracks and the release config.
+
+**Track 5B (`95b28c2`..`9bd0759`, `744030a`)** — floor-guarded unified VMM pool
+(`HG_UNIFIED_POOL=1`): `CowExpertPool` lends whole 2 MiB chunks of the expert-cache
+VMM range down to an adaptive residency floor, segmented shrink/grow (the 5B.5 winner)
+anchored **below** the prompt loan region (`lend_first`, the fix for the VMM IMA), and
+returns freed `CowArena` chunks straight to the driver — zero chunk hoarding
+(`g_cow_bank_mib < 0` under the unified pool). `relend()` in `cow_lend`/`cow_reclaim`
+scales the prompt prefill chunks (`14,336 ↔ 7,168`) with the lend state, so
+`ExpertCache` snaps back to full residency (`3,696 / 3,696` slots mapped) when idle.
+
+**Track 5C (`4691654`..`c1e4dbf`)** — damped admission-level `AutoBatchController`
+with host-RAM-bounded `K_active` queueing: excess streams queue on the attached slot,
+**`0` HTTP `503`s** across the whole stress ladder. `qsa_state_release()` frees the
+pinned host KV on idle detach, fixing the `1.55 GiB`/detach host-RAM leak (flat RSS
+`45.77 → 45.80 GiB` across hundreds of sessions). `ParkDisk` housekeeping: `16 GiB`
+default budget, boot trim `101 GiB / 149 .ses / 107.9 s → 15.9 GiB / 15 .ses / 22.0 s`,
+true LRU promotion on load, superseded-prefix drop, oversize-spill guard
+(`park_disk_boot_test` `107/107`). CoW isolation fixes: `copy_groups_kernel` missing
+`+ slot_base` (the cross-slot writer behind the residual bleed), `page_table` publish
+order, aborted-victim guard (`c51de79`), and `conversation_checkpoint_restore`
+`qsa_cow_release` + `kv_stream_reset` (`ec9a3d5`). `ParkDisk::best_resumable()` is
+checkpoint-aware, gates synchronous NVMe reads on a `1,024`-token min-gain, and resumes
+unconditionally from disk (`c1e4dbf`): Pass 9→10 disk reads `51 / 228.09 s → 1 / 0.76 s`
+resuming `33,134` tokens. MSVC `dot_x4_bench.cpp` `strata::quant::type_info` ambiguity
+fixed — the full Windows `ninja` build is clean.
+
+**Track 5D (`a6a22b4`..`acf5f0d`)** — dynamic active-slot Monitor dashboard
+(`Slot 1..N` cards tracking `K_active`), unified phase colors (blue prefill,
+dark-green restored, light-green decode), Resource Stats `#res-facts` config strip
+(context window, decode floor, concurrency cap, KV quant), ParkDisk utilization bar on
+real usable disk space, `"Restored · RAM"` / `"Restored · Storage"` badges, and the
+ghost `slot_live` cleared on a refused `BGEN` (`test_web_*` `157/157`).
+
+**Multi-Stream Agentic Stress Verification** (Passes 3–12 on `ms01:8181`, `60`
+streams/pass, `3k/9k/22k/40k × C=1/2/4/8`): cross-stream bleed fell from `4/171`
+(Passes 3–5) and `1/120` (Passes 6–7) to **`0 / 300` consecutive streams** across
+Passes 8–12 with **`0` HTTP `503`s**. Pass 12 solo-MTP A/B: MTP costs `873 MiB` VRAM
+(`3,046 → 2,601` expert slots), breaks even at `C=1` and trails MTP OFF at `C=4/8` on
+12 GB — so **v0.0.1 ships MTP OFF on 12 GB cards** to maximize `ExpertCache` residency
+(`3,699` slots).
+
+**Release config verified** (`~/g9/cfg-p5-live.json`, `--mtp`/`--mtp-q4` removed,
+restart via `~/g9/restart_p5_live.sh` → `BOOTED`, no orphan held the GPU): `/metrics`
+`engine.drafting = off`, `engine.expert_slots = 3709` (boot line `expert cache 3709
+slots, 6.02 GiB`; `+0 MiB for the draft head`), `conversation_cache.budget_mib = 8192`,
+`park_disk.budget_mib = 16384`.
+counter 197.
