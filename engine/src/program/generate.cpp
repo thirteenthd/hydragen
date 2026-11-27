@@ -7832,6 +7832,10 @@ int main(int argc, char** argv) {
     // held all 48 layers' state whatever layers it ran, which is the same disease the chunked-QSA-prefill PR
     // fixed in llama.cpp: allocation sized by the whole model instead of the device's own work.
     uint64_t main_kv_host_bytes = 0;
+    // (P5-5C.7) ONE slot's pinned host K/V, summed from the main session's own states (1.55 GiB at 131K),
+    // not qsa_kv_host_bytes(): that counter is cumulative across every allocated session (3.09 GiB for
+    // main + slot 0 at boot), so the boot host_cap and ab_recover priced each slot at 2x its real RAM.
+    uint64_t single_slot_host_kv_bytes = 0;
     {
         const strata::core::OnDevice on0(primary_device);   // STRATA_PRIMARY_DEVICE (upstream: a literal 0)
         const int64_t hi0 = multi_gpu ? split_at[0] : -1;
@@ -7864,6 +7868,8 @@ int main(int argc, char** argv) {
             return 1;
         }
         main_kv_host_bytes = strata::core::qsa_kv_host_bytes();
+        // (P5-5C.7) the main session is the only one carved at this point: its own sum is one slot's price
+        for (int64_t j = 0; j < ss.qsa_alloc; ++j) single_slot_host_kv_bytes += ss.qsa_states[j].host_allocation_bytes;
         if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1)
             std::fprintf(stderr, "strata generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
                                  "%.2f GiB of pinned RAM\n",
@@ -12005,13 +12011,14 @@ int main(int argc, char** argv) {
                     const int cow_maxb = o.batch > 0 ? o.batch : 1;
                     const int64_t cow_free_vram = (int64_t) fb - ((int64_t) o.vram_reserve_mib << 20);
                     // P5-5C.5: price the HOST side too.  An unattached slot pays its pinned host K/V
-                    // (qsa_kv_host_bytes(): the figure the --batch carve guard above uses) before it can attach,
-                    // and ensure_slot_session refuses an attach that would leave less than
+                    // (P5-5C.7: single_slot_host_kv_bytes(), the main session's own per-slot sum - the
+                    // cumulative qsa_kv_host_bytes() counted main + slot 0 and doubled the price) before it
+                    // can attach, and ensure_slot_session refuses an attach that would leave less than
                     // --conversation-cache-min-free-mib free beside it.  The §245 ms01 burst: 1.6 GiB available,
                     // 1,584 MiB host K/V + 2,048 MiB floor per slot - the VRAM-only cap started 8 streams active
                     // and every attach died on that guard.  Where host RAM cannot be read there is no host
                     // price and the VRAM cap stands, as before.
-                    const int64_t slot_host_kv = (int64_t) strata::core::qsa_kv_host_bytes();
+                    const int64_t slot_host_kv = (int64_t) single_slot_host_kv_bytes;
                     int64_t host_above_floor = 0;
                     int host_cap = cow_maxb;
                     bool host_priced = false;
@@ -17475,12 +17482,12 @@ int main(int argc, char** argv) {
         // or a vote can leave K below the boot's initial K long after the pressure passed; when a
         // sweep has just returned session arenas (or a solo GEN has just ended) and the real
         // headroom is back — expert-cache slots above the pool floor AND host RAM above the
-        // attach floor (the same qsa_kv_host_bytes / available_host_bytes pair the boot priced
+        // attach floor (the same single_slot_host_kv_bytes / available_host_bytes pair the boot priced
         // host_cap with) — step K one back toward the initial K.  One step per event is the damping.
         auto ab_recover = [&]() {
             if (!auto_batch_on || auto_batch.k_active() >= ab_cfg.initial_k) return;
             const bool vram_ok = !cow_pool.on || xcache.slots() > cow_pool.floor;
-            const int64_t slot_host_kv_bytes = (int64_t) strata::core::qsa_kv_host_bytes();
+            const int64_t slot_host_kv_bytes = (int64_t) single_slot_host_kv_bytes;
             const auto host_avail = strata::core::available_host_bytes();
             const int64_t available_host_bytes_above_floor = host_avail
                 ? (int64_t) *host_avail - ((int64_t) o.conversation_cache_min_free_mib << 20) : 0;

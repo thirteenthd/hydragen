@@ -250,6 +250,9 @@ struct QsaState {
     uint8_t* host_cpu_base = nullptr;
     uint8_t* host_device_base = nullptr;
     size_t host_allocation_bytes = 0;
+    /// (P5-5C.7) how `host_cpu_base` was pinned: true = anonymous mmap + cudaHostRegister (the WSL2 path),
+    /// false = cudaHostAlloc.  qsa_state_release must unpin it the same way it was pinned.
+    bool host_registered = false;
     strata::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
 
@@ -406,6 +409,11 @@ inline int qsa_kv_format(const QsaState& st) {
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope = nullptr, int64_t ring_cells = 0,
                         int64_t qsa_ordinal = -1);
+/// (P5-5C.7) session teardown hook for the HOST side of a state: unpins and frees the pinned K/V copy
+/// (cudaHostUnregister+munmap or cudaFreeHost, per `host_registered`), the pinned step/pos staging, and
+/// subtracts the copy from qsa_kv_host_bytes().  The caller must have quiesced the device first: the
+/// mapped copy and the staging are still read by in-flight copies.  Idempotent on a null/unstreamed state.
+void qsa_state_release(QsaState& st);
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,

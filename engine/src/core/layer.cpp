@@ -583,7 +583,8 @@ uint64_t g_kv_host_bytes = 0;
 // staging buffers. Elsewhere cudaHostAlloc stays first. Either way the other method is the fallback when the first
 // is refused. STRATA_KV_HOST_REGISTER=1/0 forces registering first or cudaHostAlloc first. Like the cudaHostAlloc
 // copy it lives as long as the process.
-uint8_t* kv_host_alloc(uint64_t bytes) {
+uint8_t* kv_host_alloc(uint64_t bytes, bool& out_registered) {
+    out_registered = false;
     auto host_alloc = [](uint64_t n) -> uint8_t* {
         uint8_t* h = nullptr;
         if (strata::core::host_alloc_guarded((void**) &h, n, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) return h;
@@ -614,11 +615,12 @@ uint8_t* kv_host_alloc(uint64_t bytes) {
         return (uint8_t*) m;
     };
     if (register_first) {
-        if (uint8_t* m = register_anon(bytes)) return m;
+        if (uint8_t* m = register_anon(bytes)) { out_registered = true; return m; }
         return host_alloc(bytes);
     }
     if (uint8_t* h = host_alloc(bytes)) return h;
-    return register_anon(bytes);
+    if (uint8_t* m = register_anon(bytes)) { out_registered = true; return m; }
+    return nullptr;
 #endif
 }
 
@@ -1715,7 +1717,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
         uint8_t* d = nullptr;
-        if ((h = kv_host_alloc(bytes)) == nullptr ||
+        bool registered = false;
+        if ((h = kv_host_alloc(bytes, registered)) == nullptr ||
             cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
             // both cudaHostRegister and cudaHostAlloc were refused (kv_host_alloc): usually not enough free RAM
             if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
@@ -1728,6 +1731,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.host_cpu_base = h;
         st.host_device_base = d;
         st.host_allocation_bytes = (size_t) bytes;
+        st.host_registered = registered;
         Cursor hc{d};
         if (st.kv_hybrid) {
             st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);
@@ -1776,6 +1780,34 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     }
     cudaDeviceSynchronize();
     return c.used;
+}
+
+// (P5-5C.7) the HOST-side counterpart of qsa_cow_state_release, for session teardown.  The pinned K/V
+// copy, the pinned step staging and the pinned pos staging are per-session allocations: a detach that
+// only returns the VRAM arena leaks 1.55 GiB of pinned RAM per slot cycle (ms01 live: RSS climbed
+// 43 -> 54 GiB over detach/re-carve cycles while detach_slot itself reported clean).  Unpin the copy
+// the way it was pinned (cudaHostRegister'd anonymous memory cannot go through cudaFreeHost, and
+// cudaHostAlloc'd memory cannot go through munmap), give the bytes back to the counter the boot and
+// ab_recover price host_cap with, and null every pointer so a second release is a no-op.
+void qsa_state_release(QsaState& st) {
+    if (st.host_cpu_base != nullptr) {
+#if !defined(_WIN32)
+        if (st.host_registered) {
+            (void) cudaHostUnregister(st.host_cpu_base);
+            munmap(st.host_cpu_base, st.host_allocation_bytes);
+        } else
+#endif
+            (void) cudaFreeHost(st.host_cpu_base);
+        g_kv_host_bytes = g_kv_host_bytes > st.host_allocation_bytes
+                              ? g_kv_host_bytes - st.host_allocation_bytes : 0;
+        st.host_cpu_base = nullptr;
+        st.host_device_base = nullptr;
+        st.host = strata::kernels::KvHostPools{};
+        st.host_allocation_bytes = 0;
+        st.host_registered = false;
+    }
+    if (st.host_step != nullptr) { (void) cudaFreeHost(st.host_step); st.host_step = nullptr; }
+    if (st.host_pos != nullptr) { (void) cudaFreeHost(st.host_pos); st.host_pos = nullptr; }
 }
 
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {

@@ -141,6 +141,18 @@ void session_release(SessionState& s) {
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
         if (s.qsa_states[j].cow_ordinal >= 0)
             strata::core::qsa_cow_state_release(s.qsa_states[j]);
+    // (P5-5C.7) AND THE HOST SIDE: the pinned K/V copy (1.55 GiB per streamed slot at 131K), the
+    // pinned step staging and the pinned pos staging are per-session allocations too.  A detach that
+    // only returned the VRAM arena leaked them every cycle: ms01 live, RSS climbed 43 -> 54 GiB
+    // across detach/re-carve cycles while the detach itself reported clean.  The mapped copy and the
+    // staging are still read by in-flight device copies, so quiesce the device before unpinning.
+    bool pinned = false;
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
+        if (s.qsa_states[j].host_cpu_base != nullptr || s.qsa_states[j].host_step != nullptr ||
+            s.qsa_states[j].host_pos != nullptr) { pinned = true; break; }
+    if (pinned) (void) cudaDeviceSynchronize();
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
+        strata::core::qsa_state_release(s.qsa_states[j]);
 }
 
 #if defined(STRATA_GPU_METAL)

@@ -369,7 +369,7 @@ class WebDynamicSlots(unittest.TestCase):
         self.assertIn("42.5", out["els"]["slot-decode-solo"]["html"])
         self.assertEqual(out["els"]["slot-tokens-solo"]["text"], "900 restored · 17 generated")
         self.assertEqual(out["els"]["slot-restored-badge-solo"]["text"], "Restored")
-        self.assertIn("Solo", out["html"][0])                 # the card is named Solo, not "Slot solo"
+        self.assertIn("Slot 1", out["html"][0])               # P5-5D.7: the card is named Slot 1, not "Solo"
 
     def test_a_solo_read_shows_its_prompt_progress(self):
         live = base_live(state="reading", running=1, prompt_total=900, prompt_read=450)

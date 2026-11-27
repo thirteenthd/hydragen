@@ -527,10 +527,12 @@ function renderConcurrency(live, eng, hw) {
   const activeSlots = slots.filter(slotIsUtilized);
   const activeGeneratingSlots = slots.filter((s) => s && (s.state === "generating" || s.state === "decoding"));
   // P5-5D.2: a single request runs on the solo GEN path (admit_slot -1): it is active but owns no batch slot,
-  // so the header can read "1 / K Active" while every slot entry is idle. Render it as a synthetic Solo card.
+  // so the header can read "1 / K Active" while every slot entry is idle. Render it as a synthetic card.
+  // P5-5D.7: the card is labelled "Slot 1" (the reader sees one stream); the DOM key stays "solo" so its
+  // ids (slot-tile-solo, st-badge-solo, ...) cannot collide with the real slot tiles slot-tile-0..7.
   if (activeSlots.length === 0 && curConcurrency > 0) {
     const soloRestored = (live && (live.restored_tokens || live.reused)) || 0;
-    activeSlots.push({ slot: "solo", label: "Solo",
+    activeSlots.push({ slot: "solo", label: "Slot 1",
       state: (live && live.state === "reading") ? "reading" : "generating",
       tok_s: live && live.tok_s, prefill_tok_s: live && live.prefill_tok_s_mean,
       prompt_tokens: live && (live.prompt_total || live.prompt_tokens),
